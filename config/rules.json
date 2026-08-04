@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "group_combine": "all",
+  "groups": [
+    {
+      "id": "a17293a4-5c01-435a-862d-4a836dd931c8",
+      "name": "规则组 1",
+      "combine": "all",
+      "enabled": true,
+      "rules": [
+        {
+          "pattern": "照亮范围扩大",
+          "operator": ">=",
+          "threshold": 15.0,
+          "enabled": true,
+          "note": "示例：最大生命 ≥ 80（可删改）",
+          "id": "sample-life"
+        }
+      ]
+    },
+    {
+      "id": "64125b68-b5ec-46ca-810d-72a9ac21bac0",
+      "name": "规则组 2",
+      "combine": "any",
+      "enabled": true,
+      "rules": [
+        {
+          "pattern": "每秒再生",
+          "operator": ">=",
+          "threshold": 48.1,
+          "enabled": true,
+          "note": "",
+          "id": "1b8505b7-de70-499a-a7e9-f5482738e8e7"
+        },
+        {
+          "pattern": "吸纳为生命",
+          "operator": ">=",
+          "threshold": 12.0,
+          "enabled": true,
+          "note": "",
+          "id": "10ba5b31-d0d5-4183-98e4-3d41815c1aea"
+        }
+      ]
+    }
+  ]
+}

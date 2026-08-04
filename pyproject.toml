@@ -1,0 +1,20 @@
+[project]
+name = "poe-crafting"
+version = "0.1.0"
+description = "PoE1 花园自动工艺工具"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "customtkinter>=5.2.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "mss>=9.0.0",
+    "Pillow>=10.0.0",
+    "pydirectinput>=1.0.4",
+    "pyperclip>=1.8.2",
+    "pynput>=1.7.6",
+    "pywin32>=306",
+]
+
+[tool.uv]
+package = false

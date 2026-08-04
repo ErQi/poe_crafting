@@ -1,0 +1,20 @@
+{
+  "window_title_keywords": [
+    "Path of Exile",
+    "流放之路"
+  ],
+  "hotkey_stop": "f8",
+  "max_attempts": 200,
+  "max_parse_failures": 5,
+  "max_unchanged": 8,
+  "action_delay_ms": 100,
+  "craft_wait_ms": 100,
+  "clipboard_timeout_ms": 1500,
+  "clipboard_poll_ms": 50,
+  "template_threshold": 0.75,
+  "match_mode": "all",
+  "craft_mode": "generic",
+  "craft_preset": "reforge",
+  "templates_dir": "assets/templates",
+  "rules_file": "config/rules.json"
+}
