@@ -114,7 +114,10 @@ class FloatingMatchOverlay:
         """根据运行状态推送一行（同 attempt 不重复）。"""
         if not status.running:
             # 结束时补最后一行（若有）
-            if status.last_match is not None and status.attempt != self._last_attempt_shown:
+            if (
+                status.last_match is not None
+                and status.attempt != self._last_attempt_shown
+            ):
                 self._ensure_shown()
                 line = format_match_overlay_line(status.attempt, status.last_match)
                 if status.stop_reason and status.stop_reason.value == "success":
@@ -222,14 +225,41 @@ class FloatingMatchOverlay:
         # 避免启动时抢焦点
         try:
             win.after(10, lambda: win.attributes("-topmost", True))
-            win.lower()  # 先不抢
-            win.lift()
         except Exception:
             pass
+        self._apply_no_activate(win)
 
         # 跟随主窗口关闭
         try:
             self.master.bind("<Destroy>", self._on_master_destroy, add="+")
+        except Exception:
+            pass
+
+    def _apply_no_activate(self, win) -> None:
+        """Windows：尽量不抢键盘焦点。"""
+        try:
+            import ctypes
+
+            hwnd = int(win.winfo_id())
+            # CTk 可能套一层，尝试 GetParent
+            user32 = ctypes.windll.user32
+            GWL_EXSTYLE = -20
+            WS_EX_NOACTIVATE = 0x08000000
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_TOPMOST = 0x00000008
+            # 找到顶级 hwnd
+            root = hwnd
+            while True:
+                parent = user32.GetParent(root)
+                if not parent:
+                    break
+                root = parent
+            style = user32.GetWindowLongW(root, GWL_EXSTYLE)
+            user32.SetWindowLongW(
+                root,
+                GWL_EXSTYLE,
+                style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+            )
         except Exception:
             pass
 

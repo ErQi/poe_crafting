@@ -145,7 +145,9 @@ class CraftApp(ctk.CTk):
             left, text="目标规则（多组）", font=ctk.CTkFont(size=16, weight="bold")
         ).grid(row=3, column=0, sticky="w", padx=12, pady=(16, 4))
 
-        self.rules_frame = widgets.RuleSetEditor(left, on_change=self._on_ruleset_changed)
+        self.rules_frame = widgets.RuleSetEditor(
+            left, on_change=self._on_ruleset_changed
+        )
         self.rules_frame.grid(row=4, column=0, sticky="nsew", padx=12, pady=4)
         left.grid_rowconfigure(4, weight=1)
 
@@ -742,11 +744,21 @@ class CraftApp(ctk.CTk):
         )
         try:
             self._was_running = True
+            try:
+                self._overlay._last_attempt_shown = -1  # noqa: SLF001
+                self._overlay.show()
+                self._overlay.add_line("▶ 开始匹配…", success=False)
+            except Exception:
+                pass
             self.automation.start(cfg)
             self._set_running_ui(True)
             self.status_label.configure(text="状态: 运行中")
         except Exception as e:
             self._was_running = False
+            try:
+                self._overlay.hide()
+            except Exception:
+                pass
             messagebox.showerror("启动失败", str(e))
 
     def _on_stop(self) -> None:
@@ -762,6 +774,7 @@ class CraftApp(ctk.CTk):
         try:
             self.automation.request_stop(StopReason.USER_STOP)
             self.hotkeys.stop()
+            self._overlay.destroy()
         finally:
             self.destroy()
 

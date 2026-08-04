@@ -89,14 +89,22 @@ class RuleSetEditor(ctk.CTkFrame):
         mid.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
         mid.grid_columnconfigure(0, weight=1)
 
-        self.group_list = ctk.CTkSegmentedButton(mid, values=["规则组 1"], command=self._on_select_group_label)
+        self.group_list = ctk.CTkSegmentedButton(
+            mid, values=["规则组 1"], command=self._on_select_group_label
+        )
         self.group_list.grid(row=0, column=0, sticky="ew", padx=(0, 8))
 
         gbtns = ctk.CTkFrame(mid, fg_color="transparent")
         gbtns.grid(row=0, column=1, sticky="e")
-        ctk.CTkButton(gbtns, text="加组", width=56, command=self._add_group).pack(side="left", padx=2)
-        ctk.CTkButton(gbtns, text="删组", width=56, fg_color="#8B3A3A", command=self._del_group).pack(side="left", padx=2)
-        ctk.CTkButton(gbtns, text="改名", width=56, fg_color="#3a3a3a", command=self._rename_group).pack(side="left", padx=2)
+        ctk.CTkButton(gbtns, text="加组", width=56, command=self._add_group).pack(
+            side="left", padx=2
+        )
+        ctk.CTkButton(
+            gbtns, text="删组", width=56, fg_color="#8B3A3A", command=self._del_group
+        ).pack(side="left", padx=2)
+        ctk.CTkButton(
+            gbtns, text="改名", width=56, fg_color="#3a3a3a", command=self._rename_group
+        ).pack(side="left", padx=2)
 
         # 当前组详情
         body = ctk.CTkFrame(self)
@@ -106,12 +114,17 @@ class RuleSetEditor(ctk.CTkFrame):
 
         ghead = ctk.CTkFrame(body, fg_color="transparent")
         ghead.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        self.group_title = ctk.CTkLabel(ghead, text="规则组 1", font=ctk.CTkFont(weight="bold"))
+        self.group_title = ctk.CTkLabel(
+            ghead, text="规则组 1", font=ctk.CTkFont(weight="bold")
+        )
         self.group_title.pack(side="left")
         self.group_enabled = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(ghead, text="启用本组", variable=self.group_enabled, command=self._on_group_enabled).pack(
-            side="left", padx=12
-        )
+        ctk.CTkCheckBox(
+            ghead,
+            text="启用本组",
+            variable=self.group_enabled,
+            command=self._on_group_enabled,
+        ).pack(side="left", padx=12)
         ctk.CTkLabel(ghead, text="组内逻辑:").pack(side="left", padx=(12, 4))
         self.inner_combine_menu = ctk.CTkSegmentedButton(
             ghead,
@@ -123,8 +136,16 @@ class RuleSetEditor(ctk.CTkFrame):
 
         header = ctk.CTkFrame(body, fg_color="transparent")
         header.grid(row=1, column=0, sticky="ew", padx=8, pady=2)
-        for text, w in (("启用", 40), ("包含文本", 150), ("算子", 60), ("阈值", 70), ("备注", 100)):
-            ctk.CTkLabel(header, text=text, width=w, anchor="w").pack(side="left", padx=2)
+        for text, w in (
+            ("启用", 40),
+            ("包含文本", 150),
+            ("算子", 60),
+            ("阈值", 70),
+            ("备注", 100),
+        ):
+            ctk.CTkLabel(header, text=text, width=w, anchor="w").pack(
+                side="left", padx=2
+            )
 
         self.list_host = ctk.CTkScrollableFrame(body, height=160)
         self.list_host.grid(row=2, column=0, sticky="nsew", padx=6, pady=4)
@@ -177,7 +198,11 @@ class RuleSetEditor(ctk.CTkFrame):
         self.set_ruleset(
             RuleSet(
                 group_combine=MatchMode.ALL.value,
-                groups=[RuleGroup(name="规则组 1", combine=MatchMode.ALL.value, rules=list(rules))],
+                groups=[
+                    RuleGroup(
+                        name="规则组 1", combine=MatchMode.ALL.value, rules=list(rules)
+                    )
+                ],
             )
         )
 
@@ -304,7 +329,9 @@ class RuleSetEditor(ctk.CTkFrame):
     def _add_group(self) -> None:
         self._sync_current_group_from_ui()
         n = len(self._ruleset.groups) + 1
-        self._ruleset.groups.append(RuleGroup(name=f"规则组 {n}", combine=MatchMode.ALL.value))
+        self._ruleset.groups.append(
+            RuleGroup(name=f"规则组 {n}", combine=MatchMode.ALL.value)
+        )
         self._selected_group = len(self._ruleset.groups) - 1
         self._refresh_group_tabs()
         self._load_current_group_to_ui()
@@ -323,7 +350,9 @@ class RuleSetEditor(ctk.CTkFrame):
 
     def _rename_group(self) -> None:
         g = self._current_group()
-        name = simpledialog.askstring("改名", "规则组名称:", initialvalue=g.name, parent=self)
+        name = simpledialog.askstring(
+            "改名", "规则组名称:", initialvalue=g.name, parent=self
+        )
         if name is None:
             return
         name = name.strip() or g.name
@@ -336,7 +365,9 @@ class RuleSetEditor(ctk.CTkFrame):
         self._selected_rule = idx
         for i, row in enumerate(self._rule_rows):
             try:
-                row["frame"].configure(fg_color=("gray30" if i == idx else "transparent"))
+                row["frame"].configure(
+                    fg_color=("gray30" if i == idx else "transparent")
+                )
             except Exception:
                 pass
 
@@ -360,7 +391,9 @@ class RuleSetEditor(ctk.CTkFrame):
             frame.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
 
             en_var = tk.BooleanVar(value=rule.enabled)
-            ctk.CTkCheckBox(frame, text="", variable=en_var, width=40, command=self._emit).pack(side="left", padx=2)
+            ctk.CTkCheckBox(
+                frame, text="", variable=en_var, width=40, command=self._emit
+            ).pack(side="left", padx=2)
 
             pattern = ctk.CTkEntry(frame, width=150)
             pattern.insert(0, rule.pattern)
@@ -369,7 +402,9 @@ class RuleSetEditor(ctk.CTkFrame):
             pattern.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
 
             op_values = ["(无)"] + [o for o in OPS if o]
-            op_menu = ctk.CTkOptionMenu(frame, values=op_values, width=70, command=lambda _v: self._emit())
+            op_menu = ctk.CTkOptionMenu(
+                frame, values=op_values, width=70, command=lambda _v: self._emit()
+            )
             cur_op = rule.operator if rule.operator in OPS and rule.operator else "(无)"
             op_menu.set(cur_op)
             op_menu.pack(side="left", padx=2)

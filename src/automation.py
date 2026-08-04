@@ -453,7 +453,9 @@ class CraftAutomation:
     def _read_item_fast(self, vision: VisionService, win, s: AppSettings) -> Item:
         hit = vision.get_cached_position("item_slot")
         if hit is None:
-            hit = vision.find_in_window(win, "item_slot", threshold=s.template_threshold)
+            hit = vision.find_in_window(
+                win, "item_slot", threshold=s.template_threshold
+            )
         if hit is None:
             raise VisionError("未找到 item_slot.png（工艺槽物品区域）")
 
@@ -510,7 +512,9 @@ class CraftAutomation:
                 raise VisionError("未找到游戏窗口")
             focus_window(win.hwnd, retries=3, settle_ms=50)
             # 单次读取仍匹配一次以填充缓存
-            hit = vision.find_in_window(win, "item_slot", threshold=settings.template_threshold)
+            hit = vision.find_in_window(
+                win, "item_slot", threshold=settings.template_threshold
+            )
             if hit is None:
                 raise VisionError("未找到 item_slot.png")
             return self._read_item_fast(vision, win, settings)

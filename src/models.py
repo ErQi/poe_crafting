@@ -132,7 +132,9 @@ class RuleGroup:
             for item in raw_rules:
                 if isinstance(item, dict):
                     rules.append(MatchRule.from_dict(item))
-        combine = str(data.get("combine") or data.get("match_mode") or MatchMode.ALL.value)
+        combine = str(
+            data.get("combine") or data.get("match_mode") or MatchMode.ALL.value
+        )
         if combine not in (MatchMode.ALL.value, MatchMode.ANY.value):
             combine = MatchMode.ALL.value
         return cls(
