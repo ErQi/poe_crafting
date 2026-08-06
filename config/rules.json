@@ -35,10 +35,18 @@
         {
           "pattern": "吸纳为生命",
           "operator": ">=",
-          "threshold": 12.0,
+          "threshold": 13.0,
           "enabled": true,
           "note": "",
           "id": "10ba5b31-d0d5-4183-98e4-3d41815c1aea"
+        },
+        {
+          "pattern": "力量",
+          "operator": ">=",
+          "threshold": 51.0,
+          "enabled": true,
+          "note": "",
+          "id": "93ddcbc0-8693-4b70-9209-dbf9f88a677e"
         }
       ]
     }

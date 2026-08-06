@@ -239,20 +239,34 @@ def _move_to(x: int, y: int) -> None:
         win32api.SetCursorPos((int(x), int(y)))
 
 
-def _click_left() -> None:
+def _click(button: str = "left") -> None:
+    button = button.lower()
+    if button not in {"left", "right"}:
+        raise ValueError(f"不支持的鼠标按钮: {button}")
     if pydirectinput is not None:
-        pydirectinput.click()
+        pydirectinput.click(button=button)
         return
     if win32api is not None:
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        if button == "right":
+            down = win32con.MOUSEEVENTF_RIGHTDOWN
+            up = win32con.MOUSEEVENTF_RIGHTUP
+        else:
+            down = win32con.MOUSEEVENTF_LEFTDOWN
+            up = win32con.MOUSEEVENTF_LEFTUP
+        win32api.mouse_event(down, 0, 0, 0, 0)
         time.sleep(0.02)
-        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        win32api.mouse_event(up, 0, 0, 0, 0)
 
 
-def click_screen(x: int, y: int, settle_ms: int = 40) -> None:
+def click_screen(
+    x: int,
+    y: int,
+    settle_ms: int = 40,
+    button: str = "left",
+) -> None:
     _move_to(x, y)
     time.sleep(settle_ms / 1000.0)
-    _click_left()
+    _click(button)
 
 
 def move_screen(x: int, y: int, settle_ms: int = 40) -> None:

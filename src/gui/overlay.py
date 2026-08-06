@@ -9,6 +9,19 @@ import customtkinter as ctk
 from ..models import MatchMode, MatchResult, RunStatus
 
 
+def _monitor_work_area(anchor_point: tuple[int, int]) -> tuple[int, int, int, int]:
+    """返回锚点所在显示器扣除任务栏后的工作区。"""
+    import win32api
+    import win32con
+
+    monitor = win32api.MonitorFromPoint(
+        anchor_point,
+        win32con.MONITOR_DEFAULTTONEAREST,
+    )
+    left, top, right, bottom = win32api.GetMonitorInfo(monitor)["Work"]
+    return int(left), int(top), int(right), int(bottom)
+
+
 def format_match_overlay_line(attempt: int, match: MatchResult) -> str:
     """单行摘要：#次 满足x/y | 简短条件状态。"""
     hits = list(match.hits or [])
@@ -54,6 +67,7 @@ class FloatingMatchOverlay:
     """屏幕右下角置顶浮动日志，每行淡入淡出。"""
 
     WIDTH = 420
+    HEIGHT = 276
     MAX_LINES = 8
     FADE_IN_MS = 220
     HOLD_MS = 2800
@@ -74,8 +88,13 @@ class FloatingMatchOverlay:
         self._last_attempt_shown = -1
         self._visible = False
         self._closing = False
+        self._work_area: Optional[tuple[int, int, int, int]] = None
 
-    def show(self) -> None:
+    def show(self, anchor_point: tuple[int, int]) -> None:
+        self._work_area = _monitor_work_area(anchor_point)
+        self._show_window()
+
+    def _show_window(self) -> None:
         if self._win is not None and self._win.winfo_exists():
             self._place()
             try:
@@ -113,19 +132,7 @@ class FloatingMatchOverlay:
     def push_status(self, status: RunStatus) -> None:
         """根据运行状态推送一行（同 attempt 不重复）。"""
         if not status.running:
-            # 结束时补最后一行（若有）
-            if (
-                status.last_match is not None
-                and status.attempt != self._last_attempt_shown
-            ):
-                self._ensure_shown()
-                line = format_match_overlay_line(status.attempt, status.last_match)
-                if status.stop_reason and status.stop_reason.value == "success":
-                    line = "★ 完成 " + line
-                elif status.message:
-                    line = f"■ {status.message} | " + line
-                self.add_line(line, success=bool(status.last_match.success))
-                self._last_attempt_shown = status.attempt
+            self.hide()
             return
 
         self._ensure_shown()
@@ -135,6 +142,9 @@ class FloatingMatchOverlay:
             return
         self._last_attempt_shown = status.attempt
         line = format_match_overlay_line(status.attempt, status.last_match)
+        if status.workflow_step_name:
+            name = status.workflow_step_name[:14]
+            line = f"[{status.workflow_step_index}. {name}] {line}"
         self.add_line(line, success=bool(status.last_match.success))
 
     def add_line(self, text: str, success: bool = False) -> None:
@@ -180,7 +190,9 @@ class FloatingMatchOverlay:
 
     def _ensure_shown(self) -> None:
         if not self._visible or self._win is None or not self._win.winfo_exists():
-            self.show()
+            if self._work_area is None:
+                raise RuntimeError("日志浮窗尚未设置目标显示器")
+            self._show_window()
 
     def _create(self) -> None:
         win = ctk.CTkToplevel(self.master)
@@ -188,11 +200,8 @@ class FloatingMatchOverlay:
         win.title("匹配浮动日志")
         win.overrideredirect(True)
         win.attributes("-topmost", True)
-        try:
-            # Windows：轻微透明
-            win.attributes("-alpha", 0.92)
-        except Exception:
-            pass
+        # 首帧先透明布局，避免按 Toplevel 初始尺寸定位后再次跳动。
+        win.attributes("-alpha", 0.0)
         # 不抢焦点
         try:
             win.transient(self.master)
@@ -220,8 +229,11 @@ class FloatingMatchOverlay:
 
         self._win = win
         self._host = host
-        self._place()
+        win.geometry(f"{self.WIDTH}x{self.HEIGHT}")
         win.deiconify()
+        win.update_idletasks()
+        self._place()
+        win.attributes("-alpha", 0.92)
         # 避免启动时抢焦点
         try:
             win.after(10, lambda: win.attributes("-topmost", True))
@@ -270,20 +282,18 @@ class FloatingMatchOverlay:
     def _place(self) -> None:
         if self._win is None:
             return
-        try:
-            sw = self._win.winfo_screenwidth()
-            sh = self._win.winfo_screenheight()
-        except Exception:
-            sw, sh = 1920, 1080
-        # 高度随行数略变
-        h = 36 + max(1, len(self._lines)) * 28 + 16
-        h = max(90, min(h, 320))
-        x = sw - self.WIDTH - self.PAD
-        y = sh - h - self.PAD - 48  # 预留任务栏
-        try:
-            self._win.geometry(f"{self.WIDTH}x{h}+{x}+{y}")
-        except Exception:
-            pass
+        if self._work_area is None:
+            raise RuntimeError("日志浮窗尚未设置目标显示器")
+        # 固定视口高度，避免日志新增或淡出删除时窗口反复伸缩。
+        self._win.geometry(f"{self.WIDTH}x{self.HEIGHT}")
+        self._win.update_idletasks()
+
+        _, _, right, bottom = self._work_area
+        window_width = self._win.winfo_width()
+        window_height = self._win.winfo_height()
+        x = right - window_width - self.PAD
+        y = bottom - window_height - self.PAD
+        self._win.geometry(f"+{x}+{y}")
 
     def _cancel_item(self, item: dict) -> None:
         item["alive"] = False

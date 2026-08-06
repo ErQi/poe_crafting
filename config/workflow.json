@@ -1,0 +1,185 @@
+{
+  "version": 1,
+  "name": "威武皮盔：T1 元素伤害 + T1 生命底子",
+  "start_step_id": "transmute",
+  "steps": [
+    {
+      "id": "transmute",
+      "name": "蜕变并检查 T1 元素或生命",
+      "enabled": true,
+      "currency_template": "currency_transmutation",
+      "expected_rarity": "魔法",
+      "ruleset": {
+        "version": 2,
+        "group_combine": "all",
+        "groups": [
+          {
+            "id": "transmute-condition",
+            "name": "先保留任一 T1 目标",
+            "combine": "any",
+            "enabled": true,
+            "rules": [
+              {
+                "pattern": "元素伤害提高",
+                "operator": ">=",
+                "threshold": 19.0,
+                "enabled": true,
+                "note": "T1",
+                "id": "transmute-t1-elemental-damage"
+              },
+              {
+                "pattern": "最大生命",
+                "operator": ">=",
+                "threshold": 130.0,
+                "enabled": true,
+                "note": "T1 档位 130-144",
+                "id": "transmute-t1-maximum-life"
+              }
+            ]
+          }
+        ]
+      },
+      "on_success": "goto:augment_missing_target",
+      "on_failure": "next"
+    },
+    {
+      "id": "alteration_t1_elemental",
+      "name": "改造洗出 T1 元素或生命",
+      "enabled": true,
+      "currency_template": "currency_alteration",
+      "expected_rarity": "魔法",
+      "ruleset": {
+        "version": 2,
+        "group_combine": "all",
+        "groups": [
+          {
+            "id": "alteration-condition",
+            "name": "先保留任一 T1 目标",
+            "combine": "any",
+            "enabled": true,
+            "rules": [
+              {
+                "pattern": "元素伤害提高",
+                "operator": ">=",
+                "threshold": 19.0,
+                "enabled": true,
+                "note": "T1",
+                "id": "t1-elemental-damage"
+              },
+              {
+                "pattern": "最大生命",
+                "operator": ">=",
+                "threshold": 130.0,
+                "enabled": true,
+                "note": "T1 档位 130-144",
+                "id": "alteration-t1-maximum-life"
+              }
+            ]
+          }
+        ]
+      },
+      "on_success": "next",
+      "on_failure": "repeat"
+    },
+    {
+      "id": "augment_missing_target",
+      "name": "单词缀时增幅尝试补齐另一目标",
+      "enabled": true,
+      "currency_template": "currency_augmentation",
+      "expected_rarity": "魔法",
+      "ruleset": {
+        "version": 2,
+        "group_combine": "all",
+        "groups": [
+          {
+            "id": "augmentation-condition",
+            "name": "增幅后检查元素与生命",
+            "combine": "all",
+            "enabled": true,
+            "rules": [
+              {
+                "pattern": "元素伤害提高",
+                "operator": ">=",
+                "threshold": 19.0,
+                "enabled": true,
+                "note": "T1 档位 19-22",
+                "id": "augmentation-t1-elemental-damage"
+              },
+              {
+                "pattern": "最大生命",
+                "operator": ">=",
+                "threshold": 130.0,
+                "enabled": true,
+                "note": "T1 档位 130-144",
+                "id": "augmentation-t1-maximum-life"
+              }
+            ]
+          }
+        ]
+      },
+      "on_success": "next",
+      "on_failure": "next"
+    },
+    {
+      "id": "regal_t1_life",
+      "name": "富豪尝试补齐 T1 元素与生命",
+      "enabled": true,
+      "currency_template": "currency_regal",
+      "expected_rarity": "稀有",
+      "ruleset": {
+        "version": 2,
+        "group_combine": "all",
+        "groups": [
+          {
+            "id": "regal-condition",
+            "name": "同时具备 T1 元素与 T1 生命",
+            "combine": "all",
+            "enabled": true,
+            "rules": [
+              {
+                "pattern": "元素伤害提高",
+                "operator": ">=",
+                "threshold": 19.0,
+                "enabled": true,
+                "note": "T1",
+                "id": "regal-keeps-elemental"
+              },
+              {
+                "pattern": "最大生命",
+                "operator": ">=",
+                "threshold": 130.0,
+                "enabled": true,
+                "note": "T1",
+                "id": "t1-maximum-life"
+              }
+            ]
+          }
+        ]
+      },
+      "on_success": "finish",
+      "on_failure": "next"
+    },
+    {
+      "id": "scour_restart",
+      "name": "富豪失败后重铸并重来",
+      "enabled": true,
+      "currency_template": "currency_scouring",
+      "expected_rarity": "普通",
+      "ruleset": {
+        "version": 2,
+        "group_combine": "all",
+        "groups": [
+          {
+            "id": "scour-condition",
+            "name": "本步条件",
+            "combine": "all",
+            "enabled": true,
+            "rules": []
+          }
+        ]
+      },
+      "on_success": "goto:transmute",
+      "on_failure": "repeat"
+    }
+  ]
+}

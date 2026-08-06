@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
 
 from .models import Affix, Item
 
@@ -21,8 +20,16 @@ NUMBER_RE = re.compile(
 RANGE_IN_PARENS_RE = re.compile(r"\([^)]*\)")
 
 # 非词缀段落/行特征（简体中文客户端）
-HEADER_KEYS = ("稀有度:", "物品等级:", "品质:", "插槽:", "需求:")
+HEADER_KEYS = (
+    "物品类别:",
+    "稀有度:",
+    "物品等级:",
+    "品质:",
+    "插槽:",
+    "需求:",
+)
 SKIP_LINE_PREFIXES = (
+    "物品类别:",
     "需求:",
     "等级:",
     "力量:",
@@ -37,6 +44,7 @@ SKIP_LINE_PREFIXES = (
     "物品数量:",
     "物品稀有度:",
     "等级需求:",
+    "出售获得通货:",
 )
 SKIP_EXACT = {
     "已鉴定",
@@ -48,12 +56,57 @@ SKIP_EXACT = {
     "Mirrored",
     "Corrupted",
     "Unidentified",
+    # 影响来源与出售绑定信息是物品元数据，不是可由通货增减的显式词缀。
+    "塑界者物品",
+    "裂界者物品",
+    "圣战者物品",
+    "救赎者物品",
+    "狩猎者物品",
+    "督军物品",
+    "焚界者物品",
+    "灭界者物品",
 }
 IMPLICIT_MARKERS = ("(implicit)", "（固有）", "(固有)")
 ENCHANT_MARKERS = ("(enchant)", "（附魔）", "(附魔)")
 FRACTURED_MARKERS = ("(fractured)", "（破裂）", "(破裂)")
 CRAFTED_MARKERS = ("(crafted)", "（工艺）", "(工艺)")
 RUNE_MARKERS = ("(rune)", "（符文）", "(符文)")
+
+
+def _normalize_metadata_line(line: str) -> str:
+    """规范国服复制文本的字段名，不改动物品名或词缀正文。
+
+    国服会输出 ``稀 有 度: 魔法``，而其他字段通常不带空格。
+    这里只压缩第一个冒号前的空白，兼容两种格式。
+    """
+
+    s = line.strip().replace("：", ":")
+    if ":" not in s:
+        return s
+    label, value = s.split(":", 1)
+    label = re.sub(r"\s+", "", label)
+    return f"{label}:{value.lstrip()}"
+
+
+def _is_modifier_descriptor_line(line: str) -> bool:
+    s = line.strip()
+    return s.startswith("{") and s.endswith("}")
+
+
+def _is_explicit_modifier_descriptor(line: str) -> bool:
+    if not _is_modifier_descriptor_line(line):
+        return False
+    return any(
+        marker in line
+        for marker in (
+            "前缀词缀",
+            "后缀词缀",
+            "前缀属性",
+            "后缀属性",
+            "Prefix Modifier",
+            "Suffix Modifier",
+        )
+    )
 
 
 def extract_numbers(text: str) -> list[float]:
@@ -100,14 +153,19 @@ BASE_STAT_LINE_RE = re.compile(
 
 def _is_affix_line(line: str) -> bool:
     s = line.strip()
+    normalized = _normalize_metadata_line(s)
     if not s:
+        return False
+    # 开启高级词缀说明后，复制文本会在实际词缀前附带
+    # `{ ▲ 前缀词缀 ... }` / `{ ▽ 后缀词缀 ... }`；它们只是说明行。
+    if _is_modifier_descriptor_line(s):
         return False
     if s in SKIP_EXACT:
         return False
-    if s.startswith("稀有度:"):
+    if normalized.startswith("稀有度:"):
         return False
     for p in SKIP_LINE_PREFIXES:
-        if s.startswith(p):
+        if normalized.startswith(p):
             return False
     if BASE_STAT_LINE_RE.match(s):
         return False
@@ -150,9 +208,12 @@ def parse_item_text(text: str) -> Item:
     # 第一段：稀有度 + 名称 + 基底
     for ln in header:
         s = ln.strip()
-        if s.startswith("稀有度:"):
-            item.rarity = s.split(":", 1)[1].strip()
-        elif not item.name and s and not s.startswith("稀有度:"):
+        normalized = _normalize_metadata_line(s)
+        if normalized.startswith("稀有度:"):
+            item.rarity = normalized.split(":", 1)[1].strip()
+        elif any(normalized.startswith(key) for key in HEADER_KEYS):
+            continue
+        elif not item.name and s:
             item.name = s
         elif item.name and not item.base_type and s and s != item.name:
             item.base_type = s
@@ -163,8 +224,14 @@ def parse_item_text(text: str) -> Item:
 
     # 扫描全部行做 flags / item_level
     all_lines = [ln.strip() for sec in sections for ln in sec]
+    descriptor_lines = [s for s in all_lines if _is_modifier_descriptor_line(s)]
+    if descriptor_lines:
+        item.explicit_mod_count = sum(
+            1 for s in descriptor_lines if _is_explicit_modifier_descriptor(s)
+        )
     for s in all_lines:
-        if s.startswith("物品等级:"):
+        normalized = _normalize_metadata_line(s)
+        if normalized.startswith("物品等级:"):
             m = re.search(r"(\d+)", s)
             if m:
                 item.item_level = int(m.group(1))
@@ -190,9 +257,12 @@ def parse_item_text(text: str) -> Item:
             continue
         # 整段若以需求/插槽/品质等开头则跳过
         first = next((x.strip() for x in sec if x.strip()), "")
-        if first.startswith(("需求:", "插槽:", "品质:", "堆叠数量:", "地图等级:")):
+        normalized_first = _normalize_metadata_line(first)
+        if normalized_first.startswith(
+            ("需求:", "插槽:", "品质:", "堆叠数量:", "地图等级:")
+        ):
             continue
-        if first.startswith("物品等级:"):
+        if normalized_first.startswith("物品等级:"):
             continue
         # 风味文本段通常很长且无数字、或不含典型词缀模式——仍尝试收集短行
         for ln in sec:
@@ -218,6 +288,14 @@ def parse_item_text(text: str) -> Item:
         values = extract_numbers(clean)
         item.affixes.append(Affix(text=clean, values=values))
 
+    if item.explicit_mod_count is None:
+        item.explicit_mod_count = len(item.affixes)
+
+    # 国服普通装备的 Ctrl+C 文本可能不带“稀有度”行。
+    # 只在已确认存在物品等级时将空值视为普通，避免把任意剪贴板文字当成装备。
+    if not item.rarity and item.item_level is not None:
+        item.rarity = "普通"
+
     # 至少要有稀有度或名称才算解析成功
     if not item.rarity and not item.name:
         raise ItemParseError("未识别到物品稀有度或名称")
@@ -231,6 +309,7 @@ def format_item_preview(item: Item) -> str:
         f"名称: {item.name or '-'}",
         f"基底: {item.base_type or '-'}",
         f"物品等级: {item.item_level if item.item_level is not None else '-'}",
+        f"显式词缀数: {item.craft_affix_count}",
     ]
     if item.corrupted:
         lines.append("状态: 已腐化")

@@ -1,31 +1,36 @@
 from __future__ import annotations
 
-import customtkinter as ctk
-import tkinter as tk
-from tkinter import messagebox
-from pathlib import Path
 import subprocess
 import sys
 import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import messagebox
 from typing import Optional
+
+import customtkinter as ctk
 
 from ..automation import AutomationConfig, CraftAutomation
 from ..config_store import (
     load_ruleset,
     load_settings,
+    load_workflow,
     resolve_path,
     save_ruleset,
     save_settings,
+    save_workflow,
 )
+from ..currencies import CURRENCY_BY_TEMPLATE, currency_label
 from ..hotkeys import HotkeyService
 from ..input_control import focus_game_window
 from ..item_parser import ItemParseError, format_item_preview, parse_item_text
-from ..matcher import match_item, match_ruleset
+from ..matcher import match_ruleset
 from ..models import (
     CRAFT_PRESET_LABELS,
     CRAFT_PRESETS,
     AppSettings,
     CraftMode,
+    CraftWorkflow,
     Item,
     MatchMode,
     RuleSet,
@@ -33,19 +38,21 @@ from ..models import (
     StopReason,
 )
 from ..vision import VisionService
+from ..workflow import validate_workflow
 from . import widgets
 from .overlay import FloatingMatchOverlay
-
+from .workflow_editor import WorkflowEditor
 
 STOP_REASON_TEXT = {
     StopReason.SUCCESS: "成功：已命中目标",
     StopReason.USER_STOP: "已手动停止",
     StopReason.MAX_ATTEMPTS: "达到最大尝试次数",
     StopReason.PARSE_FAILURES: "连续解析失败",
-    StopReason.TEMPLATE_NOT_FOUND: "模板未找到",
+    StopReason.TEMPLATE_NOT_FOUND: "匹配资源未找到",
     StopReason.LIFEFORCE_INSUFFICIENT: "生命力/材料不足",
     StopReason.UNCHANGED: "词缀连续无变化",
     StopReason.WINDOW_NOT_FOUND: "未找到游戏窗口",
+    StopReason.WORKFLOW_STOP: "流程按配置停止",
     StopReason.ERROR: "运行异常",
     StopReason.NOT_STARTED: "未开始",
 }
@@ -57,12 +64,15 @@ class CraftApp(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        self.title("PoE1 花园自动工艺")
+        self.title("PoE1 自动工艺")
         self.geometry("1180x780")
         self.minsize(1020, 680)
 
         self.settings: AppSettings = load_settings()
         self.ruleset: RuleSet = load_ruleset(resolve_path(self.settings.rules_file))
+        self.workflow: CraftWorkflow = load_workflow(
+            resolve_path(self.settings.workflow_file)
+        )
         self.current_item: Optional[Item] = None
 
         self.automation = CraftAutomation(
@@ -85,7 +95,7 @@ class CraftApp(ctk.CTk):
         self.after(100, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._log("就绪。请到「模板」页粘贴截图；再到「工艺」页配置规则并开始。")
+        self._log("就绪。单工艺在「工艺」页配置；通货状态机在「多步骤」页配置。")
         self._log(f"模板目录: {resolve_path(self.settings.templates_dir)}")
         self._log(f"紧急停止热键: {self.settings.hotkey_stop.upper()}")
 
@@ -97,12 +107,15 @@ class CraftApp(ctk.CTk):
         self.tabs = ctk.CTkTabview(self)
         self.tabs.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         tab_craft = self.tabs.add("工艺")
+        tab_workflow = self.tabs.add("多步骤")
         tab_tpl = self.tabs.add("模板")
         tab_craft.grid_columnconfigure(0, weight=1)
         tab_craft.grid_columnconfigure(1, weight=1)
         tab_craft.grid_rowconfigure(0, weight=1)
         tab_tpl.grid_columnconfigure(0, weight=1)
         tab_tpl.grid_rowconfigure(0, weight=1)
+        tab_workflow.grid_columnconfigure(0, weight=1)
+        tab_workflow.grid_rowconfigure(0, weight=1)
 
         left = ctk.CTkFrame(tab_craft)
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=0)
@@ -172,7 +185,11 @@ class CraftApp(ctk.CTk):
         self.craft_mode_menu = ctk.CTkOptionMenu(
             form,
             variable=self.craft_mode_var,
-            values=["通用：点击已选工艺", "预设：自动选择工艺"],
+            values=[
+                "通用：点击已选工艺",
+                "预设：自动选择工艺",
+                "多步骤：通货流程",
+            ],
             command=self._on_craft_mode_change,
             dynamic_resizing=False,
         )
@@ -266,6 +283,58 @@ class CraftApp(ctk.CTk):
         self.log_box.grid(row=2, column=0, sticky="nsew", padx=10, pady=(4, 10))
         self.log_box.configure(state="disabled")
 
+        # 多步骤通货流程页
+        workflow_wrap = ctk.CTkFrame(tab_workflow, fg_color="transparent")
+        workflow_wrap.grid(row=0, column=0, sticky="nsew")
+        workflow_wrap.grid_columnconfigure(0, weight=1)
+        workflow_wrap.grid_rowconfigure(1, weight=1)
+        workflow_head = ctk.CTkFrame(workflow_wrap, fg_color="transparent")
+        workflow_head.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 6))
+        ctk.CTkLabel(
+            workflow_head,
+            text="多步骤通货流程",
+            font=ctk.CTkFont(size=17, weight="bold"),
+        ).pack(side="left")
+        ctk.CTkLabel(
+            workflow_head,
+            text="每步独立配置通货、命中条件以及成功/失败去向",
+            text_color="gray",
+        ).pack(side="left", padx=12)
+
+        workflow_actions = ctk.CTkFrame(workflow_head, fg_color="transparent")
+        workflow_actions.pack(side="right")
+        self.btn_start_workflow = ctk.CTkButton(
+            workflow_actions,
+            text="开始流程",
+            width=104,
+            fg_color="#2d6a4f",
+            hover_color="#1b4332",
+            command=self._on_start_workflow,
+        )
+        self.btn_start_workflow.pack(side="left", padx=(0, 6))
+        self.btn_stop_workflow = ctk.CTkButton(
+            workflow_actions,
+            text="停止",
+            width=72,
+            fg_color="#9b2226",
+            hover_color="#6a040f",
+            command=self._on_stop,
+        )
+        self.btn_stop_workflow.pack(side="left", padx=(0, 6))
+        self.btn_save_workflow = ctk.CTkButton(
+            workflow_actions,
+            text="保存流程",
+            width=90,
+            command=self._on_save_workflow,
+        )
+        self.btn_save_workflow.pack(side="left")
+        self.workflow_editor = WorkflowEditor(
+            workflow_wrap,
+            on_change=self._on_workflow_changed,
+        )
+        self.workflow_editor.grid(row=1, column=0, sticky="nsew")
+        self.workflow_editor.set_workflow(self.workflow)
+
         # 模板页
         tpl_wrap = ctk.CTkFrame(tab_tpl, fg_color="transparent")
         tpl_wrap.grid(row=0, column=0, sticky="nsew")
@@ -312,7 +381,9 @@ class CraftApp(ctk.CTk):
         self.hotkey_entry.delete(0, "end")
         self.hotkey_entry.insert(0, s.hotkey_stop)
 
-        if s.craft_mode == CraftMode.PRESET.value:
+        if s.craft_mode == CraftMode.WORKFLOW.value:
+            self.craft_mode_menu.set("多步骤：通货流程")
+        elif s.craft_mode == CraftMode.PRESET.value:
             self.craft_mode_menu.set("预设：自动选择工艺")
         else:
             self.craft_mode_menu.set("通用：点击已选工艺")
@@ -320,6 +391,7 @@ class CraftApp(ctk.CTk):
         label = CRAFT_PRESET_LABELS.get(s.craft_preset)
         if label:
             self.preset_menu.set(label)
+        self._on_craft_mode_change(self.craft_mode_menu.get())
 
     def _collect_settings_from_ui(self) -> AppSettings:
         s = self.settings
@@ -338,9 +410,12 @@ class CraftApp(ctk.CTk):
         s.template_threshold = float(self.threshold_var.get())
         s.hotkey_stop = (self.hotkey_entry.get() or "f8").strip().lower()
         mode_label = self.craft_mode_menu.get()
-        s.craft_mode = (
-            CraftMode.PRESET.value if "预设" in mode_label else CraftMode.GENERIC.value
-        )
+        if "多步骤" in mode_label:
+            s.craft_mode = CraftMode.WORKFLOW.value
+        elif "预设" in mode_label:
+            s.craft_mode = CraftMode.PRESET.value
+        else:
+            s.craft_mode = CraftMode.GENERIC.value
         label = self.preset_menu.get()
         key = "reforge"
         for k, v in CRAFT_PRESET_LABELS.items():
@@ -358,8 +433,14 @@ class CraftApp(ctk.CTk):
     def _on_ruleset_changed(self, ruleset: RuleSet) -> None:
         self.ruleset = ruleset
 
-    def _on_craft_mode_change(self, _value: str) -> None:
-        pass
+    def _on_workflow_changed(self, workflow: CraftWorkflow) -> None:
+        self.workflow = workflow
+
+    def _on_craft_mode_change(self, value: str) -> None:
+        if hasattr(self, "preset_menu"):
+            self.preset_menu.configure(
+                state="disabled" if "多步骤" in value else "normal"
+            )
 
     def _on_threshold_slide(self, _value: float | str) -> None:
         self.threshold_label.configure(text=f"{float(self.threshold_var.get()):.2f}")
@@ -434,6 +515,10 @@ class CraftApp(ctk.CTk):
             f"说明: {status.message or '-'}",
             f"尝试次数: {status.attempt}",
         ]
+        if status.workflow_step_name:
+            body_lines.append(
+                f"最后步骤: {status.workflow_step_index}. {status.workflow_step_name}"
+            )
         if status.last_match is not None:
             body_lines.append(
                 f"匹配: {'成功' if status.last_match.success else '未达标'} ({status.last_match.mode})"
@@ -467,9 +552,12 @@ class CraftApp(ctk.CTk):
     def _set_running_ui(self, running: bool) -> None:
         state = "disabled" if running else "normal"
         self.btn_start.configure(state=state)
+        self.btn_start_workflow.configure(state=state)
         self.btn_refresh_item.configure(state=state)
         self.btn_parse_clipboard.configure(state=state)
+        self.btn_save_workflow.configure(state=state)
         self.btn_stop.configure(state="normal" if running else "disabled")
+        self.btn_stop_workflow.configure(state="normal" if running else "disabled")
 
     def _show_item(self, item: Item, match=None) -> None:
         self.current_item = item
@@ -520,6 +608,22 @@ class CraftApp(ctk.CTk):
         self._log("规则已保存（多组）")
         messagebox.showinfo("保存", "规则已写入 config/rules.json（支持多组 AND/OR）")
 
+    def _on_save_workflow(self) -> None:
+        self.workflow = self.workflow_editor.get_workflow()
+        path = resolve_path(self.settings.workflow_file)
+        save_workflow(self.workflow, path)
+        errors = validate_workflow(self.workflow)
+        self._log(f"多步骤流程已保存: {path}")
+        if errors:
+            messagebox.showwarning(
+                "流程已保存（暂不可执行）",
+                "配置已保存，但开始前还需修正：\n\n"
+                + "\n".join(f"• {x}" for x in errors),
+                parent=self,
+            )
+        else:
+            messagebox.showinfo("保存", f"流程已写入\n{path}", parent=self)
+
     def _on_save_settings(self) -> None:
         self.settings = self._collect_settings_from_ui()
         save_settings(self.settings)
@@ -565,9 +669,18 @@ class CraftApp(ctk.CTk):
             self.settings.craft_preset,
             "not_enough_lifeforce",
         ]
+        try:
+            self.workflow = self.workflow_editor.get_workflow()
+            for step in self.workflow.enabled_steps():
+                if step.currency_template and step.currency_template not in names:
+                    names.append(step.currency_template)
+        except Exception:
+            pass
         # 附带目录里其它已有 png
         for fname in vision.list_templates():
             stem = Path(fname).stem
+            if stem in CURRENCY_BY_TEMPLATE and stem not in names:
+                continue
             if stem not in names:
                 names.append(stem)
         seen: set[str] = set()
@@ -615,15 +728,20 @@ class CraftApp(ctk.CTk):
         ok_n = 0
         for r in results:
             name = r.get("template", "?")
+            label = currency_label(name)
+            display_name = f"{label}（内置通货）" if label != name else name
             if r.get("ok"):
                 ok_n += 1
-                line = f"✓ {name}.png  score={r.get('score')}  屏幕坐标={r.get('screen_xy')}"
+                line = (
+                    f"✓ {display_name}  score={r.get('score')}  "
+                    f"屏幕坐标={r.get('screen_xy')}"
+                )
                 self._log(f"  {line}")
                 lines.append(line)
             else:
                 score = r.get("score")
                 score_s = f"  score={score}" if score is not None else ""
-                line = f"✗ {name}.png  {r.get('error')}{score_s}"
+                line = f"✗ {display_name}  {r.get('error')}{score_s}"
                 self._log(f"  {line}")
                 lines.append(line)
 
@@ -665,37 +783,79 @@ class CraftApp(ctk.CTk):
             messagebox.showerror("错误", str(e))
             self._log(f"错误: {e}")
 
+    def _on_start_workflow(self) -> None:
+        """从多步骤页直接启动，并自动切换到流程模式。"""
+        if self.automation.is_running():
+            return
+        label = "多步骤：通货流程"
+        self.craft_mode_menu.set(label)
+        self._on_craft_mode_change(label)
+        self._on_start()
+
     def _on_start(self) -> None:
         if self.automation.is_running():
             return
         self.settings = self._collect_settings_from_ui()
         self.ruleset = self.rules_frame.get_ruleset()
-        enabled = [
-            r
-            for g in self.ruleset.groups
-            if g.enabled
-            for r in g.rules
-            if r.enabled and r.pattern.strip()
-        ]
-        if not enabled:
-            messagebox.showwarning("规则", "请至少添加并启用一条非空目标条件")
-            return
+        craft_mode = self.settings.craft_mode
+        workflow_snapshot: Optional[CraftWorkflow] = None
 
-        mode_label = self.craft_mode_menu.get()
-        craft_mode = (
-            CraftMode.PRESET.value if "预设" in mode_label else CraftMode.GENERIC.value
-        )
-        tips = [
-            "请确认：",
-            "1. 游戏为窗口/无边框模式，园艺台已打开",
-            "2. 物品已放入工艺槽",
-            "3. 已准备 craft_button.png 与 item_slot.png 模板",
-        ]
-        if craft_mode == CraftMode.GENERIC.value:
-            tips.append("4. 【通用模式】已在游戏内选中要重复的工艺")
+        if craft_mode == CraftMode.WORKFLOW.value:
+            workflow_snapshot = self.workflow_editor.get_workflow()
+            self.workflow = workflow_snapshot
+            errors = validate_workflow(workflow_snapshot)
+            if errors:
+                messagebox.showerror(
+                    "流程配置无效",
+                    "开始前请修正：\n\n" + "\n".join(f"• {x}" for x in errors),
+                    parent=self,
+                )
+                return
+            start = next(
+                (
+                    step
+                    for step in workflow_snapshot.steps
+                    if step.id == workflow_snapshot.start_step_id
+                ),
+                workflow_snapshot.enabled_steps()[0],
+            )
+            currencies = "、".join(
+                currency_label(name)
+                for name in dict.fromkeys(
+                    step.currency_template for step in workflow_snapshot.enabled_steps()
+                )
+            )
+            tips = [
+                "请确认：",
+                "1. 游戏为窗口/无边框模式，背包或通货仓库页保持打开",
+                "2. 目标装备与流程会用到的通货都在当前画面可见",
+                "3. item_slot.png 截取的是目标装备本身",
+                f"4. 流程使用通货: {currencies}（图标已内置）",
+                f"5. 起始步骤: {start.name}",
+            ]
         else:
-            tips.append("4. 【预设模式】对应工艺模板在可见区域内")
-        tips.append(f"5. 紧急停止热键: {self.settings.hotkey_stop.upper()}")
+            enabled = [
+                rule
+                for group in self.ruleset.groups
+                if group.enabled
+                for rule in group.rules
+                if rule.enabled and rule.pattern.strip()
+            ]
+            if not enabled:
+                messagebox.showwarning("规则", "请至少添加并启用一条非空目标条件")
+                return
+            tips = [
+                "请确认：",
+                "1. 游戏为窗口/无边框模式，园艺台已打开",
+                "2. 物品已放入工艺槽",
+                "3. 已准备 craft_button.png 与 item_slot.png 模板",
+            ]
+            if craft_mode == CraftMode.GENERIC.value:
+                tips.append("4. 【通用模式】已在游戏内选中要重复的工艺")
+            else:
+                tips.append("4. 【预设模式】对应工艺模板在可见区域内")
+
+        tips.append(f"6. 紧急停止热键: {self.settings.hotkey_stop.upper()}")
         tips.append("\n第三方自动化可能违反游戏条款，风险自负。是否开始？")
 
         if not messagebox.askyesno("确认执行", "\n".join(tips)):
@@ -703,6 +863,11 @@ class CraftApp(ctk.CTk):
 
         save_settings(self.settings)
         save_ruleset(self.ruleset, resolve_path(self.settings.rules_file))
+        if workflow_snapshot is not None:
+            save_workflow(
+                workflow_snapshot,
+                resolve_path(self.settings.workflow_file),
+            )
 
         # 在 GUI 主线程抢前台（比后台线程成功率高）
         self._log("正在切换到游戏窗口…")
@@ -741,12 +906,13 @@ class CraftApp(ctk.CTk):
             ruleset=self.ruleset,
             craft_mode=craft_mode,
             craft_preset=self.settings.craft_preset,
+            workflow=workflow_snapshot,
         )
         try:
             self._was_running = True
             try:
                 self._overlay._last_attempt_shown = -1  # noqa: SLF001
-                self._overlay.show()
+                self._overlay.show(win.center)
                 self._overlay.add_line("▶ 开始匹配…", success=False)
             except Exception:
                 pass

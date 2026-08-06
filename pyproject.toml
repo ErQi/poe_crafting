@@ -1,7 +1,7 @@
 [project]
 name = "poe-crafting"
 version = "0.1.0"
-description = "PoE1 花园自动工艺工具"
+description = "PoE1 单工艺与多步骤通货自动化工具"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

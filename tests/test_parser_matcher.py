@@ -37,6 +37,77 @@ class TestItemParser(unittest.TestCase):
         vals = extract_numbers("附加 5-10 (5-10) 物理伤害")
         self.assertEqual(vals, [5.0, 10.0])
 
+    def test_missing_rarity_with_item_level_is_normal_item(self) -> None:
+        item = parse_item_text(
+            "威武皮盔\n"
+            "--------\n"
+            "闪避值: 669\n"
+            "--------\n"
+            "物品等级: 100\n"
+            "--------\n"
+            "已鉴定"
+        )
+        self.assertEqual(item.rarity, "普通")
+
+    def test_influence_and_sale_metadata_are_not_counted_as_affixes(self) -> None:
+        item = parse_item_text(
+            "物品类别: 头部\n"
+            "稀有度: 魔法\n"
+            "丰饶的威武皮盔\n"
+            "威武皮盔\n"
+            "--------\n"
+            "物品等级: 100\n"
+            "--------\n"
+            "+130 最大生命\n"
+            "--------\n"
+            "圣战者物品\n"
+            "督军物品\n"
+            "出售获得通货:非绑定\n"
+            "--------\n"
+            "已鉴定"
+        )
+        self.assertEqual(item.name, "丰饶的威武皮盔")
+        self.assertEqual(item.base_type, "威武皮盔")
+        self.assertEqual(item.affix_texts(), ["+130 最大生命"])
+        self.assertEqual(item.craft_affix_count, 1)
+
+    def test_parse_real_cn_magic_text_with_spaced_rarity_and_mod_details(self) -> None:
+        item = parse_item_text(
+            "物品类别: 头部\n"
+            "稀 有 度: 魔法\n"
+            "督军的雪人之威武皮盔\n"
+            "--------\n"
+            "品质: +27% (augmented)\n"
+            "闪避值: 747 (augmented)\n"
+            "--------\n"
+            "需求:\n"
+            "等级: 84\n"
+            "敏捷: 224 (unmet)\n"
+            "--------\n"
+            "插槽: G\n"
+            "--------\n"
+            "物品等级: 84\n"
+            "--------\n"
+            "{ ▲ 前缀词缀 \"督军的\" (等阶：1)— 伤害, 元素 }\n"
+            "元素伤害提高 19(19-22)%\n"
+            "{ ▽ 后缀词缀 \"雪人之\" (等阶：5)— 元素, 冰霜, 抗性 }\n"
+            "+25(24-29)% 冰霜抗性\n"
+            "--------\n"
+            "圣战者物品\n"
+            "督军物品\n"
+            "--------\n"
+            "出售获得通货:非绑定"
+        )
+        self.assertEqual(item.rarity, "魔法")
+        self.assertEqual(item.item_level, 84)
+        self.assertEqual(
+            item.affix_texts(),
+            ["元素伤害提高 19(19-22)%", "+25(24-29)% 冰霜抗性"],
+        )
+        self.assertEqual(item.affixes[0].values, [19.0])
+        self.assertEqual(item.affixes[1].values, [25.0])
+        self.assertEqual(item.craft_affix_count, 2)
+
 
 class TestMatcher(unittest.TestCase):
     def setUp(self) -> None:

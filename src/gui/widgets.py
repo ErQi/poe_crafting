@@ -30,7 +30,7 @@ OPS = ["", ">=", ">", "<=", "<", "="]
 
 TEMPLATE_SLOT_DEFS: list[tuple[str, str, bool]] = [
     ("craft_button", "执行工艺按钮", True),
-    ("item_slot", "工艺槽物品", True),
+    ("item_slot", "目标装备位置（工艺槽/背包）", True),
     ("not_enough_lifeforce", "生命力不足提示", False),
 ]
 for _k, _label in CRAFT_PRESET_LABELS.items():

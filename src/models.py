@@ -1,14 +1,15 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Optional
-import uuid
 
 
 class CraftMode(str, Enum):
     GENERIC = "generic"
     PRESET = "preset"
+    WORKFLOW = "workflow"
 
 
 class MatchMode(str, Enum):
@@ -34,6 +35,7 @@ class StopReason(str, Enum):
     LIFEFORCE_INSUFFICIENT = "lifeforce_insufficient"
     UNCHANGED = "unchanged"
     WINDOW_NOT_FOUND = "window_not_found"
+    WORKFLOW_STOP = "workflow_stop"
     ERROR = "error"
     NOT_STARTED = "not_started"
 
@@ -73,12 +75,21 @@ class Item:
     base_type: str = ""
     item_level: Optional[int] = None
     affixes: list[Affix] = field(default_factory=list)
+    # 高级词缀说明中的前/后缀条数；用于判断魔法物品能否使用增幅石。
+    # 老格式没有说明行时保持 None，并回退到实际词缀行数量。
+    explicit_mod_count: Optional[int] = None
     corrupted: bool = False
     raw_text: str = ""
     flags: list[str] = field(default_factory=list)
 
     def affix_texts(self) -> list[str]:
         return [a.text for a in self.affixes]
+
+    @property
+    def craft_affix_count(self) -> int:
+        if self.explicit_mod_count is not None:
+            return self.explicit_mod_count
+        return len(self.affixes)
 
 
 @dataclass
@@ -210,6 +221,93 @@ class RuleSet:
 
 
 @dataclass
+class CraftStep:
+    """多步骤通货流程中的一个动作与其结果分支。"""
+
+    name: str = "新步骤"
+    currency_template: str = ""
+    expected_rarity: str = ""
+    ruleset: RuleSet = field(
+        default_factory=lambda: RuleSet(groups=[RuleGroup(name="本步条件")])
+    )
+    on_success: str = "next"
+    on_failure: str = "repeat"
+    enabled: bool = True
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "enabled": self.enabled,
+            "currency_template": self.currency_template,
+            "expected_rarity": self.expected_rarity,
+            "ruleset": self.ruleset.to_dict(),
+            "on_success": self.on_success,
+            "on_failure": self.on_failure,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CraftStep":
+        raw_ruleset = data.get("ruleset")
+        if not isinstance(raw_ruleset, dict):
+            # 兼容早期草案中直接放在 step.rules 的单组格式。
+            raw_rules = data.get("rules") if isinstance(data.get("rules"), list) else []
+            raw_ruleset = {
+                "match_mode": str(data.get("match_mode") or MatchMode.ALL.value),
+                "rules": raw_rules,
+            }
+        return cls(
+            id=str(data.get("id") or uuid.uuid4()),
+            name=str(data.get("name") or "新步骤"),
+            enabled=bool(data.get("enabled", True)),
+            currency_template=str(data.get("currency_template") or "").strip(),
+            expected_rarity=str(data.get("expected_rarity") or "").strip(),
+            ruleset=RuleSet.from_dict(raw_ruleset),
+            on_success=str(data.get("on_success") or "next"),
+            on_failure=str(data.get("on_failure") or "repeat"),
+        )
+
+
+@dataclass
+class CraftWorkflow:
+    """可持久化的多步骤通货制作流程。"""
+
+    name: str = "多步骤通货流程"
+    steps: list[CraftStep] = field(default_factory=list)
+    start_step_id: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "name": self.name,
+            "start_step_id": self.start_step_id,
+            "steps": [step.to_dict() for step in self.steps],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "CraftWorkflow":
+        if not isinstance(data, dict):
+            return cls()
+        raw_steps = data.get("steps") if isinstance(data.get("steps"), list) else []
+        steps = [CraftStep.from_dict(x) for x in raw_steps if isinstance(x, dict)]
+        start_step_id = str(data.get("start_step_id") or "")
+        if start_step_id and not any(step.id == start_step_id for step in steps):
+            start_step_id = ""
+        return cls(
+            name=str(data.get("name") or "多步骤通货流程"),
+            steps=steps,
+            start_step_id=start_step_id,
+        )
+
+    def enabled_steps(self) -> list[CraftStep]:
+        return [step for step in self.steps if step.enabled]
+
+    def get_step(self, step_id: str) -> Optional[CraftStep]:
+        return next((step for step in self.steps if step.id == step_id), None)
+
+
+@dataclass
 class RuleHit:
     rule: MatchRule
     matched: bool
@@ -233,8 +331,16 @@ class GroupMatchResult:
         parts = []
         for h in self.hits:
             m = "✓" if h.matched else "✗"
-            thr = h.rule.threshold if h.rule.threshold is not None else ""
-            parts.append(f"{m}{h.rule.pattern}{h.rule.operator or ''}{thr}")
+            threshold = h.rule.threshold
+            thr = f"{threshold:g}" if threshold is not None else ""
+            actual = (
+                f"（实际={h.actual_value:g}）"
+                if h.actual_value is not None
+                else ""
+            )
+            parts.append(
+                f"{m}{h.rule.pattern}{h.rule.operator or ''}{thr}{actual}"
+            )
         body = " · ".join(parts) if parts else "(空组)"
         return f"{mark}[{self.group.name}|{logic}] {body}"
 
@@ -280,6 +386,7 @@ class AppSettings:
     craft_preset: str = "reforge"
     templates_dir: str = "assets/templates"
     rules_file: str = "config/rules.json"
+    workflow_file: str = "config/workflow.json"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -305,6 +412,8 @@ class RunStatus:
     last_match: Optional[MatchResult] = None
     stop_reason: StopReason = StopReason.NOT_STARTED
     message: str = ""
+    workflow_step_name: str = ""
+    workflow_step_index: int = 0
 
 
 def _optional_float(value: Any) -> Optional[float]:

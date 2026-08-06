@@ -4,7 +4,15 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .models import AppSettings, MatchMode, MatchRule, RuleGroup, RuleSet
+from .models import (
+    AppSettings,
+    CraftWorkflow,
+    MatchMode,
+    MatchRule,
+    RuleGroup,
+    RuleSet,
+)
+from .workflow import default_workflow
 
 
 def project_root() -> Path:
@@ -56,6 +64,22 @@ def load_ruleset(path: Path | None = None) -> RuleSet:
 def save_ruleset(ruleset: RuleSet, path: Path | None = None) -> None:
     rules_path = path or resolve_path("config/rules.json")
     save_json(rules_path, ruleset.to_dict())
+
+
+def load_workflow(path: Path | None = None) -> CraftWorkflow:
+    workflow_path = path or resolve_path("config/workflow.json")
+    if not workflow_path.exists():
+        return default_workflow()
+    data = load_json(workflow_path, {})
+    if not isinstance(data, dict):
+        return default_workflow()
+    workflow = CraftWorkflow.from_dict(data)
+    return workflow if workflow.steps else default_workflow()
+
+
+def save_workflow(workflow: CraftWorkflow, path: Path | None = None) -> None:
+    workflow_path = path or resolve_path("config/workflow.json")
+    save_json(workflow_path, workflow.to_dict())
 
 
 def load_rules(path: Path | None = None) -> tuple[str, list[MatchRule]]:
