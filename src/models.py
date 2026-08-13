@@ -32,6 +32,7 @@ class StopReason(str, Enum):
     MAX_ATTEMPTS = "max_attempts"
     PARSE_FAILURES = "parse_failures"
     TEMPLATE_NOT_FOUND = "template_not_found"
+    CURRENCY_UNAVAILABLE = "currency_unavailable"
     LIFEFORCE_INSUFFICIENT = "lifeforce_insufficient"
     UNCHANGED = "unchanged"
     WINDOW_NOT_FOUND = "window_not_found"
@@ -67,6 +68,10 @@ class Affix:
     def first_value(self) -> Optional[float]:
         return self.values[0] if self.values else None
 
+    @property
+    def second_value(self) -> Optional[float]:
+        return self.values[1] if len(self.values) > 1 else None
+
 
 @dataclass
 class Item:
@@ -97,6 +102,8 @@ class MatchRule:
     pattern: str
     operator: str = CompareOp.NONE.value
     threshold: Optional[float] = None
+    # 双数值词缀的第二个阈值，例如「攻击附加 6 - 12 …」
+    threshold2: Optional[float] = None
     enabled: bool = True
     note: str = ""
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -111,6 +118,7 @@ class MatchRule:
             pattern=str(data.get("pattern") or ""),
             operator=str(data.get("operator") or ""),
             threshold=_optional_float(data.get("threshold")),
+            threshold2=_optional_float(data.get("threshold2")),
             enabled=bool(data.get("enabled", True)),
             note=str(data.get("note") or ""),
         )
@@ -118,12 +126,14 @@ class MatchRule:
 
 @dataclass
 class RuleGroup:
-    """一组词缀条件。组内用 combine(all/any) 组合。"""
+    """一组词缀条件。组内用 combine(all/any)，或至少命中 min_matches 条。"""
 
     name: str = "规则组"
     combine: str = MatchMode.ALL.value  # 组内 AND/OR
     enabled: bool = True
     rules: list[MatchRule] = field(default_factory=list)
+    # 填了就按「至少命中 N 条」判断，忽略组内 AND/OR
+    min_matches: Optional[int] = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,6 +142,7 @@ class RuleGroup:
             "name": self.name,
             "combine": self.combine,
             "enabled": self.enabled,
+            "min_matches": self.min_matches,
             "rules": [r.to_dict() for r in self.rules],
         }
 
@@ -148,12 +159,16 @@ class RuleGroup:
         )
         if combine not in (MatchMode.ALL.value, MatchMode.ANY.value):
             combine = MatchMode.ALL.value
+        min_matches = _optional_int(data.get("min_matches"))
+        if min_matches is not None and min_matches < 1:
+            min_matches = None
         return cls(
             id=str(data.get("id") or uuid.uuid4()),
             name=str(data.get("name") or "规则组"),
             combine=combine,
             enabled=bool(data.get("enabled", True)),
             rules=rules,
+            min_matches=min_matches,
         )
 
 
@@ -313,6 +328,7 @@ class RuleHit:
     matched: bool
     matched_affix: Optional[str] = None
     actual_value: Optional[float] = None
+    actual_values: list[float] = field(default_factory=list)
     reason: str = ""
     group_id: str = ""
     group_name: str = ""
@@ -327,20 +343,24 @@ class GroupMatchResult:
     @property
     def summary(self) -> str:
         logic = "AND" if self.group.combine == MatchMode.ALL.value else "OR"
+        if self.group.min_matches:
+            logic = f"至少{self.group.min_matches}"
         mark = "✓" if self.success else "✗"
         parts = []
         for h in self.hits:
             m = "✓" if h.matched else "✗"
             threshold = h.rule.threshold
             thr = f"{threshold:g}" if threshold is not None else ""
-            actual = (
-                f"（实际={h.actual_value:g}）"
-                if h.actual_value is not None
-                else ""
-            )
-            parts.append(
-                f"{m}{h.rule.pattern}{h.rule.operator or ''}{thr}{actual}"
-            )
+            if h.rule.threshold2 is not None:
+                thr = (
+                    f"{thr}-{h.rule.threshold2:g}" if thr else f"{h.rule.threshold2:g}"
+                )
+            actual = ""
+            if h.actual_values:
+                actual = "（实际=" + "-".join(f"{v:g}" for v in h.actual_values) + "）"
+            elif h.actual_value is not None:
+                actual = f"（实际={h.actual_value:g}）"
+            parts.append(f"{m}{h.rule.pattern}{h.rule.operator or ''}{thr}{actual}")
         body = " · ".join(parts) if parts else "(空组)"
         return f"{mark}[{self.group.name}|{logic}] {body}"
 
@@ -373,6 +393,7 @@ class AppSettings:
         default_factory=lambda: ["Path of Exile", "流放之路"]
     )
     hotkey_stop: str = "f8"
+    hotkey_start: str = "f7"
     max_attempts: int = 200
     max_parse_failures: int = 5
     max_unchanged: int = 8
@@ -421,5 +442,14 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
     try:
         return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
     except (TypeError, ValueError):
         return None

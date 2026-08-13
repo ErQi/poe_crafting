@@ -8,7 +8,7 @@ from statistics import median
 from typing import Callable, Optional
 
 from .clipboard_util import clear_clipboard, wait_clipboard_change
-from .currencies import currency_label
+from .currencies import currency_label, currency_stack_count
 from .input_control import (
     click_screen,
     find_game_window,
@@ -48,6 +48,10 @@ StatusFn = Callable[[RunStatus], None]
 WORKFLOW_CURRENCY_MAX_RMSE = 80.0
 WORKFLOW_CURRENCY_VERIFY_ATTEMPTS = 6
 WORKFLOW_CURRENCY_SELECT_DELAY_MS = 120
+
+
+class CurrencyUnavailableError(RuntimeError):
+    """所需通货的名称或剩余数量无法在点击前安全确认。"""
 
 
 def _workflow_asset_label(name: str) -> str:
@@ -174,6 +178,7 @@ class CraftAutomation:
         self._status = RunStatus()
         self._lock = threading.Lock()
         self._verified_currency_templates: set[str] = set()
+        self._currency_stack_counts: dict[str, int] = {}
 
     @property
     def status(self) -> RunStatus:
@@ -270,6 +275,7 @@ class CraftAutomation:
     ) -> None:
         s = config.settings
         self._verified_currency_templates.clear()
+        self._currency_stack_counts.clear()
         if config.workflow is None:
             self._finish(StopReason.ERROR, "未提供多步骤流程配置", 0, 0, 0)
             return
@@ -453,8 +459,8 @@ class CraftAutomation:
             required[1:],
         ):
             self._finish(
-                StopReason.TEMPLATE_NOT_FOUND,
-                "未能安全验证流程所需通货，未执行任何通货点击",
+                StopReason.CURRENCY_UNAVAILABLE,
+                "未找到数量可确认的流程通货，未执行任何通货点击",
                 0,
                 0,
                 0,
@@ -505,6 +511,7 @@ class CraftAutomation:
                     self._log("检测到窗口位置/尺寸变化，重新定位流程模板")
                     vision.clear_position_cache()
                     self._verified_currency_templates.clear()
+                    self._currency_stack_counts.clear()
                     item_ready = self._locate_workflow_required(
                         vision,
                         win,
@@ -521,8 +528,16 @@ class CraftAutomation:
                         )
                     )
                     if not currencies_ready:
-                        reason = StopReason.TEMPLATE_NOT_FOUND
-                        message = "窗口移动后流程模板重定位失败"
+                        reason = (
+                            StopReason.CURRENCY_UNAVAILABLE
+                            if item_ready
+                            else StopReason.TEMPLATE_NOT_FOUND
+                        )
+                        message = (
+                            "窗口移动后无法确认所需通货名称与数量"
+                            if item_ready
+                            else "窗口移动后目标装备重定位失败"
+                        )
                         break
                 focus_window(win.hwnd, retries=2, settle_ms=40)
 
@@ -541,7 +556,14 @@ class CraftAutomation:
                     f"#{attempt} 执行步骤 {step_index}/{len(workflow.steps)} "
                     f"{step.name} [使用{currency_label(step.currency_template)}]"
                 )
-                if not self._apply_currency_step(vision, win, step, s):
+                try:
+                    applied = self._apply_currency_step(vision, win, step, s)
+                except CurrencyUnavailableError as error:
+                    reason = StopReason.CURRENCY_UNAVAILABLE
+                    message = str(error)
+                    self._log(message)
+                    break
+                if not applied:
                     if self._should_stop():
                         reason = StopReason.USER_STOP
                         message = "用户停止"
@@ -1073,10 +1095,22 @@ class CraftAutomation:
             )
             copied_text = self._copy_hovered_text(hit, s)
             if copied_text is not None and expected_name in copied_text:
+                remaining = currency_stack_count(copied_text)
+                if remaining is None:
+                    self._log(
+                        f"候选是{expected_name}，但未识别到堆叠数量；"
+                        "为避免误点已拒绝"
+                    )
+                    return False
+                if remaining <= 0:
+                    self._log(f"{expected_name}堆叠数量为 0，已拒绝")
+                    return False
                 vision.set_cached_position(template_name, hit)
                 self._verified_currency_templates.add(template_name)
+                self._currency_stack_counts[template_name] = remaining
                 self._log(
-                    f"已验证{expected_name} @({hit.screen_x},{hit.screen_y})"
+                    f"已验证{expected_name} @({hit.screen_x},{hit.screen_y}) "
+                    f"| 剩余={remaining}"
                 )
                 return True
 
@@ -1191,13 +1225,16 @@ class CraftAutomation:
         if item_hit is None:
             return False
         item_region = _hit_client_region(item_hit)
-        currency_hit = vision.get_cached_position(step.currency_template)
+        template_name = step.currency_template
+        expected_name = currency_label(template_name)
+        currency_hit = vision.get_cached_position(template_name)
         if (
             currency_hit is None
-            or step.currency_template not in self._verified_currency_templates
+            or template_name not in self._verified_currency_templates
         ):
-            vision.clear_position_cache(step.currency_template)
-            self._verified_currency_templates.discard(step.currency_template)
+            vision.clear_position_cache(template_name)
+            self._verified_currency_templates.discard(template_name)
+            self._currency_stack_counts.pop(template_name, None)
             clean_frame = self._grab_workflow_frame_without_tooltip(
                 vision,
                 win,
@@ -1209,7 +1246,7 @@ class CraftAutomation:
                 vision,
                 win,
                 s,
-                step.currency_template,
+                template_name,
                 clean_frame,
                 [item_region],
             )
@@ -1217,14 +1254,66 @@ class CraftAutomation:
             currency_hit, item_region
         ):
             self._log(
-                f"已拒绝{currency_label(step.currency_template)}匹配结果："
+                f"已拒绝{expected_name}匹配结果："
                 "坐标落在目标装备区域内"
             )
-            vision.clear_position_cache(step.currency_template)
-            self._verified_currency_templates.discard(step.currency_template)
+            vision.clear_position_cache(template_name)
+            self._verified_currency_templates.discard(template_name)
+            self._currency_stack_counts.pop(template_name, None)
             currency_hit = None
         if currency_hit is None:
-            return False
+            raise CurrencyUnavailableError(
+                f"没有找到可用的{expected_name}：可能已用完或已移出可见区域"
+            )
+
+        # 定位通货时已经通过 Ctrl+C 核对名称与数量。正常循环直接使用
+        # 本地剩余量并递减，避免每次动作都等待剪贴板；只有旧配置/测试
+        # 没有数量快照时才在这里补读一次。
+        remaining = self._currency_stack_counts.get(template_name)
+        if remaining is None:
+            copied_text = self._copy_hovered_text(currency_hit, s)
+            remaining = (
+                currency_stack_count(copied_text)
+                if copied_text is not None and expected_name in copied_text
+                else None
+            )
+        if remaining is None or remaining <= 0:
+            if self._should_stop():
+                return False
+            self._log(
+                f"{expected_name}原位置已空或数量无法确认，正在查找其他堆叠…"
+            )
+            vision.clear_position_cache(template_name)
+            self._verified_currency_templates.discard(template_name)
+            self._currency_stack_counts.pop(template_name, None)
+            clean_frame = self._grab_workflow_frame_without_tooltip(
+                vision,
+                win,
+                s,
+            )
+            if clean_frame is None:
+                if self._should_stop():
+                    return False
+                raise CurrencyUnavailableError(
+                    f"无法确认{expected_name}剩余数量，已在点击前停止"
+                )
+            currency_hit = self._find_and_verify_currency_in_frame(
+                vision,
+                win,
+                s,
+                template_name,
+                clean_frame,
+                [item_region],
+            )
+            remaining = self._currency_stack_counts.get(template_name)
+            if currency_hit is None or remaining is None or remaining <= 0:
+                raise CurrencyUnavailableError(
+                    f"{expected_name}已用完，或当前画面中没有数量可确认的堆叠"
+                )
+
+        self._currency_stack_counts[template_name] = remaining
+        if remaining <= 5 or remaining % 100 == 0:
+            self._log(f"{expected_name}使用前剩余={remaining}")
 
         # 只有确认通货与目标装备是两个不同区域后才会发送鼠标动作。
         click_screen(
@@ -1246,6 +1335,17 @@ class CraftAutomation:
             settle_ms=15,
             button="left",
         )
+        remaining_after = remaining - 1
+        self._currency_stack_counts[template_name] = remaining_after
+        if remaining_after <= 0:
+            # 最后一个已经用于本轮装备；先让流程读取和判定结果。
+            # 若之后再次需要这种通货，会重新搜索其他堆叠，找不到即停止。
+            vision.clear_position_cache(template_name)
+            self._verified_currency_templates.discard(template_name)
+            self._log(
+                f"已使用当前堆叠最后 1 个{expected_name}；"
+                "后续再次需要时将自动检查并停止"
+            )
         return True
 
     def _check_lifeforce(

@@ -6,7 +6,8 @@ from typing import Optional
 
 import customtkinter as ctk
 
-from ..models import MatchMode, MatchResult, RunStatus
+from ..matcher import format_threshold_text
+from ..models import MatchMode, MatchResult, RunStatus, StopReason
 
 
 def _monitor_work_area(anchor_point: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -37,14 +38,30 @@ def format_match_overlay_line(attempt: int, match: MatchResult) -> str:
         m = "✓" if h.matched else "✗"
         name = (h.rule.pattern or "?")[:10]
         thr = ""
-        if h.rule.operator and h.rule.threshold is not None:
-            t = h.rule.threshold
-            thr = f"{h.rule.operator}{int(t) if float(t).is_integer() else t}"
+        if h.rule.operator and (
+            h.rule.threshold is not None or h.rule.threshold2 is not None
+        ):
+            t = format_threshold_text(h.rule.threshold, h.rule.threshold2)
+            thr = f"{h.rule.operator}{t}"
         parts.append(f"{m}{name}{thr}")
     if total > 6:
         parts.append("…")
     detail = " ".join(parts) if parts else "(无条件)"
     return f"{mark} #{attempt} 满足{ok_n}/{total} [{outer}] {detail}"
+
+
+def format_completion_overlay_lines(status: RunStatus, reason: str) -> list[str]:
+    """结束后的短提示，避免抢焦点弹窗。"""
+    mark = "✓" if status.stop_reason == StopReason.SUCCESS else "■"
+    lines = [f"{mark} {reason}"]
+    message = (status.message or "").strip()
+    if message and message != reason:
+        lines.append(message[:80])
+    lines.append(f"尝试 {status.attempt} 次")
+    if status.workflow_step_name:
+        name = status.workflow_step_name[:20]
+        lines.append(f"步骤 {status.workflow_step_index}. {name}")
+    return lines
 
 
 def _lerp_color(c1: str, c2: str, t: float) -> str:
@@ -74,6 +91,7 @@ class FloatingMatchOverlay:
     FADE_OUT_MS = 450
     STEP_MS = 30
     PAD = 18
+    COMPLETION_HOLD_MS = 5000
     BG = "#12141a"
     FG_OK = "#8fef9a"
     FG_FAIL = "#f0f0f0"
@@ -89,8 +107,10 @@ class FloatingMatchOverlay:
         self._visible = False
         self._closing = False
         self._work_area: Optional[tuple[int, int, int, int]] = None
+        self._auto_hide_id: Optional[str] = None
 
     def show(self, anchor_point: tuple[int, int]) -> None:
+        self._cancel_auto_hide()
         self._work_area = _monitor_work_area(anchor_point)
         self._show_window()
 
@@ -108,7 +128,9 @@ class FloatingMatchOverlay:
         self._visible = True
 
     def hide(self) -> None:
+        self._cancel_auto_hide()
         self._visible = False
+        self._clear_lines()
         if self._win is not None and self._win.winfo_exists():
             try:
                 self._win.withdraw()
@@ -118,9 +140,8 @@ class FloatingMatchOverlay:
     def destroy(self) -> None:
         self._closing = True
         self._visible = False
-        for item in list(self._lines):
-            self._cancel_item(item)
-        self._lines.clear()
+        self._cancel_auto_hide()
+        self._clear_lines()
         if self._win is not None:
             try:
                 self._win.destroy()
@@ -147,14 +168,25 @@ class FloatingMatchOverlay:
             line = f"[{status.workflow_step_index}. {name}] {line}"
         self.add_line(line, success=bool(status.last_match.success))
 
-    def add_line(self, text: str, success: bool = False) -> None:
+    def show_completion(self, lines: list[str], success: bool = False) -> None:
+        """结束提示：不抢焦点，5 秒后自动消失。"""
+        self._cancel_auto_hide()
+        self._ensure_work_area()
+        self._show_window()
+        self._clear_lines()
+        for text in reversed(lines):
+            self.add_line(text, success=success, persist=True)
+        if self._win is not None and self._win.winfo_exists():
+            self._auto_hide_id = self._win.after(self.COMPLETION_HOLD_MS, self.hide)
+
+    def add_line(self, text: str, success: bool = False, persist: bool = False) -> None:
         self._ensure_shown()
         if self._host is None or self._win is None:
             return
 
         # 超限先移除最旧
         while len(self._lines) >= self.MAX_LINES:
-            old = self._lines.pop(0)
+            old = self._lines.pop()
             self._cancel_item(old)
             try:
                 old["frame"].destroy()
@@ -163,7 +195,7 @@ class FloatingMatchOverlay:
 
         fg_target = self.FG_OK if success else self.FG_FAIL
         frame = ctk.CTkFrame(self._host, fg_color="transparent")
-        frame.pack(fill="x", pady=2, anchor="e")
+        frame.pack(fill="x", pady=2, anchor="e", before=self._top_frame())
         label = ctk.CTkLabel(
             frame,
             text=text,
@@ -184,15 +216,47 @@ class FloatingMatchOverlay:
             "after_ids": [],
             "alive": True,
         }
-        self._lines.append(item)
-        self._animate_fade_in(item)
+        self._lines.insert(0, item)
+        self._animate_fade_in(item, hold_ms=None if persist else self.HOLD_MS)
         self._place()
+
+    def _top_frame(self):
+        if not self._lines:
+            return None
+        return self._lines[0].get("frame")
+
+    def _ensure_work_area(self) -> None:
+        if self._work_area is not None:
+            return
+        try:
+            anchor = (int(self.master.winfo_rootx()), int(self.master.winfo_rooty()))
+        except Exception:
+            anchor = (0, 0)
+        self._work_area = _monitor_work_area(anchor)
 
     def _ensure_shown(self) -> None:
         if not self._visible or self._win is None or not self._win.winfo_exists():
+            self._ensure_work_area()
             if self._work_area is None:
                 raise RuntimeError("日志浮窗尚未设置目标显示器")
             self._show_window()
+
+    def _clear_lines(self) -> None:
+        for item in list(self._lines):
+            self._cancel_item(item)
+            try:
+                item["frame"].destroy()
+            except Exception:
+                pass
+        self._lines.clear()
+
+    def _cancel_auto_hide(self) -> None:
+        if self._auto_hide_id is not None and self._win is not None:
+            try:
+                self._win.after_cancel(self._auto_hide_id)
+            except Exception:
+                pass
+        self._auto_hide_id = None
 
     def _create(self) -> None:
         win = ctk.CTkToplevel(self.master)
@@ -317,7 +381,7 @@ class FloatingMatchOverlay:
         aid = self._win.after(ms, wrapper)
         item["after_ids"].append(aid)
 
-    def _animate_fade_in(self, item: dict) -> None:
+    def _animate_fade_in(self, item: dict, hold_ms: Optional[int] = HOLD_MS) -> None:
         steps = max(1, self.FADE_IN_MS // self.STEP_MS)
         state = {"i": 0}
 
@@ -335,7 +399,9 @@ class FloatingMatchOverlay:
                 self._schedule(item, self.STEP_MS, tick)
             else:
                 item["phase"] = "hold"
-                self._schedule(item, self.HOLD_MS, lambda: self._animate_fade_out(item))
+                if hold_ms is None:
+                    return
+                self._schedule(item, hold_ms, lambda: self._animate_fade_out(item))
 
         tick()
 

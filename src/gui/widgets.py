@@ -9,7 +9,7 @@ from PIL import Image
 from tkinter import messagebox, simpledialog
 
 from ..config_store import resolve_path
-from ..matcher import normalize_operator
+from ..matcher import format_threshold_text, normalize_operator, parse_threshold_text
 from ..models import (
     CRAFT_PRESET_LABELS,
     MatchMode,
@@ -133,14 +133,25 @@ class RuleSetEditor(ctk.CTkFrame):
         )
         self.inner_combine_menu.pack(side="left")
         self.inner_combine_menu.set("AND (全部)")
+        ctk.CTkLabel(ghead, text="至少匹配").pack(side="left", padx=(12, 4))
+        self.min_matches_entry = ctk.CTkEntry(
+            ghead, width=44, placeholder_text="空=逻辑"
+        )
+        self.min_matches_entry.pack(side="left")
+        self.min_matches_entry.bind(
+            "<FocusOut>", lambda _e: self._on_min_matches_change()
+        )
+        ctk.CTkLabel(
+            ghead, text="条", text_color="gray", font=ctk.CTkFont(size=11)
+        ).pack(side="left", padx=(2, 0))
 
         header = ctk.CTkFrame(body, fg_color="transparent")
         header.grid(row=1, column=0, sticky="ew", padx=8, pady=2)
         for text, w in (
             ("启用", 40),
-            ("包含文本", 150),
+            ("包含文本(可多词)", 170),
             ("算子", 60),
-            ("阈值", 70),
+            ("阈值(可6-12)", 90),
             ("备注", 100),
         ):
             ctk.CTkLabel(header, text=text, width=w, anchor="w").pack(
@@ -172,7 +183,7 @@ class RuleSetEditor(ctk.CTkFrame):
 
         tip = ctk.CTkLabel(
             body,
-            text="例：组A(生命 AND 抗性) OR 组B(能量护盾≥300) → 组间OR、组内AND",
+            text="至少匹配填数字则本组命中N条即可；包含文本可用空格/逗号写多关键字，如：攻击附加 冰霜伤害",
             text_color="gray",
             font=ctk.CTkFont(size=11),
             anchor="w",
@@ -246,7 +257,10 @@ class RuleSetEditor(ctk.CTkFrame):
         labels = []
         for i, g in enumerate(self._ruleset.groups):
             mark = "" if g.enabled else "∅"
-            logic = "∨" if g.combine == MatchMode.ANY.value else "∧"
+            if g.min_matches:
+                logic = f"≥{g.min_matches}"
+            else:
+                logic = "∨" if g.combine == MatchMode.ANY.value else "∧"
             labels.append(f"{mark}{g.name}[{logic}]"[:18])
         if not labels:
             labels = ["规则组 1"]
@@ -278,6 +292,9 @@ class RuleSetEditor(ctk.CTkFrame):
         self.group_title.configure(text=g.name)
         self.group_enabled.set(g.enabled)
         self.inner_combine_menu.set(_mode_label(g.combine))
+        self.min_matches_entry.delete(0, "end")
+        if g.min_matches:
+            self.min_matches_entry.insert(0, str(g.min_matches))
         self._rebuild_rules()
 
     def _sync_current_group_from_ui(self) -> None:
@@ -286,6 +303,15 @@ class RuleSetEditor(ctk.CTkFrame):
         g = self._current_group()
         g.enabled = bool(self.group_enabled.get())
         g.combine = _mode_from_label(self.inner_combine_menu.get())
+        raw_min = self.min_matches_entry.get().strip()
+        if raw_min == "":
+            g.min_matches = None
+        else:
+            try:
+                n = int(raw_min)
+                g.min_matches = n if n >= 1 else None
+            except ValueError:
+                g.min_matches = None
         # rules from widgets
         updated: list[MatchRule] = []
         for i, row in enumerate(self._rule_rows):
@@ -296,14 +322,9 @@ class RuleSetEditor(ctk.CTkFrame):
             rule.pattern = row["pattern"].get().strip()
             op = row["op"].get()
             rule.operator = normalize_operator("" if op in ("(无)", "无", None) else op)
-            thr_s = row["threshold"].get().strip()
-            if thr_s == "":
-                rule.threshold = None
-            else:
-                try:
-                    rule.threshold = float(thr_s)
-                except ValueError:
-                    rule.threshold = None
+            rule.threshold, rule.threshold2 = parse_threshold_text(
+                row["threshold"].get()
+            )
             rule.note = row["note"].get().strip()
             updated.append(rule)
         if len(updated) == len(g.rules):
@@ -317,6 +338,11 @@ class RuleSetEditor(ctk.CTkFrame):
     def _on_inner_combine(self, value: str) -> None:
         g = self._current_group()
         g.combine = _mode_from_label(value)
+        self._refresh_group_tabs()
+        self._emit()
+
+    def _on_min_matches_change(self) -> None:
+        self._sync_current_group_from_ui()
         self._refresh_group_tabs()
         self._emit()
 
@@ -409,10 +435,10 @@ class RuleSetEditor(ctk.CTkFrame):
             op_menu.set(cur_op)
             op_menu.pack(side="left", padx=2)
 
-            thr = ctk.CTkEntry(frame, width=70)
-            if rule.threshold is not None:
-                t = rule.threshold
-                thr.insert(0, str(int(t)) if float(t).is_integer() else str(t))
+            thr = ctk.CTkEntry(frame, width=90)
+            formatted = format_threshold_text(rule.threshold, rule.threshold2)
+            if formatted:
+                thr.insert(0, formatted)
             thr.pack(side="left", padx=2)
             thr.bind("<FocusOut>", lambda _e: self._emit())
 

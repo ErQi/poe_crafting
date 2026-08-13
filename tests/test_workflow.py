@@ -11,10 +11,12 @@ sys.path.insert(0, str(ROOT))
 from src.automation import (  # noqa: E402
     AutomationConfig,
     CraftAutomation,
+    CurrencyUnavailableError,
     _should_skip_augmentation,
     _workflow_currency_panel_exclusions,
     _workflow_currency_scales,
 )
+from src.currencies import currency_stack_count  # noqa: E402
 from src.item_parser import ItemParseError, parse_item_text  # noqa: E402
 from src.models import (  # noqa: E402
     AppSettings,
@@ -57,6 +59,14 @@ class TestWorkflow(unittest.TestCase):
         self.assertEqual(validate_workflow(self.workflow), [])
         restored = CraftWorkflow.from_dict(self.workflow.to_dict())
         self.assertEqual(restored.to_dict(), self.workflow.to_dict())
+
+    def test_currency_stack_count_parses_cn_variants(self) -> None:
+        self.assertEqual(currency_stack_count("堆叠数量: 17/20"), 17)
+        self.assertEqual(currency_stack_count("堆 叠 数 量： 1 / 20"), 1)
+        self.assertEqual(currency_stack_count("堆叠数量: 1,808 / 20"), 1808)
+        self.assertEqual(currency_stack_count("堆叠数量：12，345 / 20"), 12345)
+        self.assertEqual(currency_stack_count("Stack Size: 9/40"), 9)
+        self.assertIsNone(currency_stack_count("改造石"))
 
     def test_alteration_keeps_either_t1_elemental_or_t1_life(self) -> None:
         step = self.workflow.get_step("alteration_t1_elemental")
@@ -201,9 +211,11 @@ class TestWorkflow(unittest.TestCase):
         automation._verified_currency_templates.add(  # noqa: SLF001
             step.currency_template
         )
+        automation._currency_stack_counts[step.currency_template] = 12  # noqa: SLF001
         with (
             patch("src.automation.click_screen") as click,
             patch("src.automation.sleep_ms", return_value=False),
+            patch.object(automation, "_copy_hovered_text") as copy_currency,
         ):
             ok = automation._apply_currency_step(  # noqa: SLF001
                 _Vision(),  # type: ignore[arg-type]
@@ -213,6 +225,11 @@ class TestWorkflow(unittest.TestCase):
             )
 
         self.assertTrue(ok)
+        copy_currency.assert_not_called()
+        self.assertEqual(
+            automation._currency_stack_counts[step.currency_template],  # noqa: SLF001
+            11,
+        )
         self.assertEqual(
             click.call_args_list,
             [
@@ -220,6 +237,94 @@ class TestWorkflow(unittest.TestCase):
                 call(400, 500, settle_ms=15, button="left"),
             ],
         )
+
+    def test_last_currency_is_used_then_its_cache_is_invalidated(self) -> None:
+        step = self.workflow.get_step("alteration_t1_elemental")
+        assert step is not None
+        currency_hit = MatchHit("currency", 1.0, 100, 200, 100, 200, 20, 20)
+        item_hit = MatchHit("item", 1.0, 400, 500, 400, 500, 40, 40)
+
+        class _Vision:
+            cleared: list[str] = []
+
+            def get_cached_position(self, name: str):
+                return currency_hit if name == step.currency_template else item_hit
+
+            def clear_position_cache(self, name: str) -> None:
+                self.cleared.append(name)
+
+        vision = _Vision()
+        automation = CraftAutomation()
+        automation._verified_currency_templates.add(  # noqa: SLF001
+            step.currency_template
+        )
+        automation._currency_stack_counts[step.currency_template] = 1  # noqa: SLF001
+        with (
+            patch("src.automation.click_screen") as click,
+            patch("src.automation.sleep_ms", return_value=False),
+            patch.object(automation, "_copy_hovered_text") as copy_currency,
+        ):
+            ok = automation._apply_currency_step(  # noqa: SLF001
+                vision,  # type: ignore[arg-type]
+                object(),
+                step,
+                AppSettings(action_delay_ms=1),
+            )
+
+        self.assertTrue(ok)
+        copy_currency.assert_not_called()
+        self.assertEqual(click.call_count, 2)
+        self.assertIn(step.currency_template, vision.cleared)
+        self.assertNotIn(
+            step.currency_template,
+            automation._verified_currency_templates,  # noqa: SLF001
+        )
+        self.assertEqual(
+            automation._currency_stack_counts[step.currency_template],  # noqa: SLF001
+            0,
+        )
+
+    def test_empty_currency_slot_stops_before_any_click(self) -> None:
+        step = self.workflow.get_step("alteration_t1_elemental")
+        assert step is not None
+        currency_hit = MatchHit("currency", 1.0, 100, 200, 100, 200, 20, 20)
+        item_hit = MatchHit("item", 1.0, 400, 500, 400, 500, 40, 40)
+
+        class _Vision:
+            def get_cached_position(self, name: str):
+                return currency_hit if name == step.currency_template else item_hit
+
+            @staticmethod
+            def clear_position_cache(_name: str) -> None:
+                return
+
+        automation = CraftAutomation()
+        automation._verified_currency_templates.add(  # noqa: SLF001
+            step.currency_template
+        )
+        with (
+            patch.object(automation, "_copy_hovered_text", return_value=None),
+            patch.object(
+                automation,
+                "_grab_workflow_frame_without_tooltip",
+                return_value=object(),
+            ),
+            patch.object(
+                automation,
+                "_find_and_verify_currency_in_frame",
+                return_value=None,
+            ),
+            patch("src.automation.click_screen") as click,
+        ):
+            with self.assertRaisesRegex(CurrencyUnavailableError, "改造石已用完"):
+                automation._apply_currency_step(  # noqa: SLF001
+                    _Vision(),  # type: ignore[arg-type]
+                    object(),
+                    step,
+                    AppSettings(),
+                )
+
+        click.assert_not_called()
 
     def test_currency_action_never_clicks_when_match_is_inside_item(self) -> None:
         step = self.workflow.get_step("alteration_t1_elemental")
@@ -254,14 +359,14 @@ class TestWorkflow(unittest.TestCase):
             patch("src.automation.click_screen") as click,
             patch("src.automation.sleep_ms", return_value=False),
         ):
-            ok = automation._apply_currency_step(  # noqa: SLF001
-                _Vision(),  # type: ignore[arg-type]
-                object(),
-                step,
-                AppSettings(action_delay_ms=1),
-            )
+            with self.assertRaises(CurrencyUnavailableError):
+                automation._apply_currency_step(  # noqa: SLF001
+                    _Vision(),  # type: ignore[arg-type]
+                    object(),
+                    step,
+                    AppSettings(action_delay_ms=1),
+                )
 
-        self.assertFalse(ok)
         click.assert_not_called()
 
     def test_currency_action_never_clicks_an_unverified_candidate(self) -> None:
@@ -296,14 +401,14 @@ class TestWorkflow(unittest.TestCase):
             ),
             patch("src.automation.click_screen") as click,
         ):
-            ok = automation._apply_currency_step(  # noqa: SLF001
-                _Vision(),  # type: ignore[arg-type]
-                object(),
-                step,
-                AppSettings(),
-            )
+            with self.assertRaises(CurrencyUnavailableError):
+                automation._apply_currency_step(  # noqa: SLF001
+                    _Vision(),  # type: ignore[arg-type]
+                    object(),
+                    step,
+                    AppSettings(),
+                )
 
-        self.assertFalse(ok)
         click.assert_not_called()
 
     def test_reading_item_only_moves_and_presses_ctrl_c(self) -> None:
@@ -369,7 +474,10 @@ class TestWorkflow(unittest.TestCase):
         with patch.object(
             automation,
             "_copy_hovered_text",
-            return_value="物品类别: 可堆叠通货\n稀有度: 通货\n改造石",
+            return_value=(
+                "物品类别: 可堆叠通货\n稀有度: 通货\n改造石\n"
+                "堆叠数量: 27/40"
+            ),
         ):
             result = automation._find_and_verify_currency_in_frame(  # noqa: SLF001
                 vision,  # type: ignore[arg-type]
@@ -385,6 +493,10 @@ class TestWorkflow(unittest.TestCase):
         self.assertIn(
             step.currency_template,
             automation._verified_currency_templates,  # noqa: SLF001
+        )
+        self.assertEqual(
+            automation._currency_stack_counts[step.currency_template],  # noqa: SLF001
+            27,
         )
 
     def test_currency_scale_is_recalibrated_from_verified_icon_size(self) -> None:
@@ -490,7 +602,7 @@ class TestWorkflow(unittest.TestCase):
         with patch.object(
             automation,
             "_copy_hovered_text",
-            return_value="物品类别: 可堆叠通货\n增幅石",
+            return_value="物品类别: 可堆叠通货\n增幅石\n堆叠数量: 8/30",
         ):
             hit = automation._find_and_verify_currency_in_frame(  # noqa: SLF001
                 _Vision(),  # type: ignore[arg-type]
@@ -564,7 +676,7 @@ class TestWorkflow(unittest.TestCase):
         with patch.object(
             automation,
             "_copy_hovered_text",
-            return_value="物品类别: 可堆叠通货\n增幅石",
+            return_value="物品类别: 可堆叠通货\n增幅石\n堆叠数量: 8/30",
         ):
             hit = automation._find_and_verify_currency_in_frame(  # noqa: SLF001
                 _Vision(),  # type: ignore[arg-type]
@@ -715,6 +827,71 @@ class TestWorkflow(unittest.TestCase):
             )
 
         self.assertEqual(events, ["read", "apply:transmute"])
+
+    def test_workflow_reports_currency_unavailable_without_clicking(self) -> None:
+        class _Window:
+            hwnd = 1
+            title = "Path of Exile"
+            left = 0
+            top = 0
+            right = 1920
+            bottom = 1080
+            width = 1920
+            height = 1080
+
+        class _Vision:
+            @staticmethod
+            def template_path(name: str) -> Path:
+                return ROOT / "assets" / "templates" / f"{name}.png"
+
+        automation = CraftAutomation()
+        config = AutomationConfig(
+            settings=AppSettings(max_parse_failures=1, action_delay_ms=1),
+            ruleset=RuleSet(),
+            craft_mode=CraftMode.WORKFLOW.value,
+            craft_preset="",
+            workflow=self.workflow,
+        )
+        with (
+            patch(
+                "src.automation.focus_game_window",
+                return_value=(_Window(), True),
+            ),
+            patch("src.automation.find_game_window", return_value=_Window()),
+            patch("src.automation.focus_window", return_value=True),
+            patch.object(
+                automation,
+                "_locate_workflow_required",
+                return_value=True,
+            ),
+            patch.object(
+                automation,
+                "_locate_and_verify_workflow_currencies",
+                return_value=True,
+            ),
+            patch.object(
+                automation,
+                "_read_item_fast",
+                return_value=parse_item_text(_item_text("普通")),
+            ),
+            patch.object(
+                automation,
+                "_apply_currency_step",
+                side_effect=CurrencyUnavailableError("蜕变石已用完"),
+            ),
+            patch("src.automation.click_screen") as click,
+        ):
+            automation._run_workflow_with_vision(  # noqa: SLF001
+                config,
+                _Vision(),  # type: ignore[arg-type]
+            )
+
+        click.assert_not_called()
+        self.assertEqual(
+            automation.status.stop_reason,
+            StopReason.CURRENCY_UNAVAILABLE,
+        )
+        self.assertEqual(automation.status.message, "蜕变石已用完")
 
 
 if __name__ == "__main__":

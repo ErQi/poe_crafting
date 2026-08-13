@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 
@@ -67,6 +68,14 @@ CURRENCIES: tuple[CurrencyDefinition, ...] = (
 CURRENCY_BY_LABEL = {currency.label: currency for currency in CURRENCIES}
 CURRENCY_BY_TEMPLATE = {currency.template_name: currency for currency in CURRENCIES}
 
+# 国服字段偶尔会在汉字之间插入空格，例如“堆 叠 数 量”。
+# 同时兼容英文客户端，便于单元测试和以后切换语言。
+CURRENCY_STACK_COUNT_RE = re.compile(
+    r"(?:堆\s*叠\s*数\s*量|Stack\s+Size)\s*[:：]\s*([\d,，]+)"
+    r"(?:\s*/\s*[\d,，]+)?",
+    re.IGNORECASE,
+)
+
 
 def currency_label(template_name: str) -> str:
     definition = CURRENCY_BY_TEMPLATE.get(template_name)
@@ -76,3 +85,15 @@ def currency_label(template_name: str) -> str:
 def currency_template(label: str) -> str:
     definition = CURRENCY_BY_LABEL.get(label)
     return definition.template_name if definition is not None else ""
+
+
+def currency_stack_count(copied_text: str) -> int | None:
+    """从通货 Ctrl+C 文本中读取当前堆叠数量。"""
+
+    match = CURRENCY_STACK_COUNT_RE.search(copied_text or "")
+    if match is None:
+        return None
+    # 国服通货页的大堆叠会复制为“1,808 / 20”；斜杠前才是
+    # 实际剩余量，逗号只是千位分隔符。
+    raw_count = match.group(1).replace(",", "").replace("，", "")
+    return int(raw_count)

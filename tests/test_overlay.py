@@ -8,7 +8,10 @@ from unittest.mock import Mock
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from src.gui.overlay import FloatingMatchOverlay  # noqa: E402
+from src.gui.overlay import (  # noqa: E402
+    FloatingMatchOverlay,
+    format_completion_overlay_lines,
+)
 from src.models import RunStatus, StopReason  # noqa: E402
 
 
@@ -58,6 +61,41 @@ class TestFloatingMatchOverlay(unittest.TestCase):
         )
 
         overlay.hide.assert_called_once_with()
+
+    def test_completion_lines_include_reason_and_attempts(self) -> None:
+        status = RunStatus(
+            running=False,
+            attempt=12,
+            stop_reason=StopReason.SUCCESS,
+            message="流程完成：步骤「重铸」命中",
+            workflow_step_name="重铸",
+            workflow_step_index=2,
+        )
+        lines = format_completion_overlay_lines(status, "成功：已命中目标")
+        self.assertEqual(lines[0], "✓ 成功：已命中目标")
+        self.assertIn("流程完成：步骤「重铸」命中", lines)
+        self.assertIn("尝试 12 次", lines)
+        self.assertIn("步骤 2. 重铸", lines)
+
+    def test_show_completion_auto_hides_after_five_seconds(self) -> None:
+        overlay = FloatingMatchOverlay(object())
+        overlay._ensure_work_area = Mock()  # type: ignore[method-assign]
+        overlay._show_window = Mock()  # type: ignore[method-assign]
+        overlay._clear_lines = Mock()  # type: ignore[method-assign]
+        overlay.add_line = Mock()  # type: ignore[method-assign]
+        overlay.hide = Mock()  # type: ignore[method-assign]
+        window = Mock()
+        window.winfo_exists.return_value = True
+        window.after.return_value = "hide-id"
+        overlay._win = window  # type: ignore[assignment]
+
+        overlay.show_completion(["✓ 成功：已命中目标"], success=True)
+
+        overlay.add_line.assert_called_once_with(
+            "✓ 成功：已命中目标", success=True, persist=True
+        )
+        window.after.assert_called_once_with(overlay.COMPLETION_HOLD_MS, overlay.hide)
+        overlay.hide.assert_not_called()
 
     def test_places_scaled_window_at_target_work_area_bottom_right(self) -> None:
         overlay = FloatingMatchOverlay(object())

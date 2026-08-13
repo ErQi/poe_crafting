@@ -4,6 +4,7 @@ import subprocess
 import sys
 import threading
 import tkinter as tk
+from collections.abc import Callable
 from pathlib import Path
 from tkinter import messagebox
 from typing import Optional
@@ -40,7 +41,7 @@ from ..models import (
 from ..vision import VisionService
 from ..workflow import validate_workflow
 from . import widgets
-from .overlay import FloatingMatchOverlay
+from .overlay import FloatingMatchOverlay, format_completion_overlay_lines
 from .workflow_editor import WorkflowEditor
 
 STOP_REASON_TEXT = {
@@ -49,6 +50,7 @@ STOP_REASON_TEXT = {
     StopReason.MAX_ATTEMPTS: "达到最大尝试次数",
     StopReason.PARSE_FAILURES: "连续解析失败",
     StopReason.TEMPLATE_NOT_FOUND: "匹配资源未找到",
+    StopReason.CURRENCY_UNAVAILABLE: "通货已用完或不可用",
     StopReason.LIFEFORCE_INSUFFICIENT: "生命力/材料不足",
     StopReason.UNCHANGED: "词缀连续无变化",
     StopReason.WINDOW_NOT_FOUND: "未找到游戏窗口",
@@ -79,11 +81,10 @@ class CraftApp(ctk.CTk):
             on_log=self._queue_log,
             on_status=self._queue_status,
         )
-        self.hotkeys = HotkeyService(self.settings.hotkey_stop)
+        self.hotkeys = HotkeyService()
         self._ui_queue: list[tuple[str, object]] = []
         self._queue_lock = threading.Lock()
         self._was_running = False
-        self._completion_popup_pending = False
         self._overlay = FloatingMatchOverlay(self)
 
         self._build_ui()
@@ -91,13 +92,15 @@ class CraftApp(ctk.CTk):
         self._refresh_rules_table()
         self._set_running_ui(False)
 
-        self.hotkeys.start(self._on_hotkey_stop)
+        self._restart_hotkeys()
         self.after(100, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
         self._log("就绪。单工艺在「工艺」页配置；通货状态机在「多步骤」页配置。")
         self._log(f"模板目录: {resolve_path(self.settings.templates_dir)}")
-        self._log(f"紧急停止热键: {self.settings.hotkey_stop.upper()}")
+        self._log(
+            f"开始热键: {self.settings.hotkey_start.upper()}  停止热键: {self.settings.hotkey_stop.upper()}"
+        )
 
     # ---------- UI 构建 ----------
     def _build_ui(self) -> None:
@@ -238,6 +241,11 @@ class CraftApp(ctk.CTk):
         self.threshold_label.pack(side="left", padx=6)
 
         r = 6
+        ctk.CTkLabel(form, text="开始热键").grid(row=r, column=0, sticky="w", pady=4)
+        self.hotkey_start_entry = ctk.CTkEntry(form)
+        self.hotkey_start_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
+
+        r = 7
         ctk.CTkLabel(form, text="停止热键").grid(row=r, column=0, sticky="w", pady=4)
         self.hotkey_entry = ctk.CTkEntry(form)
         self.hotkey_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
@@ -257,7 +265,7 @@ class CraftApp(ctk.CTk):
         run_btns.grid(row=1, column=0, sticky="ew", padx=10, pady=4)
         self.btn_start = ctk.CTkButton(
             run_btns,
-            text="确认并开始",
+            text="确认并开始 (F7)",
             fg_color="#2d6a4f",
             hover_color="#1b4332",
             command=self._on_start,
@@ -305,8 +313,8 @@ class CraftApp(ctk.CTk):
         workflow_actions.pack(side="right")
         self.btn_start_workflow = ctk.CTkButton(
             workflow_actions,
-            text="开始流程",
-            width=104,
+            text="开始流程 (F7)",
+            width=120,
             fg_color="#2d6a4f",
             hover_color="#1b4332",
             command=self._on_start_workflow,
@@ -378,6 +386,8 @@ class CraftApp(ctk.CTk):
         self.craft_wait_entry.insert(0, str(s.craft_wait_ms))
         self.threshold_var.set(s.template_threshold)
         self.threshold_label.configure(text=f"{s.template_threshold:.2f}")
+        self.hotkey_start_entry.delete(0, "end")
+        self.hotkey_start_entry.insert(0, s.hotkey_start)
         self.hotkey_entry.delete(0, "end")
         self.hotkey_entry.insert(0, s.hotkey_stop)
 
@@ -392,6 +402,7 @@ class CraftApp(ctk.CTk):
         if label:
             self.preset_menu.set(label)
         self._on_craft_mode_change(self.craft_mode_menu.get())
+        self._refresh_hotkey_labels()
 
     def _collect_settings_from_ui(self) -> AppSettings:
         s = self.settings
@@ -408,6 +419,7 @@ class CraftApp(ctk.CTk):
         except ValueError:
             pass
         s.template_threshold = float(self.threshold_var.get())
+        s.hotkey_start = (self.hotkey_start_entry.get() or "f7").strip().lower()
         s.hotkey_stop = (self.hotkey_entry.get() or "f8").strip().lower()
         mode_label = self.craft_mode_menu.get()
         if "多步骤" in mode_label:
@@ -481,11 +493,11 @@ class CraftApp(ctk.CTk):
 
     def _apply_status(self, status: RunStatus) -> None:
         reason = STOP_REASON_TEXT.get(status.stop_reason, status.stop_reason.value)
-        try:
-            self._overlay.push_status(status)
-        except Exception:
-            pass
         if status.running:
+            try:
+                self._overlay.push_status(status)
+            except Exception:
+                pass
             self._was_running = True
             self.status_label.configure(
                 text=f"状态: 运行中 | 第 {status.attempt} 次 | {status.message}"
@@ -499,55 +511,25 @@ class CraftApp(ctk.CTk):
             )
             self._set_running_ui(False)
             if just_finished and status.stop_reason != StopReason.NOT_STARTED:
-                # 延迟弹窗，避免和状态刷新抢焦点；把工具窗口拉到前台
-                if not self._completion_popup_pending:
-                    self._completion_popup_pending = True
-                    self.after(80, lambda s=status: self._show_completion_popup(s))
+                self._show_completion_toast(status)
+            else:
+                try:
+                    self._overlay.push_status(status)
+                except Exception:
+                    pass
         if status.last_item is not None:
             self._show_item(status.last_item, status.last_match)
 
-    def _show_completion_popup(self, status: RunStatus) -> None:
-        self._completion_popup_pending = False
+    def _show_completion_toast(self, status: RunStatus) -> None:
         reason = STOP_REASON_TEXT.get(status.stop_reason, status.stop_reason.value)
-        title = "工艺完成"
-        body_lines = [
-            f"结果: {reason}",
-            f"说明: {status.message or '-'}",
-            f"尝试次数: {status.attempt}",
-        ]
-        if status.workflow_step_name:
-            body_lines.append(
-                f"最后步骤: {status.workflow_step_index}. {status.workflow_step_name}"
-            )
-        if status.last_match is not None:
-            body_lines.append(
-                f"匹配: {'成功' if status.last_match.success else '未达标'} ({status.last_match.mode})"
-            )
-            if status.last_match.summary:
-                body_lines.append(status.last_match.summary)
-        if status.last_item is not None and status.last_item.affixes:
-            body_lines.append("")
-            body_lines.append("当前词缀:")
-            for a in status.last_item.affixes[:12]:
-                body_lines.append(f"  • {a.text}")
-            if len(status.last_item.affixes) > 12:
-                body_lines.append(f"  …共 {len(status.last_item.affixes)} 条")
-
-        text = "\n".join(body_lines)
+        lines = format_completion_overlay_lines(status, reason)
         try:
-            self.lift()
-            self.attributes("-topmost", True)
-            self.after(200, lambda: self.attributes("-topmost", False))
-            self.focus_force()
+            self._overlay.show_completion(
+                lines,
+                success=status.stop_reason == StopReason.SUCCESS,
+            )
         except Exception:
             pass
-
-        if status.stop_reason == StopReason.SUCCESS:
-            messagebox.showinfo(title, text, parent=self)
-        elif status.stop_reason == StopReason.USER_STOP:
-            messagebox.showinfo("已停止", text, parent=self)
-        else:
-            messagebox.showwarning(title, text, parent=self)
 
     def _set_running_ui(self, running: bool) -> None:
         state = "disabled" if running else "normal"
@@ -627,11 +609,28 @@ class CraftApp(ctk.CTk):
     def _on_save_settings(self) -> None:
         self.settings = self._collect_settings_from_ui()
         save_settings(self.settings)
-        self.hotkeys.stop()
-        self.hotkeys.set_key(self.settings.hotkey_stop)
-        self.hotkeys.start(self._on_hotkey_stop)
+        self._restart_hotkeys()
+        self._refresh_hotkey_labels()
         self._log("设置已保存")
         messagebox.showinfo("保存", "设置已写入 config/settings.json")
+
+    def _restart_hotkeys(self) -> None:
+        bindings: dict[str, Callable[[], None]] = {}
+        start_key = (self.settings.hotkey_start or "f7").strip().lower()
+        stop_key = (self.settings.hotkey_stop or "f8").strip().lower()
+        if start_key:
+            bindings[start_key] = self._on_hotkey_start
+        if stop_key and stop_key != start_key:
+            bindings[stop_key] = self._on_hotkey_stop
+        self.hotkeys.start(bindings)
+
+    def _refresh_hotkey_labels(self) -> None:
+        start = (self.settings.hotkey_start or "f7").upper()
+        stop = (self.settings.hotkey_stop or "f8").upper()
+        self.btn_start.configure(text=f"确认并开始 ({start})")
+        self.btn_stop.configure(text=f"停止 ({stop})")
+        self.btn_start_workflow.configure(text=f"开始流程 ({start})")
+        self.btn_stop_workflow.configure(text=f"停止 ({stop})")
 
     def _on_open_templates(self) -> None:
         path = resolve_path(self.settings.templates_dir)
@@ -783,16 +782,16 @@ class CraftApp(ctk.CTk):
             messagebox.showerror("错误", str(e))
             self._log(f"错误: {e}")
 
-    def _on_start_workflow(self) -> None:
+    def _on_start_workflow(self, skip_confirm: bool = False) -> None:
         """从多步骤页直接启动，并自动切换到流程模式。"""
         if self.automation.is_running():
             return
         label = "多步骤：通货流程"
         self.craft_mode_menu.set(label)
         self._on_craft_mode_change(label)
-        self._on_start()
+        self._on_start(skip_confirm=skip_confirm)
 
-    def _on_start(self) -> None:
+    def _on_start(self, skip_confirm: bool = False) -> None:
         if self.automation.is_running():
             return
         self.settings = self._collect_settings_from_ui()
@@ -858,7 +857,7 @@ class CraftApp(ctk.CTk):
         tips.append(f"6. 紧急停止热键: {self.settings.hotkey_stop.upper()}")
         tips.append("\n第三方自动化可能违反游戏条款，风险自负。是否开始？")
 
-        if not messagebox.askyesno("确认执行", "\n".join(tips)):
+        if not skip_confirm and not messagebox.askyesno("确认执行", "\n".join(tips)):
             return
 
         save_settings(self.settings)
@@ -935,6 +934,20 @@ class CraftApp(ctk.CTk):
         if self.automation.is_running():
             self.automation.request_stop(StopReason.USER_STOP)
             self._queue_log(f"热键 {self.settings.hotkey_stop.upper()}：请求停止")
+
+    def _on_hotkey_start(self) -> None:
+        if self.automation.is_running():
+            return
+        self._queue_log(f"热键 {self.settings.hotkey_start.upper()}：开始")
+        self.after(0, self._hotkey_start_on_ui)
+
+    def _hotkey_start_on_ui(self) -> None:
+        if self.automation.is_running():
+            return
+        if self.settings.craft_mode == CraftMode.WORKFLOW.value:
+            self._on_start_workflow(skip_confirm=True)
+        else:
+            self._on_start(skip_confirm=True)
 
     def _on_close(self) -> None:
         try:

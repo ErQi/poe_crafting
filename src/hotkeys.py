@@ -7,19 +7,20 @@ from pynput import keyboard
 
 
 class HotkeyService:
-    """全局热键监听，默认 F8 触发 stop_callback。"""
+    """全局热键监听，支持多键绑定（如 F7 开始、F8 停止）。"""
 
-    def __init__(self, key_name: str = "f8") -> None:
-        self.key_name = (key_name or "f8").lower()
+    def __init__(self) -> None:
         self._listener: Optional[keyboard.Listener] = None
-        self._callback: Optional[Callable[[], None]] = None
+        self._bindings: dict[object, Callable[[], None]] = {}
         self._lock = threading.Lock()
 
-    def _resolve_key(self):
-        name = self.key_name.lower()
+    def _resolve_key(self, key_name: str):
+        name = (key_name or "").strip().lower()
+        if not name:
+            return None
         # f1-f12
         if name.startswith("f") and name[1:].isdigit():
-            return getattr(keyboard.Key, name, keyboard.Key.f8)
+            return getattr(keyboard.Key, name, None)
         special = {
             "esc": keyboard.Key.esc,
             "escape": keyboard.Key.esc,
@@ -29,19 +30,24 @@ class HotkeyService:
             return special[name]
         if len(name) == 1:
             return keyboard.KeyCode.from_char(name)
-        return keyboard.Key.f8
+        return None
 
-    def start(self, callback: Callable[[], None]) -> None:
+    def start(self, bindings: dict[str, Callable[[], None]]) -> None:
         self.stop()
-        self._callback = callback
-        target = self._resolve_key()
+        resolved: dict[object, Callable[[], None]] = {}
+        for name, callback in bindings.items():
+            key = self._resolve_key(name)
+            if key is None or key in resolved:
+                continue
+            resolved[key] = callback
+        self._bindings = resolved
 
         def on_press(key) -> None:
+            cb = self._bindings.get(key)
+            if cb is None:
+                return
             try:
-                if key == target:
-                    cb = self._callback
-                    if cb:
-                        cb()
+                cb()
             except Exception:
                 pass
 
@@ -57,7 +63,4 @@ class HotkeyService:
                 except Exception:
                     pass
                 self._listener = None
-            self._callback = None
-
-    def set_key(self, key_name: str) -> None:
-        self.key_name = (key_name or "f8").lower()
+            self._bindings = {}

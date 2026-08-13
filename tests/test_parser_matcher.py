@@ -8,8 +8,13 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from src.item_parser import extract_numbers, parse_item_text
-from src.matcher import match_item, match_ruleset
-from src.models import MatchMode, MatchRule, RuleGroup, RuleSet
+from src.matcher import (
+    match_item,
+    match_ruleset,
+    parse_threshold_text,
+    split_pattern_keywords,
+)
+from src.models import Affix, Item, MatchMode, MatchRule, RuleGroup, RuleSet
 
 
 SAMPLES = Path(__file__).resolve().parent / "samples"
@@ -36,16 +41,18 @@ class TestItemParser(unittest.TestCase):
         # 括号范围应被忽略
         vals = extract_numbers("附加 5-10 (5-10) 物理伤害")
         self.assertEqual(vals, [5.0, 10.0])
+        self.assertEqual(
+            extract_numbers("攻击附加 6 - 12 基础冰霜伤害"),
+            [6.0, 12.0],
+        )
+        self.assertEqual(
+            extract_numbers("法杖攻击附加 2 到 48 点闪电伤害"),
+            [2.0, 48.0],
+        )
 
     def test_missing_rarity_with_item_level_is_normal_item(self) -> None:
         item = parse_item_text(
-            "威武皮盔\n"
-            "--------\n"
-            "闪避值: 669\n"
-            "--------\n"
-            "物品等级: 100\n"
-            "--------\n"
-            "已鉴定"
+            "威武皮盔\n--------\n闪避值: 669\n--------\n物品等级: 100\n--------\n已鉴定"
         )
         self.assertEqual(item.rarity, "普通")
 
@@ -88,9 +95,9 @@ class TestItemParser(unittest.TestCase):
             "--------\n"
             "物品等级: 84\n"
             "--------\n"
-            "{ ▲ 前缀词缀 \"督军的\" (等阶：1)— 伤害, 元素 }\n"
+            '{ ▲ 前缀词缀 "督军的" (等阶：1)— 伤害, 元素 }\n'
             "元素伤害提高 19(19-22)%\n"
-            "{ ▽ 后缀词缀 \"雪人之\" (等阶：5)— 元素, 冰霜, 抗性 }\n"
+            '{ ▽ 后缀词缀 "雪人之" (等阶：5)— 元素, 冰霜, 抗性 }\n'
             "+25(24-29)% 冰霜抗性\n"
             "--------\n"
             "圣战者物品\n"
@@ -203,6 +210,128 @@ class TestMatcher(unittest.TestCase):
         )
         r = match_ruleset(self.item, rs)
         self.assertTrue(r.success)
+
+    def test_group_min_matches_at_least_two(self) -> None:
+        rs = RuleSet(
+            group_combine=MatchMode.ALL.value,
+            groups=[
+                RuleGroup(
+                    name="抗性",
+                    combine=MatchMode.ALL.value,
+                    min_matches=2,
+                    rules=[
+                        MatchRule(pattern="最大生命", operator=">=", threshold=80),
+                        MatchRule(pattern="闪电抗性", operator=">=", threshold=20),
+                        MatchRule(pattern="混沌抗性"),
+                    ],
+                )
+            ],
+        )
+        self.assertTrue(match_ruleset(self.item, rs).success)
+        rs.groups[0].min_matches = 3
+        self.assertFalse(match_ruleset(self.item, rs).success)
+
+    def test_parse_threshold_text_supports_range(self) -> None:
+        self.assertEqual(parse_threshold_text("80"), (80.0, None))
+        self.assertEqual(parse_threshold_text("6-12"), (6.0, 12.0))
+        self.assertEqual(parse_threshold_text("6 - 12"), (6.0, 12.0))
+        self.assertEqual(parse_threshold_text("6到12"), (6.0, 12.0))
+
+    def test_added_damage_range_compares_both_values(self) -> None:
+        item = Item(
+            affixes=[
+                Affix(text="攻击附加 6 - 12 基础冰霜伤害", values=[6.0, 12.0]),
+            ]
+        )
+        ok = match_item(
+            item,
+            [
+                MatchRule(
+                    pattern="基础冰霜伤害",
+                    operator=">=",
+                    threshold=6,
+                    threshold2=12,
+                )
+            ],
+        )
+        self.assertTrue(ok.success)
+        self.assertEqual(ok.hits[0].actual_values, [6.0, 12.0])
+
+        fail_high = match_item(
+            item,
+            [
+                MatchRule(
+                    pattern="基础冰霜伤害",
+                    operator=">=",
+                    threshold=6,
+                    threshold2=13,
+                )
+            ],
+        )
+        self.assertFalse(fail_high.success)
+
+        fail_low = match_item(
+            item,
+            [
+                MatchRule(
+                    pattern="基础冰霜伤害",
+                    operator=">=",
+                    threshold=7,
+                    threshold2=12,
+                )
+            ],
+        )
+        self.assertFalse(fail_low.success)
+
+    def test_legacy_single_threshold_still_uses_first_value(self) -> None:
+        item = Item(
+            affixes=[
+                Affix(text="攻击附加 6 - 12 基础冰霜伤害", values=[6.0, 12.0]),
+            ]
+        )
+        r = match_item(
+            item,
+            [MatchRule(pattern="基础冰霜伤害", operator=">=", threshold=6)],
+        )
+        self.assertTrue(r.success)
+
+    def test_split_pattern_keywords(self) -> None:
+        self.assertEqual(split_pattern_keywords("最大生命"), ["最大生命"])
+        self.assertEqual(
+            split_pattern_keywords("攻击附加 冰霜伤害"),
+            ["攻击附加", "冰霜伤害"],
+        )
+        self.assertEqual(
+            split_pattern_keywords("攻击附加,冰霜伤害"),
+            ["攻击附加", "冰霜伤害"],
+        )
+
+    def test_multi_keyword_must_all_appear_in_same_affix(self) -> None:
+        item = Item(
+            affixes=[
+                Affix(text="攻击附加 6 - 12 基础冰霜伤害", values=[6.0, 12.0]),
+                Affix(text="攻击附加 4 - 8 基础火焰伤害", values=[4.0, 8.0]),
+            ]
+        )
+        hit = match_item(
+            item,
+            [
+                MatchRule(
+                    pattern="攻击附加 冰霜伤害",
+                    operator=">=",
+                    threshold=6,
+                    threshold2=12,
+                )
+            ],
+        )
+        self.assertTrue(hit.success)
+        self.assertEqual(hit.hits[0].matched_affix, "攻击附加 6 - 12 基础冰霜伤害")
+
+        miss = match_item(
+            item,
+            [MatchRule(pattern="攻击附加 闪电伤害")],
+        )
+        self.assertFalse(miss.success)
 
     def test_legacy_rules_json_load(self) -> None:
         from src.models import RuleSet as RS

@@ -7,11 +7,13 @@
       "name": "规则组 1",
       "combine": "all",
       "enabled": true,
+      "min_matches": null,
       "rules": [
         {
-          "pattern": "照亮范围扩大",
+          "pattern": "火焰与闪电抗性",
           "operator": ">=",
-          "threshold": 15.0,
+          "threshold": 1.0,
+          "threshold2": null,
           "enabled": true,
           "note": "示例：最大生命 ≥ 80（可删改）",
           "id": "sample-life"
@@ -19,34 +21,38 @@
       ]
     },
     {
-      "id": "64125b68-b5ec-46ca-810d-72a9ac21bac0",
+      "id": "b46acf78-1a7e-49bb-b53a-88b983c2143a",
       "name": "规则组 2",
       "combine": "any",
       "enabled": true,
+      "min_matches": 1,
       "rules": [
         {
-          "pattern": "每秒再生",
+          "pattern": "法杖附加 火焰伤害",
           "operator": ">=",
-          "threshold": 48.1,
+          "threshold": 16.0,
+          "threshold2": 27.0,
           "enabled": true,
           "note": "",
-          "id": "1b8505b7-de70-499a-a7e9-f5482738e8e7"
+          "id": "6aeb18d4-a653-4ec6-a576-c7eac34b5ed0"
         },
         {
-          "pattern": "吸纳为生命",
+          "pattern": "法杖附加 闪电伤害",
           "operator": ">=",
-          "threshold": 13.0,
+          "threshold": 2.0,
+          "threshold2": 48.0,
           "enabled": true,
           "note": "",
-          "id": "10ba5b31-d0d5-4183-98e4-3d41815c1aea"
+          "id": "4d4f8cda-4ba8-450b-ad32-915e51bf9bbe"
         },
         {
-          "pattern": "力量",
+          "pattern": "法杖附加 冰霜伤害",
           "operator": ">=",
-          "threshold": 51.0,
+          "threshold": 14.0,
+          "threshold2": 25.0,
           "enabled": true,
           "note": "",
-          "id": "93ddcbc0-8693-4b70-9209-dbf9f88a677e"
+          "id": "89baa6d8-c138-47ba-b8e7-95ab417dcb68"
         }
       ]
     }

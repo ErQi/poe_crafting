@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from .models import (
     CompareOp,
     GroupMatchResult,
@@ -11,6 +13,51 @@ from .models import (
     RuleHit,
     RuleSet,
 )
+
+
+def parse_threshold_text(text: str) -> tuple[float | None, float | None]:
+    """解析阈值输入：`80` 或 `6-12` / `6 - 12` / `6到12`。"""
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+    parts = [p for p in re.split(r"\s*(?:-|—|–|到|至)\s*", raw) if p != ""]
+    if len(parts) >= 2:
+        try:
+            return float(parts[0]), float(parts[1])
+        except ValueError:
+            return None, None
+    try:
+        return float(raw), None
+    except ValueError:
+        return None, None
+
+
+def format_threshold_text(
+    threshold: float | None, threshold2: float | None = None
+) -> str:
+    if threshold is None and threshold2 is None:
+        return ""
+    if threshold is None:
+        return f"{threshold2:g}"
+    if threshold2 is None:
+        return f"{threshold:g}"
+    return f"{threshold:g}-{threshold2:g}"
+
+
+def split_pattern_keywords(pattern: str) -> list[str]:
+    """「攻击附加 冰霜伤害」或「攻击附加,冰霜伤害」拆成多个必须同时命中的关键字。"""
+    raw = (pattern or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in re.split(r"[,，;；|]+", raw) if p.strip()]
+    keywords: list[str] = []
+    for part in parts:
+        keywords.extend(p for p in part.split() if p)
+    return keywords
+
+
+def _affix_has_keywords(text: str, keywords: list[str]) -> bool:
+    return all(keyword in text for keyword in keywords)
 
 
 def _compare(actual: float, op: str, threshold: float) -> bool:
@@ -32,35 +79,51 @@ def match_rule(item: Item, rule: MatchRule) -> RuleHit:
         return RuleHit(rule=rule, matched=True, reason="disabled")
 
     pattern = (rule.pattern or "").strip()
-    if not pattern:
+    keywords = split_pattern_keywords(pattern)
+    if not keywords:
         return RuleHit(rule=rule, matched=False, reason="空规则")
 
     op = (rule.operator or "").strip()
     op = {"≥": ">=", "≤": "<=", "＝": "=", "＞": ">", "＜": "<"}.get(op, op)
+    need_value = bool(
+        op and (rule.threshold is not None or rule.threshold2 is not None)
+    )
 
     for affix in item.affixes:
-        if pattern not in affix.text:
+        if not _affix_has_keywords(affix.text, keywords):
             continue
-        if not op or rule.threshold is None:
+        if not need_value:
             return RuleHit(
                 rule=rule,
                 matched=True,
                 matched_affix=affix.text,
                 actual_value=affix.first_value,
+                actual_values=list(affix.values),
                 reason="文本匹配",
             )
-        if affix.first_value is None:
+        if not affix.values:
             continue
-        ok = _compare(affix.first_value, op, float(rule.threshold))
+        first_ok = True
+        if rule.threshold is not None:
+            if affix.first_value is None:
+                continue
+            first_ok = _compare(affix.first_value, op, float(rule.threshold))
+        second_ok = True
+        if rule.threshold2 is not None:
+            if affix.second_value is None:
+                continue
+            second_ok = _compare(affix.second_value, op, float(rule.threshold2))
+        ok = first_ok and second_ok
         return RuleHit(
             rule=rule,
             matched=ok,
             matched_affix=affix.text,
             actual_value=affix.first_value,
+            actual_values=list(affix.values),
             reason="数值匹配" if ok else "数值未达标",
         )
 
-    return RuleHit(rule=rule, matched=False, reason="未找到包含该文本的词缀")
+    return RuleHit(rule=rule, matched=False, reason="未找到同时包含这些关键字的词缀")
 
 
 def match_group(item: Item, group: RuleGroup) -> GroupMatchResult:
@@ -75,17 +138,22 @@ def match_group(item: Item, group: RuleGroup) -> GroupMatchResult:
     if not enabled_rules:
         return GroupMatchResult(group=group, success=False, hits=hits)
 
-    if group.combine == MatchMode.ANY.value:
-        success = any(h.matched for h in hits)
+    matched_n = sum(1 for h in hits if h.matched)
+    if group.min_matches:
+        success = matched_n >= int(group.min_matches)
+    elif group.combine == MatchMode.ANY.value:
+        success = matched_n >= 1
     else:
-        success = all(h.matched for h in hits)
+        success = matched_n == len(hits)
     return GroupMatchResult(group=group, success=success, hits=hits)
 
 
 def match_ruleset(item: Item, ruleset: RuleSet) -> MatchResult:
     groups = [g for g in ruleset.groups if g.enabled]
     if not groups:
-        return MatchResult(success=False, mode=ruleset.group_combine, hits=[], group_results=[])
+        return MatchResult(
+            success=False, mode=ruleset.group_combine, hits=[], group_results=[]
+        )
 
     group_results = [match_group(item, g) for g in groups]
     active = [gr for gr in group_results if gr.hits]
