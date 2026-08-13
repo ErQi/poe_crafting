@@ -7,9 +7,8 @@ import tkinter as tk
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import messagebox
-from typing import Optional
 
-import customtkinter as ctk
+import customtkinter as ctk  # type: ignore[import-untyped]
 
 from ..automation import AutomationConfig, CraftAutomation
 from ..config_store import (
@@ -38,7 +37,7 @@ from ..models import (
     RunStatus,
     StopReason,
 )
-from ..vision import VisionService
+from ..vision import VisionError, VisionService
 from ..workflow import validate_workflow
 from . import widgets
 from .overlay import FloatingMatchOverlay, format_completion_overlay_lines
@@ -75,7 +74,7 @@ class CraftApp(ctk.CTk):
         self.workflow: CraftWorkflow = load_workflow(
             resolve_path(self.settings.workflow_file)
         )
-        self.current_item: Optional[Item] = None
+        self.current_item: Item | None = None
 
         self.automation = CraftAutomation(
             on_log=self._queue_log,
@@ -231,8 +230,8 @@ class CraftApp(ctk.CTk):
         self.threshold_label = ctk.CTkLabel(thr_row, text="0.82", width=40)
         self.threshold_slider = ctk.CTkSlider(
             thr_row,
-            from_=0.5,
-            to=0.99,
+            from_=0.5,  # type: ignore[arg-type]
+            to=0.99,  # type: ignore[arg-type]
             number_of_steps=49,
             variable=self.threshold_var,
             command=self._on_threshold_slide,
@@ -473,16 +472,19 @@ class CraftApp(ctk.CTk):
         for kind, payload in items:
             if kind == "log":
                 self._log(str(payload), from_queue=True)
-            elif kind == "status":
-                self._apply_status(payload)  # type: ignore[arg-type]
+            elif kind == "status" and isinstance(payload, RunStatus):
+                self._apply_status(payload)
             elif kind == "item":
                 pair = payload
                 if isinstance(pair, tuple) and len(pair) == 2:
                     self._show_item(pair[0], pair[1])
-            elif kind == "template_test":
-                if isinstance(payload, tuple) and len(payload) == 3:
-                    results, err, thr = payload
-                    self._on_template_test_done(results or [], err, float(thr))
+            elif (
+                kind == "template_test"
+                and isinstance(payload, tuple)
+                and len(payload) == 3
+            ):
+                results, err, thr = payload
+                self._on_template_test_done(results or [], err, float(thr))
         self.after(100, self._poll_queue)
 
     def _log(self, msg: str, from_queue: bool = False) -> None:
@@ -494,10 +496,7 @@ class CraftApp(ctk.CTk):
     def _apply_status(self, status: RunStatus) -> None:
         reason = STOP_REASON_TEXT.get(status.stop_reason, status.stop_reason.value)
         if status.running:
-            try:
-                self._overlay.push_status(status)
-            except Exception:
-                pass
+            self._overlay.push_status(status)
             self._was_running = True
             self.status_label.configure(
                 text=f"状态: 运行中 | 第 {status.attempt} 次 | {status.message}"
@@ -513,23 +512,17 @@ class CraftApp(ctk.CTk):
             if just_finished and status.stop_reason != StopReason.NOT_STARTED:
                 self._show_completion_toast(status)
             else:
-                try:
-                    self._overlay.push_status(status)
-                except Exception:
-                    pass
+                self._overlay.push_status(status)
         if status.last_item is not None:
             self._show_item(status.last_item, status.last_match)
 
     def _show_completion_toast(self, status: RunStatus) -> None:
         reason = STOP_REASON_TEXT.get(status.stop_reason, status.stop_reason.value)
         lines = format_completion_overlay_lines(status, reason)
-        try:
-            self._overlay.show_completion(
-                lines,
-                success=status.stop_reason == StopReason.SUCCESS,
-            )
-        except Exception:
-            pass
+        self._overlay.show_completion(
+            lines,
+            success=status.stop_reason == StopReason.SUCCESS,
+        )
 
     def _set_running_ui(self, running: bool) -> None:
         state = "disabled" if running else "normal"
@@ -640,7 +633,7 @@ class CraftApp(ctk.CTk):
                 subprocess.Popen(["explorer", str(path)])
             else:
                 subprocess.Popen(["xdg-open", str(path)])
-        except Exception as e:
+        except OSError as e:
             messagebox.showerror("错误", f"无法打开目录: {e}")
 
     def _on_template_saved(self, key: str, path) -> None:
@@ -655,9 +648,8 @@ class CraftApp(ctk.CTk):
         # 结果原先只写到「工艺」页日志，模板页看起来像没反应；改为弹窗 + 状态栏 + 后台执行
         try:
             self.settings = self._collect_settings_from_ui()
-        except Exception:
-            # 模板页也可能点测试；设置控件应已存在
-            pass
+        except (AttributeError, ValueError, tk.TclError) as e:
+            self._log(f"读取设置失败，使用当前缓存: {e}")
 
         vision = VisionService(
             self.settings.templates_dir, self.settings.template_threshold
@@ -673,8 +665,8 @@ class CraftApp(ctk.CTk):
             for step in self.workflow.enabled_steps():
                 if step.currency_template and step.currency_template not in names:
                     names.append(step.currency_template)
-        except Exception:
-            pass
+        except (AttributeError, ValueError, KeyError, tk.TclError) as e:
+            self._log(f"读取流程步骤失败，仅测试默认模板: {e}")
         # 附带目录里其它已有 png
         for fname in vision.list_templates():
             stem = Path(fname).stem
@@ -703,7 +695,7 @@ class CraftApp(ctk.CTk):
             try:
                 results = vision.test_match_report(keywords, uniq, thr)
                 err = None
-            except Exception as e:
+            except (VisionError, OSError, RuntimeError, ValueError) as e:
                 results = []
                 err = str(e)
             with self._queue_lock:
@@ -712,7 +704,7 @@ class CraftApp(ctk.CTk):
         threading.Thread(target=work, daemon=True, name="TemplateTest").start()
 
     def _on_template_test_done(
-        self, results: list, err: Optional[str], thr: float
+        self, results: list, err: str | None, thr: float
     ) -> None:
         self.btn_test_templates.configure(state="normal")
         if err:
@@ -760,7 +752,7 @@ class CraftApp(ctk.CTk):
                 with self._queue_lock:
                     self._ui_queue.append(("item", (item, result)))
                     self._ui_queue.append(("log", "读取成功"))
-            except Exception as e:
+            except (VisionError, ItemParseError, OSError, RuntimeError) as e:
                 with self._queue_lock:
                     self._ui_queue.append(("log", f"读取失败: {e}"))
 
@@ -778,7 +770,7 @@ class CraftApp(ctk.CTk):
         except ItemParseError as e:
             messagebox.showerror("解析失败", str(e))
             self._log(f"解析失败: {e}")
-        except Exception as e:
+        except (OSError, RuntimeError, tk.TclError) as e:
             messagebox.showerror("错误", str(e))
             self._log(f"错误: {e}")
 
@@ -797,7 +789,7 @@ class CraftApp(ctk.CTk):
         self.settings = self._collect_settings_from_ui()
         self.ruleset = self.rules_frame.get_ruleset()
         craft_mode = self.settings.craft_mode
-        workflow_snapshot: Optional[CraftWorkflow] = None
+        workflow_snapshot: CraftWorkflow | None = None
 
         if craft_mode == CraftMode.WORKFLOW.value:
             workflow_snapshot = self.workflow_editor.get_workflow()
@@ -909,21 +901,15 @@ class CraftApp(ctk.CTk):
         )
         try:
             self._was_running = True
-            try:
-                self._overlay._last_attempt_shown = -1  # noqa: SLF001
-                self._overlay.show(win.center)
-                self._overlay.add_line("▶ 开始匹配…", success=False)
-            except Exception:
-                pass
+            self._overlay.reset_run()
+            self._overlay.show(win.center)
+            self._overlay.add_line("▶ 开始匹配…", success=False)
             self.automation.start(cfg)
             self._set_running_ui(True)
             self.status_label.configure(text="状态: 运行中")
-        except Exception as e:
+        except RuntimeError as e:
             self._was_running = False
-            try:
-                self._overlay.hide()
-            except Exception:
-                pass
+            self._overlay.hide()
             messagebox.showerror("启动失败", str(e))
 
     def _on_stop(self) -> None:

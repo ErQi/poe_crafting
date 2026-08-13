@@ -109,10 +109,16 @@ class FloatingMatchOverlay:
         self._work_area: Optional[tuple[int, int, int, int]] = None
         self._auto_hide_id: Optional[str] = None
 
+    def reset_run(self) -> None:
+        self._last_attempt_shown = -1
+
     def show(self, anchor_point: tuple[int, int]) -> None:
-        self._cancel_auto_hide()
-        self._work_area = _monitor_work_area(anchor_point)
-        self._show_window()
+        try:
+            self._cancel_auto_hide()
+            self._work_area = _monitor_work_area(anchor_point)
+            self._show_window()
+        except (tk.TclError, RuntimeError, OSError):
+            return
 
     def _show_window(self) -> None:
         if self._win is not None and self._win.winfo_exists():
@@ -152,35 +158,44 @@ class FloatingMatchOverlay:
 
     def push_status(self, status: RunStatus) -> None:
         """根据运行状态推送一行（同 attempt 不重复）。"""
-        if not status.running:
-            self.hide()
-            return
+        try:
+            if not status.running:
+                self.hide()
+                return
 
-        self._ensure_shown()
-        if status.last_match is None:
+            self._ensure_shown()
+            if status.last_match is None:
+                return
+            if status.attempt == self._last_attempt_shown:
+                return
+            self._last_attempt_shown = status.attempt
+            line = format_match_overlay_line(status.attempt, status.last_match)
+            if status.workflow_step_name:
+                name = status.workflow_step_name[:14]
+                line = f"[{status.workflow_step_index}. {name}] {line}"
+            self.add_line(line, success=bool(status.last_match.success))
+        except (tk.TclError, RuntimeError, OSError):
             return
-        if status.attempt == self._last_attempt_shown:
-            return
-        self._last_attempt_shown = status.attempt
-        line = format_match_overlay_line(status.attempt, status.last_match)
-        if status.workflow_step_name:
-            name = status.workflow_step_name[:14]
-            line = f"[{status.workflow_step_index}. {name}] {line}"
-        self.add_line(line, success=bool(status.last_match.success))
 
     def show_completion(self, lines: list[str], success: bool = False) -> None:
         """结束提示：不抢焦点，5 秒后自动消失。"""
-        self._cancel_auto_hide()
-        self._ensure_work_area()
-        self._show_window()
-        self._clear_lines()
-        for text in reversed(lines):
-            self.add_line(text, success=success, persist=True)
-        if self._win is not None and self._win.winfo_exists():
-            self._auto_hide_id = self._win.after(self.COMPLETION_HOLD_MS, self.hide)
+        try:
+            self._cancel_auto_hide()
+            self._ensure_work_area()
+            self._show_window()
+            self._clear_lines()
+            for text in reversed(lines):
+                self.add_line(text, success=success, persist=True)
+            if self._win is not None and self._win.winfo_exists():
+                self._auto_hide_id = self._win.after(self.COMPLETION_HOLD_MS, self.hide)
+        except (tk.TclError, RuntimeError, OSError):
+            return
 
     def add_line(self, text: str, success: bool = False, persist: bool = False) -> None:
-        self._ensure_shown()
+        try:
+            self._ensure_shown()
+        except (tk.TclError, RuntimeError, OSError):
+            return
         if self._host is None or self._win is None:
             return
 
