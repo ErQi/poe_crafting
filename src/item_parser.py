@@ -93,8 +93,29 @@ def _is_modifier_descriptor_line(line: str) -> bool:
     return s.startswith("{") and s.endswith("}")
 
 
+def _is_implicit_or_enchant_descriptor(line: str) -> bool:
+    if not _is_modifier_descriptor_line(line):
+        return False
+    return any(
+        marker in line
+        for marker in (
+            "固有",
+            "Implicit",
+            "implicit",
+            "附魔",
+            "Enchant",
+            "enchant",
+            "符文",
+            "Rune",
+            "rune",
+        )
+    )
+
+
 def _is_explicit_modifier_descriptor(line: str) -> bool:
     if not _is_modifier_descriptor_line(line):
+        return False
+    if _is_implicit_or_enchant_descriptor(line):
         return False
     return any(
         marker in line
@@ -134,7 +155,31 @@ def is_equipment_clipboard_text(text: str) -> bool:
     return True
 
 
-def _count_explicit_mods(rarity: str, affix_by_section: list[list[str]]) -> int:
+def _looks_like_base_implicit(raw: str, line: str) -> bool:
+    """无高级说明且固有/显式挤在同一段时，用基底常见固有排除。"""
+    text = _strip_affix_tags(line)
+    values = extract_numbers(text)
+    blob = raw or ""
+    if "腰带" not in blob and "Belt" not in blob:
+        return False
+    if "深渊" in text or "Abyss" in text:
+        return True
+    if ("最大生命" in text or "maximum Life" in text) and values:
+        return values[0] <= 40
+    if ("力量" in text or "Strength" in text) and values and "全" not in text:
+        return values[0] <= 35
+    if ("能量护盾" in text or "Energy Shield" in text) and values:
+        return values[0] <= 25
+    if ("物理伤害" in text or "Physical Damage" in text) and values:
+        return values[0] <= 24
+    return False
+
+
+def _count_explicit_mods(
+    rarity: str,
+    affix_by_section: list[list[str]],
+    raw_text: str = "",
+) -> int:
     """没开高级说明时，按分隔段区分固有/附魔与显式。"""
     if not affix_by_section:
         return 0
@@ -144,14 +189,53 @@ def _count_explicit_mods(rarity: str, affix_by_section: list[list[str]]) -> int:
         explicit_idx = -1
     else:
         explicit_idx = 0
+    skip_first = (
+        len(affix_by_section) == 1
+        and explicit_idx == 0
+        and len(affix_by_section[0]) >= 2
+        and _looks_like_base_implicit(raw_text, affix_by_section[0][0])
+    )
     count = 0
     for idx, lines in enumerate(affix_by_section):
-        for line in lines:
+        for line_i, line in enumerate(lines):
             if _tagged_mod_kind(line) in {"implicit", "enchant"}:
+                continue
+            if skip_first and idx == 0 and line_i == 0:
                 continue
             if idx == explicit_idx:
                 count += 1
     return count
+
+
+def _count_craft_explicits(
+    rarity: str,
+    all_lines: list[str],
+    affix_by_section: list[list[str]],
+    raw_text: str,
+) -> int:
+    """有 { 前缀/后缀 } 用官方计数；固有说明即使带前缀字样也不计入。"""
+    pending = ""
+    saw_explicit_desc = False
+    count = 0
+    for line in all_lines:
+        if _is_modifier_descriptor_line(line):
+            if _is_explicit_modifier_descriptor(line):
+                pending = "explicit"
+                saw_explicit_desc = True
+            else:
+                pending = "skip"
+            continue
+        if not _is_affix_line(line):
+            continue
+        if _tagged_mod_kind(line) in {"implicit", "enchant"}:
+            pending = ""
+            continue
+        if pending == "explicit":
+            count += 1
+        pending = ""
+    if saw_explicit_desc:
+        return count
+    return _count_explicit_mods(rarity, affix_by_section, raw_text)
 
 
 def extract_numbers(text: str) -> list[float]:
@@ -267,11 +351,6 @@ def parse_item_text(text: str) -> Item:
 
     # 扫描全部行做 flags / item_level
     all_lines = [ln.strip() for sec in sections for ln in sec]
-    descriptor_lines = [s for s in all_lines if _is_modifier_descriptor_line(s)]
-    if descriptor_lines:
-        item.explicit_mod_count = sum(
-            1 for s in descriptor_lines if _is_explicit_modifier_descriptor(s)
-        )
     for s in all_lines:
         normalized = _normalize_metadata_line(s)
         if normalized.startswith("物品等级:"):
@@ -341,7 +420,9 @@ def parse_item_text(text: str) -> Item:
         item.rarity = "普通"
 
     if item.explicit_mod_count is None:
-        item.explicit_mod_count = _count_explicit_mods(item.rarity, affix_by_section)
+        item.explicit_mod_count = _count_craft_explicits(
+            item.rarity, all_lines, affix_by_section, raw
+        )
 
     # 至少要有稀有度或名称才算解析成功
     if not item.rarity and not item.name:

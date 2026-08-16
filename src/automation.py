@@ -11,6 +11,7 @@ from typing import Callable, Iterator, Optional
 
 from .clipboard_util import (
     clear_clipboard,
+    get_clipboard,
     normalize_clipboard_text,
     wait_clipboard_change,
 )
@@ -20,6 +21,8 @@ from .input_control import (
     find_game_window,
     focus_game_window,
     focus_window,
+    get_cursor_handle,
+    get_cursor_pos,
     hotkey,
     move_screen,
     peek_window,
@@ -39,7 +42,7 @@ from .models import (
     RunStatus,
     StopReason,
 )
-from .vision import MatchHit, VisionError, VisionService
+from .vision import MatchHit, VisionError, VisionService, patch_rmse
 from .workflow import (
     ROUTE_FINISH,
     ROUTE_STOP,
@@ -55,14 +58,19 @@ StatusFn = Callable[[RunStatus], None]
 # 通货候选使用彩色 RMSE 搜索，但最终必须经 Ctrl+C 中文名称核对才能点击。
 WORKFLOW_CURRENCY_MAX_RMSE = 80.0
 WORKFLOW_CURRENCY_VERIFY_ATTEMPTS = 6
+LOCATE_CURRENCY_TRIES = 4
 # 超时只防死等；热路径节奏由成功条件决定，不按本机估 delay。
 COPY_TIMEOUT_MS = 280
 COPY_SLICE_MS = 40
 COPY_POLL_MS = 2
 CURSOR_MS = 4
-APPLY_CONFIRM_TRIES = 2
+APPLY_CONFIRM_TRIES = 3
+PUT_BACK_TRIES = 3
+HOLD_CHECK_MS = 80
 WINDOW_MOVE_PX = 12
 TOOLTIP_CLEAR_MS = 80
+CURSOR_ON_CURRENCY_RMSE = 18.0
+CURSOR_CONFIRM_TIMEOUT_MS = 280
 
 
 @contextmanager
@@ -109,6 +117,74 @@ def _hit_center_in_region(
     return left <= hit.client_x < right and top <= hit.client_y < bottom
 
 
+def _point_in_hit(x: int, y: int, hit: MatchHit) -> bool:
+    half_w = hit.width // 2
+    half_h = hit.height // 2
+    return (
+        hit.screen_x - half_w <= x < hit.screen_x - half_w + max(1, hit.width)
+        and hit.screen_y - half_h <= y < hit.screen_y - half_h + max(1, hit.height)
+    )
+
+
+def _cursor_in_hit(hit: MatchHit) -> bool:
+    x, y = get_cursor_pos()
+    return _point_in_hit(x, y, hit)
+
+
+def _cursor_unlike(a, b, limit: float = CURSOR_ON_CURRENCY_RMSE) -> bool:
+    return a is not None and b is not None and patch_rmse(a, b) >= limit
+
+
+def _hits_close(
+    a: Optional[MatchHit],
+    b: Optional[MatchHit],
+    px: int = 8,
+) -> bool:
+    if a is None or b is None:
+        return False
+    return abs(a.screen_x - b.screen_x) <= px and abs(a.screen_y - b.screen_y) <= px
+
+
+def _hit_half_cell(hit: MatchHit) -> float:
+    return max(1.0, max(hit.width, hit.height) / 2.0)
+
+
+def _currency_hit_conflict(hit: MatchHit, other: MatchHit) -> bool:
+    """点击中心落在对方矩形内，或两中心近于半格。"""
+    if _point_in_hit(hit.screen_x, hit.screen_y, other):
+        return True
+    if _point_in_hit(other.screen_x, other.screen_y, hit):
+        return True
+    half = max(_hit_half_cell(hit), _hit_half_cell(other))
+    dx = hit.screen_x - other.screen_x
+    dy = hit.screen_y - other.screen_y
+    return dx * dx + dy * dy < half * half
+
+
+def _currency_center_band(win) -> Optional[tuple[int, int, int, int]]:
+    """左右仓库/背包之间的游戏世界，通货命中不能落在这里。"""
+    width = int(getattr(win, "width", 0) or 0)
+    height = int(getattr(win, "height", 0) or 0)
+    if width <= 0 or height <= 0:
+        return None
+    panel_width = min(width, int(round(float(height) * 0.68)))
+    left = panel_width
+    right = width - panel_width
+    if right <= left:
+        return None
+    return (left, 0, right, height)
+
+
+def _is_currency_clipboard_text(text: str) -> bool:
+    """通货 tooltip；排除空文本、未找到物品、装备。"""
+    raw = (text or "").strip()
+    if not raw or "未找到物品" in raw or raw.startswith("http"):
+        return False
+    if currency_stack_count(raw) is not None:
+        return True
+    return "通货" in raw or "Currency" in raw
+
+
 def _workflow_currency_scales(
     win,
     verified_icon_size: Optional[float] = None,
@@ -141,8 +217,8 @@ def _workflow_currency_panel_exclusions(
 ) -> tuple[list[tuple[int, int, int, int]], str]:
     """根据已验证通货所在侧推断 PoE UI 面板，返回面板外禁区。
 
-    面板宽度按窗口高度计算，适配分辨率/UI 缩放；若已验证通货
-    分布在两侧，则不限制面板并由后续全屏搜索处理。
+    面板宽度按窗口高度计算，适配分辨率/UI 缩放；两侧都有时
+    不限制面板，但仍排除窗口中心带，不会回退到全屏游戏世界。
     """
 
     if not verified_hits or not getattr(win, "width", 0):
@@ -172,7 +248,7 @@ def _workflow_currency_panel_exclusions(
 
 
 def _should_skip_augmentation(step: CraftStep, item: Item) -> bool:
-    """增幅石只对恰好一条显式词缀的魔法物品执行。"""
+    """增幅石只对恰好一条显式词缀的魔法物品执行。固有不计入。"""
 
     return (
         step.currency_template == "currency_augmentation"
@@ -206,7 +282,11 @@ class CraftAutomation:
         self._lock = threading.Lock()
         self._verified_currency_templates: set[str] = set()
         self._currency_stack_counts: dict[str, int] = {}
-        self._copy_saw_equipment = False
+        self._last_hover_hit: Optional[MatchHit] = None
+        self._currency_use_armed = False
+        self._item_use_clicked = False
+        self._item_pointer_patch = None
+        self._item_pointer_handle: Optional[int] = None
 
     @property
     def status(self) -> RunStatus:
@@ -270,8 +350,15 @@ class CraftAutomation:
         vision.clear_position_cache()
         self._verified_currency_templates.clear()
         self._currency_stack_counts.clear()
+        self._last_hover_hit = None
+        self._disarm_currency()
+        self._reset_pointer_baselines()
         if not self._locate_workflow_required(vision, win, s, ["item_slot"]):
             return "窗口移动后目标装备重定位失败"
+        item_hit = vision.get_cached_position("item_slot")
+        if item_hit is not None:
+            self._move_to_hit(item_hit)
+            self._capture_item_pointer_baseline(vision)
         if currency_names and not self._locate_and_verify_workflow_currencies(
             vision, win, s, currency_names
         ):
@@ -354,6 +441,9 @@ class CraftAutomation:
         s = config.settings
         self._verified_currency_templates.clear()
         self._currency_stack_counts.clear()
+        self._last_hover_hit = None
+        self._disarm_currency()
+        self._reset_pointer_baselines()
         if config.workflow is None:
             self._finish(StopReason.ERROR, "未提供多步骤流程配置", 0, 0, 0)
             return
@@ -464,6 +554,10 @@ class CraftAutomation:
             return
 
         self._update(last_item=initial_item, parse_failures=0)
+        if self._capture_item_pointer_baseline(vision):
+            self._log("已采集装备格普通指针基线")
+        else:
+            self._log("未能采集装备格指针基线，未确认通货前不会左键")
         self._log(
             f"启动读取成功：稀有度={initial_item.rarity or '-'} | "
             f"显式词缀={initial_item.craft_affix_count}"
@@ -547,6 +641,12 @@ class CraftAutomation:
             )
             return
 
+        item_hit = vision.get_cached_position("item_slot")
+        if item_hit is not None:
+            self._move_to_hit(item_hit)
+            if self._capture_item_pointer_baseline(vision):
+                self._log("已更新装备格普通指针基线")
+
         unchanged = 0
         current_item = initial_item
         last_raw = f"{initial_item.rarity}|" + "|".join(initial_item.affix_texts())
@@ -627,16 +727,15 @@ class CraftAutomation:
                     if stop_message and stop_reason != StopReason.USER_STOP:
                         self._log(stop_message)
                     break
+                if item is None:
+                    if self._should_stop():
+                        reason = StopReason.USER_STOP
+                        message = "用户停止"
+                        break
+                    self._log("通货未确认，本轮不判定，继续")
+                    self._wait_after_failed_use(vision)
+                    continue
                 parse_failures = 0
-
-            if item is None:
-                if self._should_stop():
-                    reason = StopReason.USER_STOP
-                    message = "用户停止"
-                elif reason == StopReason.MAX_ATTEMPTS:
-                    reason = StopReason.PARSE_FAILURES
-                    message = "通货动作后连续读取装备失败；为避免重复施放已停止"
-                break
 
             current_item = item
             evaluation = evaluate_step(item, step)
@@ -1011,20 +1110,10 @@ class CraftAutomation:
         if item_hit is None:
             self._log("核对通货前丢失了目标装备坐标")
             return False
-        frame = self._grab_workflow_frame_without_tooltip(vision, win, s)
-        if frame is None:
-            return False
         excluded_regions = [_hit_client_region(item_hit)]
         for name in names:
-            vision.clear_position_cache(name)
-            self._verified_currency_templates.discard(name)
-            hit = self._find_and_verify_currency_in_frame(
-                vision,
-                win,
-                s,
-                name,
-                frame,
-                excluded_regions,
+            hit = self._find_verified_currency(
+                vision, win, s, name, excluded_regions
             )
             if hit is None:
                 self._log(
@@ -1035,18 +1124,87 @@ class CraftAutomation:
             excluded_regions.append(_hit_client_region(hit))
         return True
 
+    def _find_verified_currency(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        template_name: str,
+        excluded_regions: list[tuple[int, int, int, int]],
+        allow_item_slot: bool = False,
+    ) -> Optional[MatchHit]:
+        """悬停 + Ctrl+C 核对名称和数量。失败则清缓存、再截图重试。"""
+        expected = currency_label(template_name)
+        for attempt in range(1, LOCATE_CURRENCY_TRIES + 1):
+            if self._should_stop():
+                return None
+            vision.clear_position_cache(template_name)
+            self._verified_currency_templates.discard(template_name)
+            self._currency_stack_counts.pop(template_name, None)
+            # 选中前禁止去装备格；通货已挂上时禁止去其它堆叠。
+            park = self._safe_park_hit(
+                vision,
+                allow_item_slot=allow_item_slot and not self._currency_use_armed,
+                allow_other_currency=not self._currency_use_armed,
+            )
+            frame = self._grab_workflow_frame_without_tooltip(
+                vision, win, s, park
+            )
+            if frame is None:
+                return None
+            hit = self._find_and_verify_currency_in_frame(
+                vision,
+                win,
+                s,
+                template_name,
+                frame,
+                excluded_regions,
+            )
+            if hit is not None:
+                return hit
+            if attempt < LOCATE_CURRENCY_TRIES:
+                self._log(
+                    f"未能核对{expected}（{attempt}/{LOCATE_CURRENCY_TRIES}），"
+                    "清缓存并重新截图后再试"
+                )
+        return None
+
+    def _safe_park_hit(
+        self,
+        vision: VisionService,
+        *,
+        avoid_hit: Optional[MatchHit] = None,
+        allow_item_slot: bool = False,
+        allow_other_currency: bool = True,
+    ) -> Optional[MatchHit]:
+        """另一个已确认安全点。通货挂在光标上时只能去装备格或原地。"""
+        avoid = avoid_hit if avoid_hit is not None else self._last_hover_hit
+        if self._currency_use_armed:
+            allow_other_currency = False
+        if allow_other_currency:
+            for name in self._verified_currency_templates:
+                hit = vision.get_cached_position(name)
+                if hit is not None and not _hits_close(hit, avoid):
+                    return hit
+        if allow_item_slot:
+            hit = vision.get_cached_position("item_slot")
+            if hit is not None and not _hits_close(hit, avoid):
+                return hit
+        return None
+
     def _grab_workflow_frame_without_tooltip(
         self,
         vision: VisionService,
         win,
         s: AppSettings,
+        park_hit: Optional[MatchHit] = None,
     ):
-        """移开装备/通货悬浮窗后再截取通货搜索画面。"""
-
-        neutral_x, neutral_y = win.center
-        move_screen(neutral_x, neutral_y, settle_ms=20)
-        if sleep_ms(TOOLTIP_CLEAR_MS, self._should_stop):
-            return None
+        """清 tooltip 后再截图。只移到另一个安全点，没有则原地截。"""
+        if park_hit is not None and not _hits_close(park_hit, self._last_hover_hit):
+            move_screen(park_hit.screen_x, park_hit.screen_y, settle_ms=20)
+            self._last_hover_hit = park_hit
+            if sleep_ms(TOOLTIP_CLEAR_MS, self._should_stop):
+                return None
         return vision.grab_window(win)
 
     def _find_and_verify_currency_in_frame(
@@ -1066,6 +1224,12 @@ class CraftAutomation:
             for name in self._verified_currency_templates
             if (hit := vision.get_cached_position(name)) is not None
         ]
+        item_hit = vision.get_cached_position("item_slot")
+        item_region = _hit_client_region(item_hit) if item_hit else None
+        center_band = _currency_center_band(win)
+        ui_exclusions = [center_band] if center_band else []
+        panel_exclusions: list[tuple[int, int, int, int]] = []
+        measured_size = 0.0
 
         phases: list[
             tuple[
@@ -1089,20 +1253,41 @@ class CraftAutomation:
             )
             self._log(
                 f"{expected_name}按本次画面动态校准：图标约 {measured_size:g}px，"
-                f"优先搜索{panel_label}（失败自动回退全屏/宽尺度）"
+                f"只搜{panel_label}侧栏"
             )
             phases = [
-                ("校准面板", calibrated_scales, panel_exclusions, 4),
-                ("校准全屏", calibrated_scales, [], 1),
-                ("宽尺度全屏", broad_scales, [], 1),
+                ("校准侧栏", calibrated_scales, panel_exclusions + ui_exclusions, 4),
             ]
         else:
-            phases = [("初始全屏", broad_scales, [], WORKFLOW_CURRENCY_VERIFY_ATTEMPTS)]
+            phases = [
+                ("侧栏", broad_scales, ui_exclusions, WORKFLOW_CURRENCY_VERIFY_ATTEMPTS),
+            ]
 
         verify_try = 0
 
+        def hit_in_ui(hit: MatchHit) -> bool:
+            if item_region is not None and _hit_center_in_region(hit, item_region):
+                self._log(f"{expected_name}候选落在装备格内，不悬停")
+                return False
+            if center_band is not None and _hit_center_in_region(hit, center_band):
+                self._log(
+                    f"{expected_name}候选 @({hit.screen_x},{hit.screen_y}) "
+                    "在窗口中心带，不悬停"
+                )
+                return False
+            other_name = self._conflicting_currency_name(vision, hit, template_name)
+            if other_name is not None:
+                self._log(
+                    f"{expected_name}候选与已核实{currency_label(other_name)}"
+                    "中心过近或重叠，排除"
+                )
+                return False
+            return True
+
         def verify_hit(hit: MatchHit, phase_name: str) -> bool:
             nonlocal verify_try
+            if not hit_in_ui(hit):
+                return False
             verify_try += 1
             if hit.feature_matches is not None:
                 metric_text = f"特征聚类={hit.feature_matches}"
@@ -1120,8 +1305,13 @@ class CraftAutomation:
                 f"尺寸={hit.width}x{hit.height} {metric_text}，"
                 "正在 Ctrl+C 核对…"
             )
-            copied_text = self._copy_hovered_text(hit, s)
-            if copied_text is not None and expected_name in copied_text:
+            copied_text = self._copy_hovered_text(vision, hit, s)
+            if copied_text is None:
+                self._log(
+                    f"候选未能复制到{expected_name}文本，将尝试其他位置"
+                )
+                return False
+            if expected_name in copied_text:
                 remaining = currency_stack_count(copied_text)
                 if remaining is None:
                     self._log(
@@ -1141,16 +1331,14 @@ class CraftAutomation:
                 )
                 return True
 
-            observed = "未复制到物品文本"
-            if copied_text:
-                observed = next(
-                    (
-                        line.strip()
-                        for line in copied_text.splitlines()
-                        if line.strip()
-                    ),
-                    observed,
-                )
+            observed = next(
+                (
+                    line.strip()
+                    for line in copied_text.splitlines()
+                    if line.strip()
+                ),
+                "未复制到物品文本",
+            )
             self._log(f"候选不是{expected_name}：{observed}")
             return False
 
@@ -1165,7 +1353,9 @@ class CraftAutomation:
                     template_name,
                     target_width=int(round(measured_size)),
                     exclude_regions=(
-                        list(base_excluded_regions) + panel_exclusions
+                        list(base_excluded_regions)
+                        + panel_exclusions
+                        + ui_exclusions
                     ),
                     max_candidates=4,
                 )
@@ -1208,6 +1398,28 @@ class CraftAutomation:
                     return None
         return None
 
+    def _conflicting_currency_name(
+        self,
+        vision: VisionService,
+        hit: MatchHit,
+        template_name: str,
+    ) -> Optional[str]:
+        for name in self._verified_currency_templates:
+            if name == template_name:
+                continue
+            other = vision.get_cached_position(name)
+            if other is not None and _currency_hit_conflict(hit, other):
+                return name
+        return None
+
+    def _disarm_currency(self) -> None:
+        self._currency_use_armed = False
+        self._item_use_clicked = False
+
+    def _reset_pointer_baselines(self) -> None:
+        self._item_pointer_patch = None
+        self._item_pointer_handle = None
+
     def _refund_currency(self, template_name: str) -> None:
         remaining = self._currency_stack_counts.get(template_name)
         if remaining is not None:
@@ -1223,16 +1435,217 @@ class CraftAutomation:
             "后续再次需要时将自动检查并停止"
         )
 
-    def _put_item_back(self, vision: VisionService) -> None:
-        hit = vision.get_cached_position("item_slot")
+    def _move_to_hit(self, hit: MatchHit) -> None:
+        move_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS)
+        self._last_hover_hit = hit
+
+    def _click_item_slot_left(self, hit: MatchHit) -> None:
+        """仅「使用」或「确认拾取后的放回」可对装备格左键。"""
+        click_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS, button="left")
+        self._last_hover_hit = hit
+
+    def _put_item_back(
+        self,
+        vision: VisionService,
+        item_hit: Optional[MatchHit] = None,
+    ) -> None:
+        hit = item_hit or vision.get_cached_position("item_slot")
         if hit is None:
             return
-        click_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS, button="left")
+        self._disarm_currency()
+        self._click_item_slot_left(hit)
 
     def _is_wrong_item(self, before: Item, after: Item) -> bool:
         return bool(
             before.base_type and after.base_type and before.base_type != after.base_type
         )
+
+    def _same_item_text(self, before: Item, after: Item) -> bool:
+        return normalize_clipboard_text(before.raw_text) == normalize_clipboard_text(
+            after.raw_text
+        )
+
+    def _try_read_item(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        already_on_item: bool = False,
+        timeout_ms: int = COPY_TIMEOUT_MS,
+    ) -> Optional[Item]:
+        """读当前格子装备，接受旧文本。超时/未刷新返回 None；真解析失败抛出。"""
+        try:
+            item = self._read_item_fast(
+                vision,
+                win,
+                s,
+                already_on_item=already_on_item,
+                stale_text="",
+                timeout_ms=timeout_ms,
+            )
+        except ItemParseError as error:
+            message = str(error)
+            if "等待剪贴板超时" in message or "未读到通货" in message:
+                return None
+            if "词缀尚未刷新" in message:
+                return None
+            raise
+        if item.rarity in {"魔法", "稀有"} and not item.affixes:
+            return None
+        return item
+
+    def _holding_item(
+        self,
+        vision: VisionService,
+        item_hit: MatchHit,
+        s: AppSettings,
+    ) -> bool:
+        """通货堆叠上重新 Ctrl+C 得到装备文本，才视为拿在手上。旧剪贴板不算。"""
+        park = self._safe_park_hit(
+            vision,
+            avoid_hit=item_hit,
+            allow_item_slot=False,
+            allow_other_currency=True,
+        )
+        if park is None:
+            for name in self._verified_currency_templates:
+                hit = vision.get_cached_position(name)
+                if hit is not None and not _hits_close(hit, item_hit):
+                    park = hit
+                    break
+        if park is None:
+            return False
+        self._move_to_hit(park)
+        clear_clipboard()
+        leftover = normalize_clipboard_text(get_clipboard())
+        if leftover and is_equipment_clipboard_text(leftover):
+            return False
+        text = self._copy_item_text(
+            s,
+            timeout_ms=max(HOLD_CHECK_MS, COPY_TIMEOUT_MS),
+            require_item=True,
+            stale_text=leftover,
+        )
+        return bool(text)
+
+    def _item_in_slot(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        before: Item,
+        already_on_item: bool,
+    ) -> Optional[Item]:
+        try:
+            item = self._try_read_item(
+                vision, win, s, already_on_item=already_on_item
+            )
+        except (ItemParseError, VisionError):
+            return None
+        if item is None or self._is_wrong_item(before, item):
+            return None
+        item_hit = vision.get_cached_position("item_slot")
+        if item_hit is not None and self._holding_item(vision, item_hit, s):
+            return None
+        return item
+
+    def _can_put_item_back(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        item_hit: Optional[MatchHit],
+    ) -> bool:
+        """通货上新复制到装备，或已离开格子后模板消失。旧剪贴板不算。"""
+        if item_hit is not None and self._holding_item(vision, item_hit, s):
+            return True
+        if item_hit is not None and _cursor_in_hit(item_hit):
+            return False
+        try:
+            live = vision.find_in_window(
+                win, "item_slot", threshold=s.template_threshold
+            )
+        except VisionError:
+            live = None
+        return live is None
+
+    def _recover_picked_item(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        before: Item,
+    ) -> Optional[Item]:
+        """确认拿在手上或格子已空后再左键放回。"""
+        item_hit = vision.get_cached_position("item_slot")
+        slotted = self._item_in_slot(
+            vision, win, s, before, already_on_item=item_hit is not None
+        )
+        if slotted is not None:
+            return slotted
+        if item_hit is None or not self._can_put_item_back(vision, win, s, item_hit):
+            return None
+        for put_try in range(1, PUT_BACK_TRIES + 1):
+            if self._should_stop():
+                return None
+            self._log(f"放回装备 ({put_try}/{PUT_BACK_TRIES})")
+            self._put_item_back(vision, item_hit)
+            slotted = self._item_in_slot(vision, win, s, before, already_on_item=True)
+            if slotted is not None:
+                return slotted
+            slotted = self._item_in_slot(vision, win, s, before, already_on_item=False)
+            if slotted is not None:
+                return slotted
+            if not self._can_put_item_back(vision, win, s, item_hit):
+                return None
+        return None
+
+    def _read_after_currency(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        before: Item,
+    ) -> tuple[str, Optional[Item]]:
+        """左键后留在装备格 Ctrl+C。等到新文本，或确认旧文本/读不到。"""
+        item_hit = vision.get_cached_position("item_slot")
+        wait_ms = max(COPY_TIMEOUT_MS, int(s.craft_wait_ms))
+        try:
+            fresh = self._read_item_fast(
+                vision,
+                win,
+                s,
+                already_on_item=True,
+                stale_text=before.raw_text,
+                timeout_ms=wait_ms,
+            )
+            if not self._is_wrong_item(before, fresh):
+                return "new", fresh
+        except ItemParseError as error:
+            message = str(error)
+            if "等待剪贴板超时" not in message and "未读到通货" not in message:
+                if "词缀尚未刷新" not in message:
+                    return "parse", None
+        except VisionError:
+            pass
+
+        try:
+            item = self._try_read_item(vision, win, s, already_on_item=True)
+        except ItemParseError:
+            return "parse", None
+        except VisionError:
+            item = None
+
+        if item is not None and not self._is_wrong_item(before, item):
+            if not self._same_item_text(before, item):
+                return "new", item
+            if item_hit is not None and self._holding_item(vision, item_hit, s):
+                return "pickup", self._recover_picked_item(vision, win, s, before)
+            return "stale", item
+
+        if self._can_put_item_back(vision, win, s, item_hit):
+            return "pickup", self._recover_picked_item(vision, win, s, before)
+        return "pickup", None
 
     def _apply_until_new_item(
         self,
@@ -1243,136 +1656,103 @@ class CraftAutomation:
         before: Item,
         currency_names: list[str],
     ) -> tuple[Optional[Item], object, Optional[StopReason], str]:
-        """右键通货→左键装备，直到读到新装备。未确认则重试动作，不用旧文本判定。"""
-        stale_text = before.raw_text
+        """右键通货→装备格确认光标→左键，直到读到新装备。旧文本不判定。"""
         template_name = step.currency_template
+        parse_failures = 0
+        need_recover = False
         for apply_try in range(1, APPLY_CONFIRM_TRIES + 1):
-            try:
-                clicked = self._apply_currency_step(vision, win, step, s)
-            except CurrencyUnavailableError as error:
-                return None, win, StopReason.CURRENCY_UNAVAILABLE, str(error)
             if self._should_stop():
                 return None, win, StopReason.USER_STOP, "用户停止"
-            if not clicked:
-                if apply_try < APPLY_CONFIRM_TRIES:
-                    self._log("左键前未读到装备，重新选择通货")
+            if need_recover:
+                recovered = self._recover_picked_item(vision, win, s, before)
+                if recovered is None:
                     continue
-                return (
-                    None,
-                    win,
-                    StopReason.TEMPLATE_NOT_FOUND,
-                    f"无法定位或使用{currency_label(template_name)}",
+                need_recover = False
+                self._capture_item_pointer_baseline(vision)
+            try:
+                kind, read_item = self._use_currency_on_item(
+                    vision, win, step, s, before
                 )
-            if sleep_ms(s.craft_wait_ms, self._should_stop):
+            except CurrencyUnavailableError as error:
+                self._disarm_currency()
+                return None, win, StopReason.CURRENCY_UNAVAILABLE, str(error)
+            if self._should_stop() or kind == "stop":
                 return None, win, StopReason.USER_STOP, "用户停止"
-
-            on_item = True
-            read_item: Optional[Item] = None
-            unconfirmed = False
-            for read_try in range(1, s.max_parse_failures + 1):
-                try:
-                    read_item = self._read_item_fast(
-                        vision,
-                        win,
-                        s,
-                        already_on_item=on_item,
-                        stale_text=stale_text,
-                    )
-                    if self._is_wrong_item(before, read_item):
-                        self._log("读到的不是原装备，疑似拾取，放回后重试")
-                        self._put_item_back(vision)
-                        unconfirmed = True
-                        read_item = None
-                    break
-                except ItemParseError as error:
-                    parse_failures = read_try
-                    self._update(notify=False, parse_failures=parse_failures)
-                    if "未读到通货动作后的新物品文本" in str(error):
-                        if not self._copy_saw_equipment:
-                            self._put_item_back(vision)
-                        unconfirmed = True
-                        break
-                    self._log(
-                        f"动作后读取失败 ({read_try}/{s.max_parse_failures})，"
-                        f"仅重读装备: {error}"
-                    )
-                    on_item = False
-                    if read_try >= 2:
-                        win2, moved, lost = self._sync_game_window(win)
-                        if win2 is None:
-                            return None, win, StopReason.WINDOW_NOT_FOUND, lost or "游戏窗口丢失"
-                        if moved:
-                            self._log("连续读取失败且窗口已移动，重新定位")
-                            win = win2
-                            relocate_error = self._relocate_workflow(
-                                vision, win, s, currency_names
-                            )
-                            if relocate_error:
-                                return None, win, StopReason.TEMPLATE_NOT_FOUND, relocate_error
-                    if self._should_stop():
-                        return None, win, StopReason.USER_STOP, "用户停止"
-                except VisionError as error:
-                    parse_failures = read_try
-                    self._update(notify=False, parse_failures=parse_failures)
-                    self._log(
-                        f"动作后读取失败 ({read_try}/{s.max_parse_failures})，"
-                        f"仅重读装备: {error}"
-                    )
-                    vision.clear_position_cache("item_slot")
-                    on_item = False
-                    if self._should_stop():
-                        return None, win, StopReason.USER_STOP, "用户停止"
-                except Exception as error:
-                    parse_failures = read_try
-                    self._update(notify=False, parse_failures=parse_failures)
-                    self._log(
-                        f"动作后读取异常 ({read_try}/{s.max_parse_failures})，"
-                        f"仅重读装备: {error}"
-                    )
-                    on_item = False
-                    if self._should_stop():
-                        return None, win, StopReason.USER_STOP, "用户停止"
-
-            if read_item is not None:
+            if kind == "no_select":
+                self._disarm_currency()
+                self._log("堆叠名称未核对，回到本步通货再右键")
+                continue
+            if kind == "like_pointer":
+                self._disarm_currency()
+                self._log("装备格光标仍像普通指针，不左键，回到堆叠再右键")
+                continue
+            if kind == "no_click":
+                self._disarm_currency()
+                self._log("未停在装备格内，不左键，回到堆叠再右键")
+                continue
+            if kind == "new" and read_item is not None:
+                self._disarm_currency()
+                self._capture_item_pointer_baseline(vision)
                 self._confirm_currency_spent(vision, template_name)
                 return read_item, win, None, ""
-            if unconfirmed and apply_try < APPLY_CONFIRM_TRIES:
-                self._refund_currency(template_name)
-                self._log("未读到新装备，重新选择通货再点")
+            if kind == "parse":
+                parse_failures += 1
+                self._update(parse_failures=parse_failures)
+                self._log(
+                    f"剪贴板无法解析为物品 ({parse_failures}/{s.max_parse_failures})"
+                )
+                if parse_failures >= s.max_parse_failures:
+                    self._disarm_currency()
+                    return (
+                        None,
+                        win,
+                        StopReason.PARSE_FAILURES,
+                        "连续解析失败次数过多",
+                    )
                 continue
-            if self._should_stop():
-                return None, win, StopReason.USER_STOP, "用户停止"
-            return (
-                None,
-                win,
-                StopReason.PARSE_FAILURES,
-                "通货动作后未能读到新装备文本，未用旧文本判定",
-            )
-        return (
-            None,
-            win,
-            StopReason.PARSE_FAILURES,
-            "通货动作后未能读到新装备文本，未用旧文本判定",
-        )
+            self._refund_currency(template_name)
+            self._disarm_currency()
+            if kind == "pickup":
+                self._log(
+                    "检测到拾取，已放回"
+                    if read_item
+                    else "检测到拾取，无铁证不左键放回"
+                )
+                if read_item is None:
+                    need_recover = True
+                    win2, moved, lost = self._sync_game_window(win)
+                    if win2 is None:
+                        return None, win, StopReason.WINDOW_NOT_FOUND, lost or "游戏窗口丢失"
+                    if moved:
+                        self._log("拾取恢复前发现窗口已移动，重新定位")
+                        win = win2
+                        relocate_error = self._relocate_workflow(
+                            vision, win, s, currency_names
+                        )
+                        if relocate_error:
+                            return None, win, StopReason.TEMPLATE_NOT_FOUND, relocate_error
+            else:
+                self._log("通货未生效，装备仍在格子，不左键，回到堆叠再右键")
+        return None, win, None, ""
 
     def _copy_hovered_text(
         self,
+        vision: VisionService,
         hit: MatchHit,
         s: AppSettings,
     ) -> Optional[str]:
-        """只悬停并 Ctrl+C，用于点击前核对通货名称。"""
+        """移到堆叠中心再 Ctrl+C。不在堆叠上采指针基线。"""
+        self._move_to_hit(hit)
+        return self._copy_item_text(
+            s, timeout_ms=COPY_TIMEOUT_MS, require_currency=True
+        )
 
-        move_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS)
-        return self._copy_item_text(s, timeout_ms=COPY_TIMEOUT_MS)
+    def _clear_currency_hit(self, vision: VisionService, template_name: str) -> None:
+        vision.clear_position_cache(template_name)
+        self._verified_currency_templates.discard(template_name)
+        self._currency_stack_counts.pop(template_name, None)
 
-    def _apply_currency_step(
-        self,
-        vision: VisionService,
-        win,
-        step: CraftStep,
-        s: AppSettings,
-    ) -> bool:
-        # PoE 通货使用方式：右键所选通货，再左键目标装备。
+    def _resolve_item_hit(self, vision: VisionService, win, s: AppSettings):
         item_hit = vision.get_cached_position("item_slot")
         if item_hit is None:
             item_hit = vision.find_in_window(
@@ -1380,91 +1760,139 @@ class CraftAutomation:
                 "item_slot",
                 threshold=s.template_threshold,
             )
+        return item_hit
+
+    def _usable_step_currency_hit(
+        self,
+        vision: VisionService,
+        template_name: str,
+        item_region: tuple[int, int, int, int],
+    ) -> Optional[MatchHit]:
+        if template_name not in self._verified_currency_templates:
+            return None
+        hit = vision.get_cached_position(template_name)
+        if hit is None:
+            return None
+        if _hit_center_in_region(hit, item_region):
+            return None
+        if self._conflicting_currency_name(vision, hit, template_name):
+            return None
+        return hit
+
+    def _select_step_currency(
+        self,
+        vision: VisionService,
+        win,
+        step: CraftStep,
+        s: AppSettings,
+    ) -> bool:
+        """只在本步通货上：Ctrl+C 核对名字 → 右键一次。不在堆叠上判定选中。"""
+        item_hit = self._resolve_item_hit(vision, win, s)
         if item_hit is None:
             return False
         item_region = _hit_client_region(item_hit)
         template_name = step.currency_template
         expected_name = currency_label(template_name)
-        currency_hit = vision.get_cached_position(template_name)
-        if (
-            currency_hit is None
-            or template_name not in self._verified_currency_templates
-        ):
-            vision.clear_position_cache(template_name)
-            self._verified_currency_templates.discard(template_name)
-            self._currency_stack_counts.pop(template_name, None)
-            clean_frame = self._grab_workflow_frame_without_tooltip(
-                vision,
-                win,
-                s,
-            )
-            if clean_frame is None:
-                return False
-            currency_hit = self._find_and_verify_currency_in_frame(
+        excluded = [item_region]
+        currency_hit = self._usable_step_currency_hit(
+            vision, template_name, item_region
+        )
+        if currency_hit is None:
+            currency_hit = self._find_verified_currency(
                 vision,
                 win,
                 s,
                 template_name,
-                clean_frame,
-                [item_region],
+                excluded,
+                allow_item_slot=False,
             )
-        if currency_hit is not None and _hit_center_in_region(
-            currency_hit, item_region
+        if currency_hit is not None and (
+            _hit_center_in_region(currency_hit, item_region)
+            or self._conflicting_currency_name(vision, currency_hit, template_name)
         ):
-            self._log(
-                f"已拒绝{expected_name}匹配结果："
-                "坐标落在目标装备区域内"
+            conflict = self._conflicting_currency_name(
+                vision, currency_hit, template_name
             )
-            vision.clear_position_cache(template_name)
-            self._verified_currency_templates.discard(template_name)
-            self._currency_stack_counts.pop(template_name, None)
-            currency_hit = None
+            reason = (
+                f"与已核实{currency_label(conflict)}中心过近"
+                if conflict
+                else "坐标落在目标装备区域内"
+            )
+            self._log(f"已拒绝{expected_name}匹配结果：{reason}")
+            self._clear_currency_hit(vision, template_name)
+            excluded = [item_region]
+            if conflict:
+                other = vision.get_cached_position(conflict)
+                if other is not None:
+                    excluded.append(_hit_client_region(other))
+            currency_hit = self._find_verified_currency(
+                vision,
+                win,
+                s,
+                template_name,
+                excluded,
+                allow_item_slot=False,
+            )
         if currency_hit is None:
+            if self._should_stop():
+                return False
             raise CurrencyUnavailableError(
                 f"没有找到可用的{expected_name}：可能已用完或已移出可见区域"
             )
 
-        # 定位通货时已经通过 Ctrl+C 核对名称与数量。正常循环直接使用
-        # 本地剩余量并递减，避免每次动作都等待剪贴板；只有旧配置/测试
-        # 没有数量快照时才在这里补读一次。
-        remaining = self._currency_stack_counts.get(template_name)
-        if remaining is None:
-            copied_text = self._copy_hovered_text(currency_hit, s)
-            remaining = (
-                currency_stack_count(copied_text)
-                if copied_text is not None and expected_name in copied_text
-                else None
+        copied_text = self._copy_hovered_text(vision, currency_hit, s)
+        if copied_text is None or expected_name not in copied_text:
+            self._log(f"堆叠上不是{expected_name}，不右键，重新查找")
+            excluded = [item_region, _hit_client_region(currency_hit)]
+            self._clear_currency_hit(vision, template_name)
+            currency_hit = self._find_verified_currency(
+                vision,
+                win,
+                s,
+                template_name,
+                excluded,
+                allow_item_slot=False,
             )
+            if currency_hit is None:
+                if self._should_stop():
+                    return False
+                raise CurrencyUnavailableError(
+                    f"没有找到可用的{expected_name}：可能已用完或已移出可见区域"
+                )
+            copied_text = self._copy_hovered_text(vision, currency_hit, s)
+            if copied_text is None or expected_name not in copied_text:
+                self._log(f"再次核对仍不是{expected_name}，本轮不右键")
+                return False
+
+        remaining = currency_stack_count(copied_text)
         if remaining is None or remaining <= 0:
             if self._should_stop():
                 return False
             self._log(
                 f"{expected_name}原位置已空或数量无法确认，正在查找其他堆叠…"
             )
-            vision.clear_position_cache(template_name)
-            self._verified_currency_templates.discard(template_name)
-            self._currency_stack_counts.pop(template_name, None)
-            clean_frame = self._grab_workflow_frame_without_tooltip(
-                vision,
-                win,
-                s,
-            )
-            if clean_frame is None:
-                if self._should_stop():
-                    return False
-                raise CurrencyUnavailableError(
-                    f"无法确认{expected_name}剩余数量，已在点击前停止"
-                )
-            currency_hit = self._find_and_verify_currency_in_frame(
+            excluded = [item_region, _hit_client_region(currency_hit)]
+            currency_hit = self._find_verified_currency(
                 vision,
                 win,
                 s,
                 template_name,
-                clean_frame,
-                [item_region],
+                excluded,
+                allow_item_slot=False,
             )
             remaining = self._currency_stack_counts.get(template_name)
             if currency_hit is None or remaining is None or remaining <= 0:
+                if self._should_stop():
+                    return False
+                raise CurrencyUnavailableError(
+                    f"{expected_name}已用完，或当前画面中没有数量可确认的堆叠"
+                )
+            copied_text = self._copy_hovered_text(vision, currency_hit, s)
+            if copied_text is None or expected_name not in copied_text:
+                self._log(f"新堆叠不是{expected_name}，本轮不右键")
+                return False
+            remaining = currency_stack_count(copied_text) or remaining
+            if remaining <= 0:
                 raise CurrencyUnavailableError(
                     f"{expected_name}已用完，或当前画面中没有数量可确认的堆叠"
                 )
@@ -1473,25 +1901,154 @@ class CraftAutomation:
         if remaining <= 5 or remaining % 100 == 0:
             self._log(f"{expected_name}使用前剩余={remaining}")
 
-        # 上一轮读装备后光标还在格子上：先离开再右键，避免点偏或点到装备。
+        if not self._right_click_currency_stack(currency_hit):
+            self._disarm_currency()
+            return False
+        self._currency_use_armed = True
+        self._item_use_clicked = False
+        return True
+
+    def _use_currency_on_item(
+        self,
+        vision: VisionService,
+        win,
+        step: CraftStep,
+        s: AppSettings,
+        before: Item,
+    ) -> tuple[str, Optional[Item]]:
+        """一次使用：堆叠右键 → 只 move 到装备格 → 不像指针才左键 → 读新文本。"""
+        if not self._item_use_clicked:
+            if not self._select_step_currency(vision, win, step, s):
+                return "no_select", None
+            item_hit = self._resolve_item_hit(vision, win, s)
+            if item_hit is None:
+                return "no_click", None
+            click_kind = self._left_click_item_use(vision, item_hit)
+            if click_kind != "ok":
+                return click_kind, None
+            self._item_use_clicked = True
+            remaining = self._currency_stack_counts.get(step.currency_template)
+            if remaining is not None:
+                self._currency_stack_counts[step.currency_template] = remaining - 1
+        return self._read_after_currency(vision, win, s, before)
+
+    def _apply_currency_step(
+        self,
+        vision: VisionService,
+        win,
+        step: CraftStep,
+        s: AppSettings,
+    ) -> bool:
+        """兼容入口：选中本步通货并左键装备。"""
+        if not self._select_step_currency(vision, win, step, s):
+            return False
+        item_hit = self._resolve_item_hit(vision, win, s)
+        if item_hit is None:
+            self._disarm_currency()
+            return False
+        click_kind = self._left_click_item_use(vision, item_hit)
+        if click_kind != "ok":
+            self._disarm_currency()
+            return False
+        self._item_use_clicked = True
+        remaining = self._currency_stack_counts.get(step.currency_template)
+        if remaining is not None:
+            self._currency_stack_counts[step.currency_template] = remaining - 1
+        return True
+
+    def _capture_item_pointer_baseline(self, vision: VisionService) -> bool:
+        """装备格、未选通货时的普通指针。之后左键只和这张比。"""
+        item_hit = vision.get_cached_position("item_slot")
+        if item_hit is None or not _cursor_in_hit(item_hit):
+            return False
+        handle = get_cursor_handle()
+        patch = vision.capture_cursor_patch()
+        if handle is None and patch is None:
+            return False
+        self._item_pointer_handle = handle
+        self._item_pointer_patch = patch
+        return True
+
+    def _item_cursor_holds_currency(self, vision: VisionService) -> bool:
+        """装备格上相对启动指针基线：块明显不同或 hCursor 变了。"""
+        handle = get_cursor_handle()
+        patch = vision.capture_cursor_patch()
+        handle_changed = (
+            self._item_pointer_handle is not None
+            and handle is not None
+            and handle != self._item_pointer_handle
+        )
+        return handle_changed or _cursor_unlike(self._item_pointer_patch, patch)
+
+    def _wait_after_failed_use(self, vision: VisionService) -> None:
+        """失败后停一个确认窗口，避免紧接着空转下一轮。"""
+        sleep_ms(CURSOR_CONFIRM_TIMEOUT_MS, self._should_stop)
+
+    def _right_click_currency_stack(self, stack_hit: MatchHit) -> bool:
+        """只在已核实堆叠上右键一次。不在这里判定是否挂上。"""
+        self._move_to_hit(stack_hit)
+        if not _cursor_in_hit(stack_hit):
+            self._log("未能停在已核实通货堆叠上，本轮不右键")
+            return False
         click_screen(
-            currency_hit.screen_x,
-            currency_hit.screen_y,
+            stack_hit.screen_x,
+            stack_hit.screen_y,
             settle_ms=CURSOR_MS,
             button="right",
         )
-        # 尽快移到装备；能再次读到装备文本才左键（鼠标/tooltip 就绪）。
-        move_screen(item_hit.screen_x, item_hit.screen_y, settle_ms=CURSOR_MS)
-        if not self._copy_item_text(s, timeout_ms=COPY_TIMEOUT_MS, require_item=True):
-            return False
-        click_screen(
-            item_hit.screen_x,
-            item_hit.screen_y,
-            settle_ms=0,
-            button="left",
-        )
-        self._currency_stack_counts[template_name] = remaining - 1
+        self._last_hover_hit = stack_hit
         return True
+
+    def _left_click_item_use(
+        self,
+        vision: VisionService,
+        item_hit: MatchHit,
+    ) -> str:
+        """只 move 到装备格；和指针基线不像才左键一次。"""
+        if not self._currency_use_armed:
+            return "no_select"
+        if self._item_pointer_patch is None and self._item_pointer_handle is None:
+            self._log("没有装备格指针基线，不左键")
+            return "like_pointer"
+        if self._conflicting_currency_name(vision, item_hit, ""):
+            self._log("装备格坐标落在通货区域，不左键")
+            return "no_click"
+        self._move_to_hit(item_hit)
+        if not wait_until(
+            lambda: _cursor_in_hit(item_hit),
+            CURSOR_CONFIRM_TIMEOUT_MS,
+            poll_ms=20,
+            should_stop=self._should_stop,
+        ):
+            self._log("未能停在装备格内，本轮不左键")
+            return "no_click"
+        x, y = get_cursor_pos()
+        for name in self._verified_currency_templates:
+            other = vision.get_cached_position(name)
+            if other is not None and _point_in_hit(x, y, other):
+                self._log("光标仍在通货堆叠上，不左键")
+                return "no_click"
+        stable = [0]
+
+        def holds_currency() -> bool:
+            if not _cursor_in_hit(item_hit):
+                stable[0] = 0
+                return False
+            if self._item_cursor_holds_currency(vision):
+                stable[0] += 1
+                return stable[0] >= 2
+            stable[0] = 0
+            return False
+
+        if not wait_until(
+            holds_currency,
+            CURSOR_CONFIRM_TIMEOUT_MS,
+            poll_ms=20,
+            should_stop=self._should_stop,
+        ):
+            return "like_pointer"
+        self._click_item_slot_left(item_hit)
+        return "ok"
 
     def _check_lifeforce(
         self, vision: VisionService, win, s: AppSettings
@@ -1524,8 +2081,9 @@ class CraftAutomation:
                 return False
         if hit is None:
             return False
-        # 根据当前窗口原点修正缓存坐标（窗口未动时等价）
-        # 缓存里已是绝对屏幕坐标；窗口移动时会清缓存，故直接点
+        if template_name == "item_slot":
+            self._log("item_slot 只能在使用或确认放回时左键，已拒绝通用点击")
+            return False
         click_screen(hit.screen_x, hit.screen_y, settle_ms=15, button=button)
         return True
 
@@ -1564,14 +2122,14 @@ class CraftAutomation:
         timeout_ms: int,
         stale_text: str = "",
         require_item: bool = False,
+        require_currency: bool = False,
     ) -> Optional[str]:
-        """轮询直到剪贴板出现有效文本；通货动作后必须是新装备。"""
+        """轮询直到剪贴板出现有效文本；传入 stale_text 时拒绝旧装备。"""
         stale = normalize_clipboard_text(stale_text)
         reject_texts = (stale,) if stale else ()
         clear_clipboard()
         previous = ""
         found: list[str] = []
-        self._copy_saw_equipment = False
         deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
 
         def pred() -> bool:
@@ -1589,11 +2147,22 @@ class CraftAutomation:
             )
             if not text:
                 return False
-            if is_equipment_clipboard_text(text):
-                self._copy_saw_equipment = True
+            if require_currency:
+                if not _is_currency_clipboard_text(text):
+                    previous = normalize_clipboard_text(text)
+                    return False
             elif require_item:
-                previous = normalize_clipboard_text(text)
-                return False
+                if not is_equipment_clipboard_text(text):
+                    previous = normalize_clipboard_text(text)
+                    return False
+                try:
+                    parsed = parse_item_text(text)
+                except ItemParseError:
+                    previous = normalize_clipboard_text(text)
+                    return False
+                if parsed.rarity in {"魔法", "稀有"} and not parsed.affixes:
+                    previous = normalize_clipboard_text(text)
+                    return False
             found.append(text)
             return True
 
@@ -1613,6 +2182,7 @@ class CraftAutomation:
         s: AppSettings,
         already_on_item: bool = False,
         stale_text: str = "",
+        timeout_ms: int = COPY_TIMEOUT_MS,
     ) -> Item:
         hit = vision.get_cached_position("item_slot")
         if hit is None:
@@ -1624,11 +2194,13 @@ class CraftAutomation:
             raise VisionError("未找到 item_slot.png（工艺槽物品区域）")
 
         if not already_on_item:
-            move_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS)
+            self._move_to_hit(hit)
+        else:
+            self._last_hover_hit = hit
 
         text = self._copy_item_text(
             s,
-            timeout_ms=COPY_TIMEOUT_MS,
+            timeout_ms=timeout_ms,
             stale_text=stale_text,
             require_item=True,
         )
@@ -1639,7 +2211,7 @@ class CraftAutomation:
                 else "等待剪贴板超时，请确认鼠标悬停在物品上且复制键为 Ctrl+C"
             )
         item = parse_item_text(text)
-        if stale_text and item.rarity in {"魔法", "稀有"} and not item.affixes:
+        if item.rarity in {"魔法", "稀有"} and not item.affixes:
             raise ItemParseError("物品词缀尚未刷新")
         return item
 

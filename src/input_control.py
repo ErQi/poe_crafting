@@ -5,6 +5,13 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 try:
+    import ctypes
+    from ctypes import wintypes
+except ImportError:
+    ctypes = None  # type: ignore
+    wintypes = None  # type: ignore
+
+try:
     import win32api
     import win32con
     import win32gui
@@ -14,6 +21,48 @@ except ImportError:  # 非 Windows 开发时降级
     win32con = None  # type: ignore
     win32gui = None  # type: ignore
     win32process = None  # type: ignore
+
+_CURSORINFO = None
+_ICONINFO = None
+_user32 = None
+_gdi32 = None
+if ctypes is not None and wintypes is not None:
+    try:
+
+        class _CURSORINFO(ctypes.Structure):
+            _fields_ = (
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hCursor", wintypes.HANDLE),
+                ("ptScreenPos", wintypes.POINT),
+            )
+
+        class _ICONINFO(ctypes.Structure):
+            _fields_ = (
+                ("fIcon", wintypes.BOOL),
+                ("xHotspot", wintypes.DWORD),
+                ("yHotspot", wintypes.DWORD),
+                ("hbmMask", wintypes.HBITMAP),
+                ("hbmColor", wintypes.HBITMAP),
+            )
+
+        _user32 = ctypes.windll.user32
+        _gdi32 = ctypes.windll.gdi32
+        _user32.GetCursorInfo.argtypes = [ctypes.POINTER(_CURSORINFO)]
+        _user32.GetCursorInfo.restype = wintypes.BOOL
+        _user32.GetIconInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ICONINFO)]
+        _user32.GetIconInfo.restype = wintypes.BOOL
+        _user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        _user32.GetSystemMetrics.restype = ctypes.c_int
+        _gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+        _gdi32.DeleteObject.restype = wintypes.BOOL
+    except Exception:
+        _CURSORINFO = None
+        _ICONINFO = None
+        _user32 = None
+        _gdi32 = None
+
+_hotspot_cache: dict[int, tuple[int, int]] = {}
 
 try:
     import pydirectinput
@@ -251,6 +300,103 @@ def focus_game_window(
     return win, ok
 
 
+def get_cursor_pos() -> tuple[int, int]:
+    if win32api is not None:
+        pos = win32api.GetCursorPos()
+        return int(pos[0]), int(pos[1])
+    if pydirectinput is not None:
+        pos = pydirectinput.position()
+        return int(pos[0]), int(pos[1])
+    return 0, 0
+
+
+def get_cursor_handle() -> Optional[int]:
+    """当前系统光标句柄。游戏把通货挂到光标上时通常会换 hCursor。"""
+    if _user32 is not None and _CURSORINFO is not None:
+        try:
+            info = _CURSORINFO()
+            info.cbSize = ctypes.sizeof(_CURSORINFO)
+            if _user32.GetCursorInfo(ctypes.byref(info)) and info.hCursor:
+                return int(info.hCursor)
+        except Exception:
+            pass
+    if win32gui is not None:
+        try:
+            _flags, hcursor, _pos = win32gui.GetCursorInfo()
+            return int(hcursor) if hcursor else None
+        except Exception:
+            return None
+    return None
+
+
+def get_cursor_hotspot() -> tuple[int, int]:
+    """当前光标热点相对其位图左上角的偏移。失败则 (0, 0)。"""
+    handle = get_cursor_handle()
+    if handle is None:
+        return (0, 0)
+    cached = _hotspot_cache.get(handle)
+    if cached is not None:
+        return cached
+    hotspot = (0, 0)
+    if _user32 is not None and _gdi32 is not None and _ICONINFO is not None:
+        try:
+            info = _ICONINFO()
+            if _user32.GetIconInfo(handle, ctypes.byref(info)):
+                try:
+                    hotspot = (int(info.xHotspot), int(info.yHotspot))
+                finally:
+                    if info.hbmMask:
+                        _gdi32.DeleteObject(info.hbmMask)
+                    if info.hbmColor:
+                        _gdi32.DeleteObject(info.hbmColor)
+        except Exception:
+            hotspot = (0, 0)
+    elif win32gui is not None:
+        try:
+            _icon, x_hot, y_hot, mask, color = win32gui.GetIconInfo(handle)
+            try:
+                hotspot = (int(x_hot), int(y_hot))
+            finally:
+                if mask:
+                    win32gui.DeleteObject(mask)
+                if color:
+                    win32gui.DeleteObject(color)
+        except Exception:
+            hotspot = (0, 0)
+    _hotspot_cache[handle] = hotspot
+    return hotspot
+
+
+def cursor_patch_size(window_height: int = 0, hwnd: int = 0) -> int:
+    """按游戏窗口高度/DPI 放大光标截图块，4K 不会再死用 32px。"""
+    height = max(0, int(window_height))
+    dpi = 96
+    if height <= 0 and win32api is not None:
+        try:
+            height = max(1, int(win32api.GetSystemMetrics(1)))
+        except Exception:
+            height = 0
+    if height <= 0 and _user32 is not None:
+        try:
+            height = max(1, int(_user32.GetSystemMetrics(1)))
+        except Exception:
+            height = 0
+    if height <= 0:
+        height = 1080
+    if _user32 is not None:
+        try:
+            if hwnd:
+                raw = int(_user32.GetDpiForWindow(int(hwnd)))
+            else:
+                raw = int(_user32.GetDpiForSystem())
+            if raw > 0:
+                dpi = raw
+        except Exception:
+            pass
+    scale = max(height / 1080.0, dpi / 96.0)
+    return max(32, int(round(32 * scale)))
+
+
 def _move_to(x: int, y: int) -> None:
     if win32api is not None:
         win32api.SetCursorPos((int(x), int(y)))
@@ -282,8 +428,10 @@ def click_screen(
     x: int,
     y: int,
     settle_ms: int = 40,
-    button: str = "left",
+    *,
+    button: str,
 ) -> None:
+    """先移到坐标，等 settle 后再点一次。必须显式指定左右键。"""
     _move_to(x, y)
     time.sleep(settle_ms / 1000.0)
     _click(button)

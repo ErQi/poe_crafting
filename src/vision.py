@@ -9,7 +9,13 @@ import cv2
 import numpy as np
 
 from .config_store import resolve_path
-from .input_control import WindowInfo, find_game_window
+from .input_control import (
+    WindowInfo,
+    cursor_patch_size,
+    find_game_window,
+    get_cursor_hotspot,
+    get_cursor_pos,
+)
 
 try:
     import mss
@@ -85,6 +91,33 @@ def capture_region(
 
 def capture_window(window: WindowInfo, sct: Optional["mss.mss"] = None) -> np.ndarray:
     return capture_region(window.left, window.top, window.width, window.height, sct=sct)
+
+
+def patch_rmse(a: np.ndarray, b: np.ndarray) -> float:
+    if a.shape != b.shape:
+        return 0.0
+    diff = a.astype(np.float32) - b.astype(np.float32)
+    return float(np.sqrt(np.mean(diff * diff)))
+
+
+def capture_cursor_patch(
+    size: Optional[int] = None,
+    sct: Optional["mss.mss"] = None,
+) -> Optional[np.ndarray]:
+    """从实际热点原点截取光标块；尺寸按分辨率/DPI，不写死 32px。"""
+    patch = cursor_patch_size() if size is None else max(32, int(size))
+    cx, cy = get_cursor_pos()
+    hx, hy = get_cursor_hotspot()
+    try:
+        return capture_region(
+            max(0, int(cx) - int(hx)),
+            max(0, int(cy) - int(hy)),
+            patch,
+            patch,
+            sct=sct,
+        )
+    except Exception:
+        return None
 
 
 def load_template(path: Path) -> np.ndarray:
@@ -502,6 +535,8 @@ class VisionService:
         self._feature_frame_ref: Optional[np.ndarray] = None
         self._feature_frame_data: Optional[tuple[list, Optional[np.ndarray]]] = None
         self._sct = None
+        self._window_height = 0
+        self._window_hwnd = 0
         if mss is not None:
             try:
                 self._sct = mss.mss()
@@ -581,8 +616,18 @@ class VisionService:
             return []
         return sorted(p.name for p in self.templates_dir.glob("*.png"))
 
+    def _note_window(self, window: WindowInfo) -> None:
+        self._window_height = window.height
+        self._window_hwnd = window.hwnd
+
     def grab_window(self, window: WindowInfo) -> np.ndarray:
+        self._note_window(window)
         return capture_window(window, sct=self._sct)
+
+    def capture_cursor_patch(self, size: Optional[int] = None) -> Optional[np.ndarray]:
+        if size is None:
+            size = cursor_patch_size(self._window_height, self._window_hwnd)
+        return capture_cursor_patch(size, sct=self._sct)
 
     def match_in_frame(
         self,
@@ -595,6 +640,7 @@ class VisionService:
         use_fallback_scales: bool = True,
         exclude_regions: Optional[list[tuple[int, int, int, int]]] = None,
     ) -> Optional[MatchHit]:
+        self._note_window(window)
         thr = self.threshold if threshold is None else threshold
         needle_gray = self.get_template_gray(template_name)
         needle_mask = self.get_template_mask(template_name)
@@ -658,6 +704,7 @@ class VisionService:
     ) -> Optional[MatchHit]:
         """用彩色 RMSE 定位透明图标；默认不缓存未核对的候选。"""
 
+        self._note_window(window)
         template = self.get_template(template_name)
         mask = self.get_template_mask(template_name)
         hit = match_template_color_rmse(
@@ -729,6 +776,49 @@ class VisionService:
                 )
             )
         return hits
+
+    def match_near_screen(
+        self,
+        screen_x: int,
+        screen_y: int,
+        template_name: str,
+        radius: int = 72,
+        max_rmse: float = 80.0,
+        scales: Optional[list[float] | tuple[float, ...]] = None,
+    ) -> Optional[MatchHit]:
+        """在屏幕坐标附近小范围做彩色匹配，不写入位置缓存。"""
+
+        left = int(screen_x) - radius
+        top = int(screen_y) - radius
+        size = max(16, radius * 2)
+        try:
+            frame = capture_region(left, top, size, size, sct=self._sct)
+        except Exception:
+            return None
+        raw = match_template_color_rmse(
+            frame,
+            self.get_template(template_name),
+            self.get_template_mask(template_name),
+            max_rmse=max_rmse,
+            scales=scales or (0.85, 1.0, 1.15),
+            search_scale=1.0,
+        )
+        if raw is None:
+            return None
+        score, x, y, width, height, rmse = raw
+        center_x = left + x + width // 2
+        center_y = top + y + height // 2
+        return MatchHit(
+            name=template_name,
+            score=score,
+            screen_x=center_x,
+            screen_y=center_y,
+            client_x=x + width // 2,
+            client_y=y + height // 2,
+            width=width,
+            height=height,
+            color_rmse=rmse,
+        )
 
     def find_color_in_window(
         self,
