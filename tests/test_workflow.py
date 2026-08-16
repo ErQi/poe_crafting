@@ -807,6 +807,7 @@ class TestWorkflow(unittest.TestCase):
                 return_value=(_Window(), True),
             ),
             patch("src.automation.find_game_window", return_value=_Window()),
+            patch("src.automation.peek_window", return_value=_Window()),
             patch("src.automation.focus_window", return_value=True),
             patch.object(
                 automation,
@@ -858,6 +859,7 @@ class TestWorkflow(unittest.TestCase):
                 return_value=(_Window(), True),
             ),
             patch("src.automation.find_game_window", return_value=_Window()),
+            patch("src.automation.peek_window", return_value=_Window()),
             patch("src.automation.focus_window", return_value=True),
             patch.object(
                 automation,

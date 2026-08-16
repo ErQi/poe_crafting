@@ -18,7 +18,7 @@ except ImportError:  # 非 Windows 开发时降级
 try:
     import pydirectinput
 
-    pydirectinput.PAUSE = 0.02
+    pydirectinput.PAUSE = 0
     pydirectinput.FAILSAFE = False
 except ImportError:
     pydirectinput = None  # type: ignore
@@ -46,6 +46,36 @@ class WindowInfo:
         return (self.left + self.width // 2, self.top + self.height // 2)
 
 
+def _window_from_hwnd(hwnd: int, title: str = "") -> Optional[WindowInfo]:
+    """只读已有句柄：是否还在 + 客户区屏幕坐标。不枚举桌面。"""
+    if win32gui is None or not hwnd:
+        return None
+    try:
+        if not win32gui.IsWindow(hwnd):
+            return None
+        rect = win32gui.GetClientRect(hwnd)
+        left_top = win32gui.ClientToScreen(hwnd, (rect[0], rect[1]))
+        right_bottom = win32gui.ClientToScreen(hwnd, (rect[2], rect[3]))
+        info = WindowInfo(
+            hwnd=hwnd,
+            title=title or (win32gui.GetWindowText(hwnd) or ""),
+            left=left_top[0],
+            top=left_top[1],
+            right=right_bottom[0],
+            bottom=right_bottom[1],
+        )
+        if info.width > 100 and info.height > 100:
+            return info
+    except Exception:
+        return None
+    return None
+
+
+def peek_window(hwnd: int, title: str = "") -> Optional[WindowInfo]:
+    """常规循环用的廉价窗口检查，不走 EnumWindows。"""
+    return _window_from_hwnd(hwnd, title)
+
+
 def find_game_window(keywords: list[str]) -> Optional[WindowInfo]:
     if win32gui is None:
         return None
@@ -67,29 +97,19 @@ def find_game_window(keywords: list[str]) -> Optional[WindowInfo]:
                 break
         if not matched:
             return
-        try:
-            rect = win32gui.GetClientRect(hwnd)
-            left_top = win32gui.ClientToScreen(hwnd, (rect[0], rect[1]))
-            right_bottom = win32gui.ClientToScreen(hwnd, (rect[2], rect[3]))
-            info = WindowInfo(
-                hwnd=hwnd,
-                title=title,
-                left=left_top[0],
-                top=left_top[1],
-                right=right_bottom[0],
-                bottom=right_bottom[1],
-            )
-            if info.width > 100 and info.height > 100:
-                found.append(info)
-        except Exception:
-            return
+        info = _window_from_hwnd(hwnd, title)
+        if info is not None:
+            found.append(info)
 
     win32gui.EnumWindows(_enum, None)
     if not found:
         return None
-    # 优先面积最大
     found.sort(key=lambda w: w.width * w.height, reverse=True)
     return found[0]
+
+
+def is_foreground_window(hwnd: int) -> bool:
+    return _is_foreground(hwnd)
 
 
 def _is_foreground(hwnd: int) -> bool:
@@ -232,11 +252,11 @@ def focus_game_window(
 
 
 def _move_to(x: int, y: int) -> None:
-    if pydirectinput is not None:
-        pydirectinput.moveTo(int(x), int(y))
-        return
     if win32api is not None:
         win32api.SetCursorPos((int(x), int(y)))
+        return
+    if pydirectinput is not None:
+        pydirectinput.moveTo(int(x), int(y))
 
 
 def _click(button: str = "left") -> None:
@@ -288,7 +308,7 @@ def hotkey(*keys: str) -> None:
         try:
             for k in keys_l:
                 pydirectinput.keyDown(k)
-            time.sleep(0.04)
+            time.sleep(0.012)
             for k in reversed(keys_l):
                 pydirectinput.keyUp(k)
             return
@@ -321,7 +341,7 @@ def hotkey(*keys: str) -> None:
 
     for vk in vks:
         win32api.keybd_event(vk, 0, 0, 0)
-    time.sleep(0.04)
+    time.sleep(0.012)
     for vk in reversed(vks):
         win32api.keybd_event(vk, 0, win32con.KEYEVENTF_KEYUP, 0)
 

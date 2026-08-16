@@ -291,11 +291,17 @@ class CraftWorkflow:
     name: str = "多步骤通货流程"
     steps: list[CraftStep] = field(default_factory=list)
     start_step_id: str = ""
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    description: str = ""
+    group: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": 1,
+            "id": self.id,
             "name": self.name,
+            "description": self.description,
+            "group": self.group,
             "start_step_id": self.start_step_id,
             "steps": [step.to_dict() for step in self.steps],
         }
@@ -310,7 +316,10 @@ class CraftWorkflow:
         if start_step_id and not any(step.id == start_step_id for step in steps):
             start_step_id = ""
         return cls(
+            id=str(data.get("id") or uuid.uuid4()),
             name=str(data.get("name") or "多步骤通货流程"),
+            description=str(data.get("description") or ""),
+            group=str(data.get("group") or ""),
             steps=steps,
             start_step_id=start_step_id,
         )
@@ -320,6 +329,100 @@ class CraftWorkflow:
 
     def get_step(self, step_id: str) -> Optional[CraftStep]:
         return next((step for step in self.steps if step.id == step_id), None)
+
+
+@dataclass
+class WorkflowLibrary:
+    """多套工艺流程，界面上可快速切换。"""
+
+    active_id: str = ""
+    workflows: list[CraftWorkflow] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": 2,
+            "active_id": self.active_id,
+            "workflows": [workflow.to_dict() for workflow in self.workflows],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WorkflowLibrary":
+        if not isinstance(data, dict):
+            return cls()
+        raw = data.get("workflows") if isinstance(data.get("workflows"), list) else []
+        workflows = [
+            CraftWorkflow.from_dict(item) for item in raw if isinstance(item, dict)
+        ]
+        seen: set[str] = set()
+        unique: list[CraftWorkflow] = []
+        for workflow in workflows:
+            if workflow.id in seen:
+                workflow.id = str(uuid.uuid4())
+            seen.add(workflow.id)
+            unique.append(workflow)
+        active_id = str(data.get("active_id") or "")
+        if active_id and not any(item.id == active_id for item in unique):
+            active_id = ""
+        if not active_id and unique:
+            active_id = unique[0].id
+        return cls(active_id=active_id, workflows=unique)
+
+    def get(self, workflow_id: str) -> Optional[CraftWorkflow]:
+        return next((item for item in self.workflows if item.id == workflow_id), None)
+
+    def active(self) -> CraftWorkflow:
+        current = self.get(self.active_id)
+        if current is not None:
+            return current
+        if self.workflows:
+            self.active_id = self.workflows[0].id
+            return self.workflows[0]
+        empty = CraftWorkflow(name="空流程", group="自定义")
+        self.workflows.append(empty)
+        self.active_id = empty.id
+        return empty
+
+    def select(self, workflow_id: str) -> CraftWorkflow:
+        target = self.get(workflow_id)
+        if target is None:
+            return self.active()
+        self.active_id = workflow_id
+        return target
+
+    def put(self, workflow: CraftWorkflow) -> None:
+        if not workflow.id:
+            workflow.id = str(uuid.uuid4())
+        for index, existing in enumerate(self.workflows):
+            if existing.id == workflow.id:
+                self.workflows[index] = workflow
+                return
+        self.workflows.append(workflow)
+
+    def remove(self, workflow_id: str) -> bool:
+        if len(self.workflows) <= 1:
+            return False
+        self.workflows = [item for item in self.workflows if item.id != workflow_id]
+        if self.active_id == workflow_id:
+            self.active_id = self.workflows[0].id if self.workflows else ""
+        return True
+
+    def grouped(self) -> list[tuple[str, list[CraftWorkflow]]]:
+        order = ("腰带重组", "其他", "自定义")
+        buckets: dict[str, list[CraftWorkflow]] = {name: [] for name in order}
+        extras: list[tuple[str, list[CraftWorkflow]]] = []
+        extra_index: dict[str, int] = {}
+        for workflow in self.workflows:
+            group = workflow.group.strip() or "自定义"
+            if group in buckets:
+                buckets[group].append(workflow)
+                continue
+            if group not in extra_index:
+                extra_index[group] = len(extras)
+                extras.append((group, []))
+            extras[extra_index[group]][1].append(workflow)
+        result = [(name, items) for name, items in buckets.items() if items]
+        result.extend(extras)
+        return result
 
 
 @dataclass
@@ -407,7 +510,7 @@ class AppSettings:
     craft_preset: str = "reforge"
     templates_dir: str = "assets/templates"
     rules_file: str = "config/rules.json"
-    workflow_file: str = "config/workflow.json"
+    workflow_file: str = "config/workflows.json"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -435,6 +538,7 @@ class RunStatus:
     message: str = ""
     workflow_step_name: str = ""
     workflow_step_index: int = 0
+    workflow_name: str = ""
 
 
 def _optional_float(value: Any) -> Optional[float]:

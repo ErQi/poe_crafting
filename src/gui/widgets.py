@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
 import customtkinter as ctk
 import tkinter as tk
+import tkinter.ttk as ttk
 from PIL import Image
 from tkinter import messagebox, simpledialog
 
@@ -27,6 +29,76 @@ from ..template_io import (
 
 
 OPS = ["", ">=", ">", "<=", "<", "="]
+_ROW_BG = "#2b2b2b"
+_ROW_SEL = "#3a4556"
+_ENTRY_BG = "#1e1e1e"
+_ENTRY_FG = "#e8e8e8"
+_TTK_READY = False
+
+
+@contextmanager
+def hide_while_rebuild(widget) -> Iterator[None]:
+    """重建列表时可暂藏子控件。绝不 grid_remove 主窗口或滚动框。"""
+    try:
+        toplevel = widget.winfo_toplevel()
+        info = dict(widget.grid_info())
+    except tk.TclError:
+        yield
+        return
+    if (
+        not info
+        or widget is toplevel
+        or widget.__class__.__name__ == "CTkScrollableFrame"
+    ):
+        yield
+        return
+    try:
+        widget.grid_remove()
+        yield
+    finally:
+        opts = {k: v for k, v in info.items() if k != "in"}
+        try:
+            widget.grid(**opts)
+        except tk.TclError:
+            try:
+                widget.grid()
+            except tk.TclError:
+                pass
+
+
+def _ensure_ttk_style(root) -> None:
+    global _TTK_READY
+    if _TTK_READY:
+        return
+    style = ttk.Style(root)
+    try:
+        style.theme_use("clam")
+    except tk.TclError:
+        pass
+    style.configure(
+        "Craft.TCombobox",
+        fieldbackground=_ENTRY_BG,
+        background=_ROW_BG,
+        foreground=_ENTRY_FG,
+        arrowcolor=_ENTRY_FG,
+    )
+    _TTK_READY = True
+
+
+def _tk_entry(parent, width: int, value: str = "") -> tk.Entry:
+    entry = tk.Entry(
+        parent,
+        width=width,
+        bg=_ENTRY_BG,
+        fg=_ENTRY_FG,
+        insertbackground=_ENTRY_FG,
+        relief="flat",
+        highlightthickness=1,
+        highlightbackground="#3a3a3a",
+    )
+    if value:
+        entry.insert(0, value)
+    return entry
 
 TEMPLATE_SLOT_DEFS: list[tuple[str, str, bool]] = [
     ("craft_button", "执行工艺按钮", True),
@@ -391,72 +463,85 @@ class RuleSetEditor(ctk.CTkFrame):
         self._selected_rule = idx
         for i, row in enumerate(self._rule_rows):
             try:
-                row["frame"].configure(
-                    fg_color=("gray30" if i == idx else "transparent")
-                )
+                row["frame"].configure(bg=_ROW_SEL if i == idx else _ROW_BG)
             except Exception:
                 pass
 
     def _rebuild_rules(self) -> None:
-        for child in self.list_host.winfo_children():
-            child.destroy()
-        self._rule_rows.clear()
-        g = self._current_group()
-        if not g.rules:
-            empty = ctk.CTkLabel(
-                self.list_host,
-                text="本组还没有词缀条件\n点击下方「+ 添加词缀条件」",
-                text_color="gray",
-                justify="center",
-            )
-            empty.pack(expand=True, pady=24)
-            return
-        for idx, rule in enumerate(g.rules):
-            frame = ctk.CTkFrame(self.list_host, fg_color="transparent")
-            frame.pack(fill="x", pady=2)
-            frame.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
-
-            en_var = tk.BooleanVar(value=rule.enabled)
-            ctk.CTkCheckBox(
-                frame, text="", variable=en_var, width=40, command=self._emit
-            ).pack(side="left", padx=2)
-
-            pattern = ctk.CTkEntry(frame, width=150)
-            pattern.insert(0, rule.pattern)
-            pattern.pack(side="left", padx=2)
-            pattern.bind("<FocusOut>", lambda _e: self._emit())
-            pattern.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
-
+        _ensure_ttk_style(self)
+        with hide_while_rebuild(self.list_host):
+            for child in self.list_host.winfo_children():
+                child.destroy()
+            self._rule_rows.clear()
+            g = self._current_group()
+            if not g.rules:
+                tk.Label(
+                    self.list_host,
+                    text="本组还没有词缀条件\n点击下方「+ 添加词缀条件」",
+                    fg="#8a8a8a",
+                    bg=_ROW_BG,
+                    justify="center",
+                ).pack(expand=True, pady=24)
+                return
             op_values = ["(无)"] + [o for o in OPS if o]
-            op_menu = ctk.CTkOptionMenu(
-                frame, values=op_values, width=70, command=lambda _v: self._emit()
-            )
-            cur_op = rule.operator if rule.operator in OPS and rule.operator else "(无)"
-            op_menu.set(cur_op)
-            op_menu.pack(side="left", padx=2)
+            for idx, rule in enumerate(g.rules):
+                frame = tk.Frame(self.list_host, bg=_ROW_BG)
+                frame.pack(fill="x", pady=2)
+                frame.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
 
-            thr = ctk.CTkEntry(frame, width=90)
-            formatted = format_threshold_text(rule.threshold, rule.threshold2)
-            if formatted:
-                thr.insert(0, formatted)
-            thr.pack(side="left", padx=2)
-            thr.bind("<FocusOut>", lambda _e: self._emit())
+                en_var = tk.BooleanVar(value=rule.enabled)
+                tk.Checkbutton(
+                    frame,
+                    text="",
+                    variable=en_var,
+                    command=self._emit,
+                    bg=_ROW_BG,
+                    activebackground=_ROW_BG,
+                    selectcolor=_ENTRY_BG,
+                    fg=_ENTRY_FG,
+                    activeforeground=_ENTRY_FG,
+                    highlightthickness=0,
+                    bd=0,
+                ).pack(side="left", padx=2)
 
-            note = ctk.CTkEntry(frame, width=120)
-            note.insert(0, rule.note)
-            note.pack(side="left", padx=2, fill="x", expand=True)
-            note.bind("<FocusOut>", lambda _e: self._emit())
+                pattern = _tk_entry(frame, 22, rule.pattern)
+                pattern.pack(side="left", padx=2)
+                pattern.bind("<FocusOut>", lambda _e: self._emit())
+                pattern.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
 
-            self._rule_rows.append(
-                {
-                    "frame": frame,
-                    "enabled": en_var,
-                    "pattern": pattern,
-                    "op": op_menu,
-                    "threshold": thr,
-                    "note": note,
-                }
-            )
+                op_menu = ttk.Combobox(
+                    frame,
+                    values=op_values,
+                    width=5,
+                    state="readonly",
+                    style="Craft.TCombobox",
+                )
+                cur_op = (
+                    rule.operator if rule.operator in OPS and rule.operator else "(无)"
+                )
+                op_menu.set(cur_op)
+                op_menu.pack(side="left", padx=2)
+                op_menu.bind("<<ComboboxSelected>>", lambda _e: self._emit())
+
+                formatted = format_threshold_text(rule.threshold, rule.threshold2)
+                thr = _tk_entry(frame, 12, formatted)
+                thr.pack(side="left", padx=2)
+                thr.bind("<FocusOut>", lambda _e: self._emit())
+
+                note = _tk_entry(frame, 16, rule.note)
+                note.pack(side="left", padx=2, fill="x", expand=True)
+                note.bind("<FocusOut>", lambda _e: self._emit())
+
+                self._rule_rows.append(
+                    {
+                        "frame": frame,
+                        "enabled": en_var,
+                        "pattern": pattern,
+                        "op": op_menu,
+                        "threshold": thr,
+                        "note": note,
+                    }
+                )
 
 
 # 兼容旧名称
@@ -475,6 +560,7 @@ class TemplatePastePanel(ctk.CTkFrame):
         templates_dir: str | Path,
         on_log: Optional[Callable[[str], None]] = None,
         on_saved: Optional[Callable[[str, Path], None]] = None,
+        autoload_slots: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(master, **kwargs)
@@ -486,16 +572,23 @@ class TemplatePastePanel(ctk.CTkFrame):
         self._slot_images: dict[str, ctk.CTkImage] = {}
         self._selected_key = "craft_button"
         self._slot_cards: dict[str, ctk.CTkFrame] = {}
+        self._slots_ready = False
 
         self.grid_columnconfigure(0, weight=2)
         self.grid_columnconfigure(1, weight=3)
         self.grid_rowconfigure(1, weight=1)
 
         self._build()
-        self.refresh_slots()
+        if autoload_slots:
+            self.ensure_slots()
 
     def set_templates_dir(self, templates_dir: str | Path) -> None:
         self.templates_dir = resolve_path(templates_dir)
+        self.refresh_slots()
+
+    def ensure_slots(self) -> None:
+        if self._slots_ready:
+            return
         self.refresh_slots()
 
     def bind_paste_shortcuts(self, widget) -> None:
@@ -706,6 +799,11 @@ class TemplatePastePanel(ctk.CTkFrame):
         messagebox.showinfo("保存成功", f"已写入\n{path}")
 
     def refresh_slots(self) -> None:
+        self._slots_ready = True
+        with hide_while_rebuild(self.slots_host):
+            self._fill_slots()
+
+    def _fill_slots(self) -> None:
         for child in self.slots_host.winfo_children():
             child.destroy()
         self._slot_images.clear()

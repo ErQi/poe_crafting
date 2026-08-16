@@ -1,13 +1,19 @@
 from __future__ import annotations
 
+import gc
 import threading
 import time
 import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from statistics import median
-from typing import Callable, Optional
+from typing import Callable, Iterator, Optional
 
-from .clipboard_util import clear_clipboard, wait_clipboard_change
+from .clipboard_util import (
+    clear_clipboard,
+    normalize_clipboard_text,
+    wait_clipboard_change,
+)
 from .currencies import currency_label, currency_stack_count
 from .input_control import (
     click_screen,
@@ -16,10 +22,12 @@ from .input_control import (
     focus_window,
     hotkey,
     move_screen,
+    peek_window,
     sleep_ms,
 )
-from .item_parser import ItemParseError, parse_item_text
+from .item_parser import ItemParseError, is_equipment_clipboard_text, parse_item_text
 from .matcher import match_ruleset
+from .timing import wait_until
 from .models import (
     AppSettings,
     CraftMode,
@@ -47,7 +55,26 @@ StatusFn = Callable[[RunStatus], None]
 # 通货候选使用彩色 RMSE 搜索，但最终必须经 Ctrl+C 中文名称核对才能点击。
 WORKFLOW_CURRENCY_MAX_RMSE = 80.0
 WORKFLOW_CURRENCY_VERIFY_ATTEMPTS = 6
-WORKFLOW_CURRENCY_SELECT_DELAY_MS = 120
+# 超时只防死等；热路径节奏由成功条件决定，不按本机估 delay。
+COPY_TIMEOUT_MS = 280
+COPY_SLICE_MS = 40
+COPY_POLL_MS = 2
+CURSOR_MS = 4
+APPLY_CONFIRM_TRIES = 2
+WINDOW_MOVE_PX = 12
+TOOLTIP_CLEAR_MS = 80
+
+
+@contextmanager
+def _pause_gc() -> Iterator[None]:
+    gc.collect()
+    was_enabled = gc.isenabled()
+    gc.disable()
+    try:
+        yield
+    finally:
+        if was_enabled:
+            gc.enable()
 
 
 class CurrencyUnavailableError(RuntimeError):
@@ -179,6 +206,7 @@ class CraftAutomation:
         self._lock = threading.Lock()
         self._verified_currency_templates: set[str] = set()
         self._currency_stack_counts: dict[str, int] = {}
+        self._copy_saw_equipment = False
 
     @property
     def status(self) -> RunStatus:
@@ -196,7 +224,7 @@ class CraftAutomation:
         ts = time.strftime("%H:%M:%S")
         self._on_log(f"[{ts}] {msg}")
 
-    def _update(self, **kwargs) -> None:
+    def _update(self, notify: bool = True, **kwargs) -> None:
         with self._lock:
             for k, v in kwargs.items():
                 setattr(self._status, k, v)
@@ -211,8 +239,58 @@ class CraftAutomation:
                 message=self._status.message,
                 workflow_step_name=self._status.workflow_step_name,
                 workflow_step_index=self._status.workflow_step_index,
+                workflow_name=self._status.workflow_name,
             )
-        self._on_status(snap)
+        if notify:
+            self._on_status(snap)
+
+    def _sync_game_window(self, win):
+        """只查已有句柄是否还在、客户区是否移动。不枚举桌面、不抢焦点。"""
+        win2 = peek_window(win.hwnd, getattr(win, "title", "") or "")
+        if win2 is None:
+            return None, False, "游戏窗口丢失"
+        moved = (
+            abs(win2.left - win.left) > WINDOW_MOVE_PX
+            or abs(win2.top - win.top) > WINDOW_MOVE_PX
+            or abs(win2.width - win.width) > WINDOW_MOVE_PX
+            or abs(win2.height - win.height) > WINDOW_MOVE_PX
+        )
+        if moved:
+            return win2, True, ""
+        return win, False, ""
+
+    def _relocate_workflow(
+        self,
+        vision,
+        win,
+        s: AppSettings,
+        currency_names: list[str],
+    ) -> str:
+        """窗口移动后重定位装备与通货。成功返回空串。"""
+        vision.clear_position_cache()
+        self._verified_currency_templates.clear()
+        self._currency_stack_counts.clear()
+        if not self._locate_workflow_required(vision, win, s, ["item_slot"]):
+            return "窗口移动后目标装备重定位失败"
+        if currency_names and not self._locate_and_verify_workflow_currencies(
+            vision, win, s, currency_names
+        ):
+            return "窗口移动后无法确认所需通货名称与数量"
+        return ""
+
+    def _relocate_required_if_moved(self, vision, win, s: AppSettings, config: AutomationConfig):
+        """连续读失败时才查窗口；没移动立刻返回原窗口。"""
+        win2, moved, lost = self._sync_game_window(win)
+        if win2 is None:
+            return None, lost or "游戏窗口丢失"
+        if not moved:
+            return win, ""
+        self._log("连续读取失败且窗口已移动，重新匹配模板")
+        vision.clear_position_cache()
+        if not self._locate_required(vision, win2, s, config):
+            return None, "窗口移动后模板重定位失败"
+        focus_window(win2.hwnd, retries=1, settle_ms=20)
+        return win2, ""
 
     def start(self, config: AutomationConfig) -> None:
         if self.is_running():
@@ -282,6 +360,7 @@ class CraftAutomation:
 
         # 使用启动时快照，避免运行中修改 GUI 影响当前状态机。
         workflow = CraftWorkflow.from_dict(config.workflow.to_dict())
+        self._update(workflow_name=workflow.name)
         errors = validate_workflow(workflow)
         if errors:
             self._finish(
@@ -351,7 +430,8 @@ class CraftAutomation:
                 self._log(
                     f"启动读取失败 ({read_try}/{s.max_parse_failures})：{e}"
                 )
-                vision.clear_position_cache("item_slot")
+                if isinstance(e, VisionError):
+                    vision.clear_position_cache("item_slot")
                 if self._should_stop():
                     break
                 sleep_ms(max(40, s.action_delay_ms), self._should_stop)
@@ -471,10 +551,39 @@ class CraftAutomation:
         current_item = initial_item
         last_raw = f"{initial_item.rarity}|" + "|".join(initial_item.affix_texts())
         last_action_step_id = ""
+        currency_names = required[1:]
+
+        with _pause_gc():
+            self._run_workflow_loop(
+                vision,
+                win,
+                s,
+                workflow,
+                current,
+                current_item,
+                last_raw,
+                last_action_step_id,
+                unchanged,
+                parse_failures,
+                currency_names,
+            )
+
+    def _run_workflow_loop(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        workflow: CraftWorkflow,
+        current: CraftStep,
+        current_item: Item,
+        last_raw: str,
+        last_action_step_id: str,
+        unchanged: int,
+        parse_failures: int,
+        currency_names: list[str],
+    ) -> None:
         reason = StopReason.MAX_ATTEMPTS
         message = f"已达最大动作数 {s.max_attempts}"
-        rematch_every = 25
-
         for attempt in range(1, s.max_attempts + 1):
             if self._should_stop():
                 reason = StopReason.USER_STOP
@@ -488,58 +597,12 @@ class CraftAutomation:
                 break
             step_index = workflow.steps.index(step) + 1
             self._update(
+                notify=False,
                 attempt=attempt,
                 workflow_step_name=step.name,
                 workflow_step_index=step_index,
                 message=f"步骤 {step_index}: {step.name}",
             )
-
-            if attempt == 1 or attempt % rematch_every == 0:
-                win2 = find_game_window(s.window_title_keywords)
-                if win2 is None:
-                    reason = StopReason.WINDOW_NOT_FOUND
-                    message = "游戏窗口丢失"
-                    break
-                moved = (
-                    win2.left != win.left
-                    or win2.top != win.top
-                    or win2.width != win.width
-                    or win2.height != win.height
-                )
-                win = win2
-                if moved:
-                    self._log("检测到窗口位置/尺寸变化，重新定位流程模板")
-                    vision.clear_position_cache()
-                    self._verified_currency_templates.clear()
-                    self._currency_stack_counts.clear()
-                    item_ready = self._locate_workflow_required(
-                        vision,
-                        win,
-                        s,
-                        ["item_slot"],
-                    )
-                    currencies_ready = (
-                        item_ready
-                        and self._locate_and_verify_workflow_currencies(
-                            vision,
-                            win,
-                            s,
-                            required[1:],
-                        )
-                    )
-                    if not currencies_ready:
-                        reason = (
-                            StopReason.CURRENCY_UNAVAILABLE
-                            if item_ready
-                            else StopReason.TEMPLATE_NOT_FOUND
-                        )
-                        message = (
-                            "窗口移动后无法确认所需通货名称与数量"
-                            if item_ready
-                            else "窗口移动后目标装备重定位失败"
-                        )
-                        break
-                focus_window(win.hwnd, retries=2, settle_ms=40)
 
             t0 = time.perf_counter()
             item: Optional[Item] = None
@@ -547,70 +610,30 @@ class CraftAutomation:
             if not action_performed:
                 item = current_item
                 self._log(
-                    f"#{attempt} 步骤 {step_index}/{len(workflow.steps)} "
-                    f"{step.name}：当前有 {item.craft_affix_count} 条显式词缀，"
-                    "跳过增幅石（仅恰好 1 条时使用）"
+                    f"显式词缀={current_item.craft_affix_count}，跳过增幅"
                 )
             else:
-                self._log(
-                    f"#{attempt} 执行步骤 {step_index}/{len(workflow.steps)} "
-                    f"{step.name} [使用{currency_label(step.currency_template)}]"
+                item, win, stop_reason, stop_message = self._apply_until_new_item(
+                    vision,
+                    win,
+                    step,
+                    s,
+                    current_item,
+                    currency_names,
                 )
-                try:
-                    applied = self._apply_currency_step(vision, win, step, s)
-                except CurrencyUnavailableError as error:
-                    reason = StopReason.CURRENCY_UNAVAILABLE
-                    message = str(error)
-                    self._log(message)
+                if stop_reason is not None:
+                    reason = stop_reason
+                    message = stop_message
+                    if stop_message and stop_reason != StopReason.USER_STOP:
+                        self._log(stop_message)
                     break
-                if not applied:
-                    if self._should_stop():
-                        reason = StopReason.USER_STOP
-                        message = "用户停止"
-                    else:
-                        reason = StopReason.TEMPLATE_NOT_FOUND
-                        message = (
-                            f"无法定位或使用{currency_label(step.currency_template)}"
-                        )
-                    break
-
-                if sleep_ms(s.craft_wait_ms, self._should_stop):
-                    reason = StopReason.USER_STOP
-                    message = "用户停止"
-                    break
-
-                # 动作已经发生，读取失败时只重读，绝不再次施放通货。
-                for read_try in range(1, s.max_parse_failures + 1):
-                    try:
-                        item = self._read_item_fast(vision, win, s)
-                        parse_failures = 0
-                        break
-                    except (ItemParseError, VisionError) as e:
-                        parse_failures = read_try
-                        self._update(parse_failures=parse_failures)
-                        self._log(
-                            f"动作后读取失败 ({read_try}/{s.max_parse_failures})，"
-                            f"仅重读装备: {e}"
-                        )
-                        vision.clear_position_cache("item_slot")
-                        if self._should_stop():
-                            break
-                        sleep_ms(max(40, s.action_delay_ms), self._should_stop)
-                    except Exception as e:
-                        parse_failures = read_try
-                        self._update(parse_failures=parse_failures)
-                        self._log(
-                            f"动作后读取异常 ({read_try}/{s.max_parse_failures})，"
-                            f"仅重读装备: {e}"
-                        )
-                        if self._should_stop():
-                            break
+                parse_failures = 0
 
             if item is None:
                 if self._should_stop():
                     reason = StopReason.USER_STOP
                     message = "用户停止"
-                else:
+                elif reason == StopReason.MAX_ATTEMPTS:
                     reason = StopReason.PARSE_FAILURES
                     message = "通货动作后连续读取装备失败；为避免重复施放已停止"
                 break
@@ -631,9 +654,6 @@ class CraftAutomation:
                 if raw_key and raw_key == last_raw and step.id == last_action_step_id:
                     unchanged += 1
                     self._update(unchanged_streak=unchanged)
-                    # 通货堆可能耗尽或位置变化；下一轮强制重新搜索该通货。
-                    vision.clear_position_cache(step.currency_template)
-                    self._verified_currency_templates.discard(step.currency_template)
                     if unchanged >= s.max_unchanged:
                         reason = StopReason.UNCHANGED
                         message = (
@@ -691,9 +711,9 @@ class CraftAutomation:
 
     def _run_with_vision(self, config: AutomationConfig, vision: VisionService) -> None:
         s = config.settings
-        gc = "OR" if config.ruleset.group_combine == "any" else "AND"
+        logic = "OR" if config.ruleset.group_combine == "any" else "AND"
         self._log(
-            f"开始自动化 | 模式={config.craft_mode} | 组间={gc} | 组数={len(config.ruleset.groups)} | 最大次数={s.max_attempts}"
+            f"开始自动化 | 模式={config.craft_mode} | 组间={logic} | 组数={len(config.ruleset.groups)} | 最大次数={s.max_attempts}"
         )
         self._log("视觉加速: 位置缓存 + 单尺度匹配 + 降采样搜索")
 
@@ -732,59 +752,42 @@ class CraftAutomation:
         if not self._locate_required(vision, win, s, config):
             return
 
+        stop_hit = self._check_lifeforce(vision, win, s)
+        if stop_hit is not None:
+            message = f"检测到生命力不足 (score={stop_hit.score:.3f})"
+            self._log(message)
+            self._finish(StopReason.LIFEFORCE_INSUFFICIENT, message, 0, 0, 0)
+            return
+
         parse_failures = 0
         unchanged = 0
         last_raw = ""
+        with _pause_gc():
+            reason, message, parse_failures, unchanged = self._run_generic_loop(
+                config, vision, win, s, parse_failures, unchanged, last_raw
+            )
+        self._finish(reason, message, self._status.attempt, parse_failures, unchanged)
+
+    def _run_generic_loop(
+        self,
+        config: AutomationConfig,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        parse_failures: int,
+        unchanged: int,
+        last_raw: str,
+    ):
         reason = StopReason.MAX_ATTEMPTS
         message = "达到最大尝试次数"
-        rematch_every = 25  # 定期重标定，防窗口拖动
-        lifeforce_every = 10
-
         for attempt in range(1, s.max_attempts + 1):
             if self._should_stop():
                 reason = StopReason.USER_STOP
                 message = "用户停止"
                 break
 
-            self._update(attempt=attempt, message=f"第 {attempt} 次工艺")
-            # 日志降频：每轮只打一行关键信息
+            self._update(notify=False, attempt=attempt, message=f"第 {attempt} 次工艺")
             t0 = time.perf_counter()
-
-            # 窗口位置：每 N 次或失败时刷新；避免每轮 EnumWindows + 抢焦点
-            if attempt == 1 or attempt % rematch_every == 0:
-                win2 = find_game_window(s.window_title_keywords)
-                if win2 is None:
-                    reason = StopReason.WINDOW_NOT_FOUND
-                    message = "游戏窗口丢失"
-                    self._log(message)
-                    break
-                # 窗口移动则清缓存
-                if (
-                    win2.left != win.left
-                    or win2.top != win.top
-                    or win2.width != win.width
-                    or win2.height != win.height
-                ):
-                    self._log("检测到窗口位置/尺寸变化，重新匹配模板")
-                    vision.clear_position_cache()
-                    win = win2
-                    if not self._locate_required(vision, win, s, config):
-                        reason = StopReason.TEMPLATE_NOT_FOUND
-                        message = "窗口移动后模板重定位失败"
-                        break
-                else:
-                    win = win2
-                focus_window(win.hwnd, retries=2, settle_ms=40)
-
-            # 生命力不足：降频检测
-            if attempt == 1 or attempt % lifeforce_every == 0:
-                stop_hit = self._check_lifeforce(vision, win, s)
-                if stop_hit is not None:
-                    reason = StopReason.LIFEFORCE_INSUFFICIENT
-                    message = f"检测到生命力不足 (score={stop_hit.score:.3f})"
-                    self._log(message)
-                    self._finish(reason, message, attempt, parse_failures, unchanged)
-                    return
 
             # 预设：仅首次/重定位后点选；通用模式跳过
             if config.craft_mode == CraftMode.PRESET.value:
@@ -839,9 +842,20 @@ class CraftAutomation:
             except ItemParseError as e:
                 parse_failures += 1
                 self._log(f"解析失败 ({parse_failures}/{s.max_parse_failures}): {e}")
-                # 失败时重定位 item_slot
-                vision.clear_position_cache("item_slot")
                 self._update(parse_failures=parse_failures)
+                if parse_failures >= 2:
+                    win2, relocate_error = self._relocate_required_if_moved(
+                        vision, win, s, config
+                    )
+                    if relocate_error:
+                        reason = (
+                            StopReason.WINDOW_NOT_FOUND
+                            if win2 is None
+                            else StopReason.TEMPLATE_NOT_FOUND
+                        )
+                        message = relocate_error
+                        break
+                    win = win2
                 if parse_failures >= s.max_parse_failures:
                     reason = StopReason.PARSE_FAILURES
                     message = "连续解析失败次数过多"
@@ -852,6 +866,19 @@ class CraftAutomation:
                 self._log(f"读取物品视觉失败: {e}")
                 vision.clear_position_cache("item_slot")
                 self._update(parse_failures=parse_failures)
+                if parse_failures >= 2:
+                    win2, relocate_error = self._relocate_required_if_moved(
+                        vision, win, s, config
+                    )
+                    if relocate_error:
+                        reason = (
+                            StopReason.WINDOW_NOT_FOUND
+                            if win2 is None
+                            else StopReason.TEMPLATE_NOT_FOUND
+                        )
+                        message = relocate_error
+                        break
+                    win = win2
                 if parse_failures >= s.max_parse_failures:
                     reason = StopReason.PARSE_FAILURES
                     message = str(e)
@@ -906,7 +933,7 @@ class CraftAutomation:
             reason = StopReason.MAX_ATTEMPTS
             message = f"已达最大尝试次数 {s.max_attempts}"
 
-        self._finish(reason, message, self._status.attempt, parse_failures, unchanged)
+        return reason, message, parse_failures, unchanged
 
     def _locate_required(
         self,
@@ -1018,7 +1045,7 @@ class CraftAutomation:
 
         neutral_x, neutral_y = win.center
         move_screen(neutral_x, neutral_y, settle_ms=20)
-        if sleep_ms(max(250, s.action_delay_ms), self._should_stop):
+        if sleep_ms(TOOLTIP_CLEAR_MS, self._should_stop):
             return None
         return vision.grab_window(win)
 
@@ -1181,6 +1208,153 @@ class CraftAutomation:
                     return None
         return None
 
+    def _refund_currency(self, template_name: str) -> None:
+        remaining = self._currency_stack_counts.get(template_name)
+        if remaining is not None:
+            self._currency_stack_counts[template_name] = remaining + 1
+
+    def _confirm_currency_spent(self, vision: VisionService, template_name: str) -> None:
+        if self._currency_stack_counts.get(template_name, 1) > 0:
+            return
+        vision.clear_position_cache(template_name)
+        self._verified_currency_templates.discard(template_name)
+        self._log(
+            f"已使用当前堆叠最后 1 个{currency_label(template_name)}；"
+            "后续再次需要时将自动检查并停止"
+        )
+
+    def _put_item_back(self, vision: VisionService) -> None:
+        hit = vision.get_cached_position("item_slot")
+        if hit is None:
+            return
+        click_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS, button="left")
+
+    def _is_wrong_item(self, before: Item, after: Item) -> bool:
+        return bool(
+            before.base_type and after.base_type and before.base_type != after.base_type
+        )
+
+    def _apply_until_new_item(
+        self,
+        vision: VisionService,
+        win,
+        step: CraftStep,
+        s: AppSettings,
+        before: Item,
+        currency_names: list[str],
+    ) -> tuple[Optional[Item], object, Optional[StopReason], str]:
+        """右键通货→左键装备，直到读到新装备。未确认则重试动作，不用旧文本判定。"""
+        stale_text = before.raw_text
+        template_name = step.currency_template
+        for apply_try in range(1, APPLY_CONFIRM_TRIES + 1):
+            try:
+                clicked = self._apply_currency_step(vision, win, step, s)
+            except CurrencyUnavailableError as error:
+                return None, win, StopReason.CURRENCY_UNAVAILABLE, str(error)
+            if self._should_stop():
+                return None, win, StopReason.USER_STOP, "用户停止"
+            if not clicked:
+                if apply_try < APPLY_CONFIRM_TRIES:
+                    self._log("左键前未读到装备，重新选择通货")
+                    continue
+                return (
+                    None,
+                    win,
+                    StopReason.TEMPLATE_NOT_FOUND,
+                    f"无法定位或使用{currency_label(template_name)}",
+                )
+            if sleep_ms(s.craft_wait_ms, self._should_stop):
+                return None, win, StopReason.USER_STOP, "用户停止"
+
+            on_item = True
+            read_item: Optional[Item] = None
+            unconfirmed = False
+            for read_try in range(1, s.max_parse_failures + 1):
+                try:
+                    read_item = self._read_item_fast(
+                        vision,
+                        win,
+                        s,
+                        already_on_item=on_item,
+                        stale_text=stale_text,
+                    )
+                    if self._is_wrong_item(before, read_item):
+                        self._log("读到的不是原装备，疑似拾取，放回后重试")
+                        self._put_item_back(vision)
+                        unconfirmed = True
+                        read_item = None
+                    break
+                except ItemParseError as error:
+                    parse_failures = read_try
+                    self._update(notify=False, parse_failures=parse_failures)
+                    if "未读到通货动作后的新物品文本" in str(error):
+                        if not self._copy_saw_equipment:
+                            self._put_item_back(vision)
+                        unconfirmed = True
+                        break
+                    self._log(
+                        f"动作后读取失败 ({read_try}/{s.max_parse_failures})，"
+                        f"仅重读装备: {error}"
+                    )
+                    on_item = False
+                    if read_try >= 2:
+                        win2, moved, lost = self._sync_game_window(win)
+                        if win2 is None:
+                            return None, win, StopReason.WINDOW_NOT_FOUND, lost or "游戏窗口丢失"
+                        if moved:
+                            self._log("连续读取失败且窗口已移动，重新定位")
+                            win = win2
+                            relocate_error = self._relocate_workflow(
+                                vision, win, s, currency_names
+                            )
+                            if relocate_error:
+                                return None, win, StopReason.TEMPLATE_NOT_FOUND, relocate_error
+                    if self._should_stop():
+                        return None, win, StopReason.USER_STOP, "用户停止"
+                except VisionError as error:
+                    parse_failures = read_try
+                    self._update(notify=False, parse_failures=parse_failures)
+                    self._log(
+                        f"动作后读取失败 ({read_try}/{s.max_parse_failures})，"
+                        f"仅重读装备: {error}"
+                    )
+                    vision.clear_position_cache("item_slot")
+                    on_item = False
+                    if self._should_stop():
+                        return None, win, StopReason.USER_STOP, "用户停止"
+                except Exception as error:
+                    parse_failures = read_try
+                    self._update(notify=False, parse_failures=parse_failures)
+                    self._log(
+                        f"动作后读取异常 ({read_try}/{s.max_parse_failures})，"
+                        f"仅重读装备: {error}"
+                    )
+                    on_item = False
+                    if self._should_stop():
+                        return None, win, StopReason.USER_STOP, "用户停止"
+
+            if read_item is not None:
+                self._confirm_currency_spent(vision, template_name)
+                return read_item, win, None, ""
+            if unconfirmed and apply_try < APPLY_CONFIRM_TRIES:
+                self._refund_currency(template_name)
+                self._log("未读到新装备，重新选择通货再点")
+                continue
+            if self._should_stop():
+                return None, win, StopReason.USER_STOP, "用户停止"
+            return (
+                None,
+                win,
+                StopReason.PARSE_FAILURES,
+                "通货动作后未能读到新装备文本，未用旧文本判定",
+            )
+        return (
+            None,
+            win,
+            StopReason.PARSE_FAILURES,
+            "通货动作后未能读到新装备文本，未用旧文本判定",
+        )
+
     def _copy_hovered_text(
         self,
         hit: MatchHit,
@@ -1188,24 +1362,8 @@ class CraftAutomation:
     ) -> Optional[str]:
         """只悬停并 Ctrl+C，用于点击前核对通货名称。"""
 
-        move_screen(hit.screen_x, hit.screen_y, settle_ms=20)
-        if sleep_ms(max(120, s.action_delay_ms), self._should_stop):
-            return None
-        for copy_try in range(2):
-            clear_clipboard()
-            time.sleep(0.01)
-            hotkey("ctrl", "c")
-            copied = wait_clipboard_change(
-                previous="",
-                timeout_ms=max(300, min(s.clipboard_timeout_ms, 800)),
-                poll_ms=max(10, min(30, s.clipboard_poll_ms)),
-                reject_empty=True,
-            )
-            if copied is not None:
-                return copied
-            if copy_try == 0 and sleep_ms(100, self._should_stop):
-                return None
-        return None
+        move_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS)
+        return self._copy_item_text(s, timeout_ms=COPY_TIMEOUT_MS)
 
     def _apply_currency_step(
         self,
@@ -1315,37 +1473,24 @@ class CraftAutomation:
         if remaining <= 5 or remaining % 100 == 0:
             self._log(f"{expected_name}使用前剩余={remaining}")
 
-        # 只有确认通货与目标装备是两个不同区域后才会发送鼠标动作。
+        # 上一轮读装备后光标还在格子上：先离开再右键，避免点偏或点到装备。
         click_screen(
             currency_hit.screen_x,
             currency_hit.screen_y,
-            settle_ms=15,
+            settle_ms=CURSOR_MS,
             button="right",
         )
-
-        if sleep_ms(
-            max(WORKFLOW_CURRENCY_SELECT_DELAY_MS, s.action_delay_ms),
-            self._should_stop,
-        ):
+        # 尽快移到装备；能再次读到装备文本才左键（鼠标/tooltip 就绪）。
+        move_screen(item_hit.screen_x, item_hit.screen_y, settle_ms=CURSOR_MS)
+        if not self._copy_item_text(s, timeout_ms=COPY_TIMEOUT_MS, require_item=True):
             return False
-
         click_screen(
             item_hit.screen_x,
             item_hit.screen_y,
-            settle_ms=15,
+            settle_ms=0,
             button="left",
         )
-        remaining_after = remaining - 1
-        self._currency_stack_counts[template_name] = remaining_after
-        if remaining_after <= 0:
-            # 最后一个已经用于本轮装备；先让流程读取和判定结果。
-            # 若之后再次需要这种通货，会重新搜索其他堆叠，找不到即停止。
-            vision.clear_position_cache(template_name)
-            self._verified_currency_templates.discard(template_name)
-            self._log(
-                f"已使用当前堆叠最后 1 个{expected_name}；"
-                "后续再次需要时将自动检查并停止"
-            )
+        self._currency_stack_counts[template_name] = remaining - 1
         return True
 
     def _check_lifeforce(
@@ -1413,49 +1558,90 @@ class CraftAutomation:
             vision, win, template_name, s, force_rematch=True
         )
 
-    def _read_item_fast(self, vision: VisionService, win, s: AppSettings) -> Item:
+    def _copy_item_text(
+        self,
+        _s: AppSettings,
+        timeout_ms: int,
+        stale_text: str = "",
+        require_item: bool = False,
+    ) -> Optional[str]:
+        """轮询直到剪贴板出现有效文本；通货动作后必须是新装备。"""
+        stale = normalize_clipboard_text(stale_text)
+        reject_texts = (stale,) if stale else ()
+        clear_clipboard()
+        previous = ""
+        found: list[str] = []
+        self._copy_saw_equipment = False
+        deadline = time.monotonic() + max(1, timeout_ms) / 1000.0
+
+        def pred() -> bool:
+            nonlocal previous
+            remain_ms = int((deadline - time.monotonic()) * 1000)
+            if remain_ms <= 0:
+                return False
+            hotkey("ctrl", "c")
+            text = wait_clipboard_change(
+                previous=previous,
+                timeout_ms=min(COPY_SLICE_MS, remain_ms),
+                poll_ms=COPY_POLL_MS,
+                reject_empty=True,
+                reject_texts=reject_texts,
+            )
+            if not text:
+                return False
+            if is_equipment_clipboard_text(text):
+                self._copy_saw_equipment = True
+            elif require_item:
+                previous = normalize_clipboard_text(text)
+                return False
+            found.append(text)
+            return True
+
+        if wait_until(
+            pred,
+            timeout_ms,
+            poll_ms=COPY_POLL_MS,
+            should_stop=self._should_stop,
+        ):
+            return found[0] if found else None
+        return None
+
+    def _read_item_fast(
+        self,
+        vision: VisionService,
+        win,
+        s: AppSettings,
+        already_on_item: bool = False,
+        stale_text: str = "",
+    ) -> Item:
         hit = vision.get_cached_position("item_slot")
         if hit is None:
+            already_on_item = False
             hit = vision.find_in_window(
                 win, "item_slot", threshold=s.template_threshold
             )
         if hit is None:
             raise VisionError("未找到 item_slot.png（工艺槽物品区域）")
 
-        move_screen(hit.screen_x, hit.screen_y, settle_ms=20)
-        # 悬停稍等：过短游戏可能还没生成 tooltip
-        hover_ms = max(40, min(120, s.action_delay_ms))
-        if sleep_ms(hover_ms, self._should_stop):
-            raise ItemParseError("读取被中止")
+        if not already_on_item:
+            move_screen(hit.screen_x, hit.screen_y, settle_ms=CURSOR_MS)
 
-        clear_clipboard()
-        time.sleep(0.01)
-        hotkey("ctrl", "c")
-        # 剪贴板超时默认偏长；快速模式用更短上限
-        timeout = min(s.clipboard_timeout_ms, 800)
-        text = wait_clipboard_change(
-            previous="",
-            timeout_ms=timeout,
-            poll_ms=max(10, min(30, s.clipboard_poll_ms)),
-            reject_empty=True,
+        text = self._copy_item_text(
+            s,
+            timeout_ms=COPY_TIMEOUT_MS,
+            stale_text=stale_text,
+            require_item=True,
         )
         if text is None:
-            # 一次快速重试
-            move_screen(hit.screen_x, hit.screen_y, settle_ms=20)
-            time.sleep(0.05)
-            clear_clipboard()
-            hotkey("ctrl", "c")
-            text = wait_clipboard_change(
-                previous="",
-                timeout_ms=timeout,
-                poll_ms=max(10, min(30, s.clipboard_poll_ms)),
-                reject_empty=True,
-            )
-        if text is None:
             raise ItemParseError(
-                "等待剪贴板超时，请确认鼠标悬停在物品上且复制键为 Ctrl+C"
+                "未读到通货动作后的新物品文本"
+                if stale_text
+                else "等待剪贴板超时，请确认鼠标悬停在物品上且复制键为 Ctrl+C"
             )
-        return parse_item_text(text)
+        item = parse_item_text(text)
+        if stale_text and item.rarity in {"魔法", "稀有"} and not item.affixes:
+            raise ItemParseError("物品词缀尚未刷新")
+        return item
 
     def _read_item(self, vision: VisionService, win, s: AppSettings) -> Item:
         return self._read_item_fast(vision, win, s)

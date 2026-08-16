@@ -15,7 +15,7 @@ from ..workflow import (
     TRANSITION_REPEAT,
     TRANSITION_STOP,
 )
-from .widgets import RuleSetEditor
+from .widgets import RuleSetEditor, hide_while_rebuild
 
 RARITY_LABEL_TO_VALUE = {
     "不校验": "",
@@ -42,7 +42,7 @@ class WorkflowEditor(ctk.CTkFrame):
         self._workflow = CraftWorkflow()
         self._selected_index = 0
         self._loading = False
-        self._step_buttons: list[ctk.CTkButton] = []
+        self._step_buttons: list[tk.Button] = []
         self._transition_label_to_value: dict[str, str] = {}
         self._transition_value_to_label: dict[str, str] = {}
         self._start_label_to_id: dict[str, str] = {}
@@ -68,6 +68,16 @@ class WorkflowEditor(ctk.CTkFrame):
         )
         self.workflow_name_entry.bind("<FocusOut>", self._on_header_changed)
         self.workflow_name_entry.bind("<Return>", self._on_header_changed)
+
+        ctk.CTkLabel(top, text="说明").grid(
+            row=1, column=0, sticky="w", padx=(10, 6), pady=(0, 8)
+        )
+        self.workflow_desc_entry = ctk.CTkEntry(top)
+        self.workflow_desc_entry.grid(
+            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8)
+        )
+        self.workflow_desc_entry.bind("<FocusOut>", self._on_header_changed)
+        self.workflow_desc_entry.bind("<Return>", self._on_header_changed)
 
         ctk.CTkLabel(top, text="起始步骤").grid(
             row=0, column=2, sticky="w", padx=(0, 6), pady=8
@@ -239,6 +249,8 @@ class WorkflowEditor(ctk.CTkFrame):
             self._selected_index = 0
             self.workflow_name_entry.delete(0, "end")
             self.workflow_name_entry.insert(0, self._workflow.name)
+            self.workflow_desc_entry.delete(0, "end")
+            self.workflow_desc_entry.insert(0, self._workflow.description)
             self._refresh_all()
         finally:
             self._loading = False
@@ -262,6 +274,7 @@ class WorkflowEditor(ctk.CTkFrame):
         if self._loading:
             return
         self._workflow.name = self.workflow_name_entry.get().strip() or "多步骤通货流程"
+        self._workflow.description = self.workflow_desc_entry.get().strip()
         selected = self._start_label_to_id.get(self.start_step_menu.get())
         if selected:
             self._workflow.start_step_id = selected
@@ -312,29 +325,58 @@ class WorkflowEditor(ctk.CTkFrame):
         self._load_current_to_ui()
 
     def _refresh_step_list(self) -> None:
-        for child in self.step_list.winfo_children():
-            child.destroy()
-        self._step_buttons.clear()
-        if not self._workflow.steps:
-            ctk.CTkLabel(
-                self.step_list,
-                text="还没有步骤\n点击下方 + 添加",
-                text_color="gray",
-                justify="center",
-            ).grid(row=0, column=0, sticky="ew", pady=30)
-            return
-        for index, step in enumerate(self._workflow.steps):
-            prefix = "" if step.enabled else "[停用] "
-            button = ctk.CTkButton(
-                self.step_list,
-                text=f"{index + 1}. {prefix}{step.name}",
-                anchor="w",
-                fg_color="#1f6aa5" if index == self._selected_index else "#343638",
-                hover_color="#285f85" if index == self._selected_index else "#4a4d50",
-                command=lambda i=index: self._select_step(i),
-            )
-            button.grid(row=index, column=0, sticky="ew", pady=3)
-            self._step_buttons.append(button)
+        steps = self._workflow.steps
+        with hide_while_rebuild(self.step_list):
+            if not steps:
+                for button in self._step_buttons:
+                    button.destroy()
+                self._step_buttons.clear()
+                for child in self.step_list.winfo_children():
+                    child.destroy()
+                tk.Label(
+                    self.step_list,
+                    text="还没有步骤\n点击下方 + 添加",
+                    fg="#8a8a8a",
+                    bg="#2b2b2b",
+                    justify="center",
+                ).grid(row=0, column=0, sticky="ew", pady=30)
+                return
+            if not self._step_buttons:
+                for child in self.step_list.winfo_children():
+                    child.destroy()
+            while len(self._step_buttons) > len(steps):
+                self._step_buttons.pop().destroy()
+            for index, step in enumerate(steps):
+                prefix = "" if step.enabled else "[停用] "
+                text = f"{index + 1}. {prefix}{step.name}"
+                selected = index == self._selected_index
+                fg = "#1f6aa5" if selected else "#343638"
+                hover = "#285f85" if selected else "#4a4d50"
+                if index < len(self._step_buttons):
+                    self._step_buttons[index].configure(
+                        text=text,
+                        bg=fg,
+                        activebackground=hover,
+                        command=lambda i=index: self._select_step(i),
+                    )
+                    continue
+                button = tk.Button(
+                    self.step_list,
+                    text=text,
+                    anchor="w",
+                    bg=fg,
+                    fg="#f0f0f0",
+                    activebackground=hover,
+                    activeforeground="#f0f0f0",
+                    relief="flat",
+                    bd=0,
+                    padx=8,
+                    pady=4,
+                    font=("Microsoft YaHei UI", 9),
+                    command=lambda i=index: self._select_step(i),
+                )
+                button.grid(row=index, column=0, sticky="ew", pady=3)
+                self._step_buttons.append(button)
 
     def _refresh_start_menu(self) -> None:
         self._start_label_to_id.clear()
@@ -411,7 +453,13 @@ class WorkflowEditor(ctk.CTkFrame):
     def _refresh_after_step_field_changed(self) -> None:
         if self._loading:
             return
+        meta = tuple(
+            (step.id, step.name, step.enabled) for step in self._workflow.steps
+        )
         self._refresh_step_list()
+        if meta == getattr(self, "_step_meta", None):
+            return
+        self._step_meta = meta
         self._refresh_start_menu()
         step = self._current_step()
         if step is not None:

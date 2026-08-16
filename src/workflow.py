@@ -13,6 +13,7 @@ from .models import (
     MatchRule,
     RuleGroup,
     RuleSet,
+    WorkflowLibrary,
 )
 
 TRANSITION_NEXT = "next"
@@ -172,89 +173,343 @@ def validate_workflow(workflow: CraftWorkflow) -> list[str]:
     return errors
 
 
-def default_workflow() -> CraftWorkflow:
-    """用户当前需求的前两条 T1 词缀流程，可在 GUI 中继续扩展。"""
+# 腰带 T1 按下限判断，不要求满 roll。
+T1_LIFE = 130  # 丰饶的 130-144
+T1_ELE_ATTACK = 43  # 毁灭的 43-50
+T1_FIRE_DAMAGE = 26  # 督军的 26-30
+T1_ELE_RES = 46  # 火/冰/闪 T1 46-48，抗性可互转
+T1_GENERIC_ELE = 19  # 头盔「元素伤害提高」19-22
 
-    # T1 的 roll 区间分别为 19-22 与 130-144；按档位下限判断，
-    # 不能只接受满 roll 的 22 / 144。
-    def elemental_rule() -> MatchRule:
-        return MatchRule(pattern="元素伤害提高", operator=">=", threshold=19)
 
-    def life_rule() -> MatchRule:
-        return MatchRule(pattern="最大生命", operator=">=", threshold=130)
+def _rule(pattern: str, threshold: float, note: str = "") -> MatchRule:
+    return MatchRule(
+        pattern=pattern,
+        operator=">=",
+        threshold=threshold,
+        note=note,
+    )
 
-    def either_target(name: str) -> RuleSet:
-        return RuleSet(
-            group_combine=MatchMode.ALL.value,
-            groups=[
-                RuleGroup(
-                    name=name,
-                    combine=MatchMode.ANY.value,
-                    rules=[elemental_rule(), life_rule()],
-                )
-            ],
-        )
 
-    def both_targets(name: str) -> RuleSet:
-        return RuleSet(
-            group_combine=MatchMode.ALL.value,
-            groups=[
-                RuleGroup(
-                    name=name,
-                    combine=MatchMode.ALL.value,
-                    rules=[elemental_rule(), life_rule()],
-                )
-            ],
-        )
+def _ruleset(name: str, combine: str, rules: list[MatchRule]) -> RuleSet:
+    return RuleSet(
+        group_combine=MatchMode.ALL.value,
+        groups=[RuleGroup(name=name, combine=combine, rules=list(rules))],
+    )
 
+
+def _either(name: str, *rules: MatchRule) -> RuleSet:
+    return _ruleset(name, MatchMode.ANY.value, list(rules))
+
+
+def _both(name: str, *rules: MatchRule) -> RuleSet:
+    return _ruleset(name, MatchMode.ALL.value, list(rules))
+
+
+def _as_group(target: MatchRule | RuleGroup, name: str) -> RuleGroup:
+    if isinstance(target, RuleGroup):
+        return RuleGroup.from_dict(target.to_dict())
+    return RuleGroup(name=name, combine=MatchMode.ALL.value, rules=[target])
+
+
+def _pair_ruleset(combine: str, first: RuleGroup, second: RuleGroup) -> RuleSet:
+    return RuleSet(group_combine=combine, groups=[first, second])
+
+
+def life_rule(threshold: float = T1_LIFE) -> MatchRule:
+    return _rule("最大生命", threshold, f"T1 ≥ {threshold:g}")
+
+
+def ele_attack_rule(threshold: float = T1_ELE_ATTACK) -> MatchRule:
+    return _rule("攻击技能的元素伤害提高", threshold, f"T1 ≥ {threshold:g}")
+
+
+def fire_damage_rule(threshold: float = T1_FIRE_DAMAGE) -> MatchRule:
+    return _rule("火焰伤害提高", threshold, f"T1 ≥ {threshold:g}")
+
+
+def fire_res_rule(threshold: float = T1_ELE_RES) -> MatchRule:
+    return _rule("火焰抗性", threshold, f"T1 ≥ {threshold:g}")
+
+
+def cold_res_rule(threshold: float = T1_ELE_RES) -> MatchRule:
+    return _rule("冰霜抗性", threshold, f"T1 ≥ {threshold:g}")
+
+
+def lightning_res_rule(threshold: float = T1_ELE_RES) -> MatchRule:
+    return _rule("闪电抗性", threshold, f"T1 ≥ {threshold:g}")
+
+
+def any_t1_res_group(threshold: float = T1_ELE_RES) -> RuleGroup:
+    return RuleGroup(
+        name="T1 元素抗性（可转换）",
+        combine=MatchMode.ANY.value,
+        rules=[
+            fire_res_rule(threshold),
+            cold_res_rule(threshold),
+            lightning_res_rule(threshold),
+        ],
+    )
+
+
+def generic_ele_rule(threshold: float = T1_GENERIC_ELE) -> MatchRule:
+    return _rule("元素伤害提高", threshold, f"T1 ≥ {threshold:g}")
+
+
+def magic_two_mod_workflow(
+    workflow_id: str,
+    name: str,
+    description: str,
+    group: str,
+    first: MatchRule | RuleGroup,
+    second: MatchRule | RuleGroup,
+) -> CraftWorkflow:
+    """改造/增幅洗出两条目标的蓝装。"""
+
+    prefix = workflow_id
+    transmute_id = f"{prefix}__transmute"
+    alteration_id = f"{prefix}__alteration"
+    augment_id = f"{prefix}__augment"
+    either = _pair_ruleset(
+        MatchMode.ANY.value,
+        _as_group(first, "目标 A"),
+        _as_group(second, "目标 B"),
+    )
+    both = _pair_ruleset(
+        MatchMode.ALL.value,
+        _as_group(first, "目标 A"),
+        _as_group(second, "目标 B"),
+    )
     transmute = CraftStep(
-        id="transmute",
-        name="蜕变并检查 T1 元素或生命",
+        id=transmute_id,
+        name="蜕变并检查任一目标",
         currency_template="currency_transmutation",
         expected_rarity="魔法",
-        ruleset=either_target("先保留任一 T1 目标"),
-        on_success=f"{TRANSITION_GOTO_PREFIX}augment_missing_target",
+        ruleset=either,
+        on_success=f"{TRANSITION_GOTO_PREFIX}{augment_id}",
         on_failure=TRANSITION_NEXT,
     )
     alteration = CraftStep(
-        id="alteration_t1_elemental",
-        name="改造洗出 T1 元素或生命",
+        id=alteration_id,
+        name="改造洗出任一目标",
         currency_template="currency_alteration",
         expected_rarity="魔法",
-        ruleset=either_target("先保留任一 T1 目标"),
+        ruleset=either,
         on_success=TRANSITION_NEXT,
         on_failure=TRANSITION_REPEAT,
     )
     augmentation = CraftStep(
-        id="augment_missing_target",
+        id=augment_id,
+        name="单词缀时增幅补另一目标",
+        currency_template="currency_augmentation",
+        expected_rarity="魔法",
+        ruleset=both,
+        on_success=TRANSITION_FINISH,
+        on_failure=f"{TRANSITION_GOTO_PREFIX}{alteration_id}",
+    )
+    return CraftWorkflow(
+        id=workflow_id,
+        name=name,
+        description=description,
+        group=group,
+        steps=[transmute, alteration, augmentation],
+        start_step_id=transmute_id,
+    )
+
+
+def magic_one_mod_workflow(
+    workflow_id: str,
+    name: str,
+    description: str,
+    group: str,
+    target: MatchRule,
+) -> CraftWorkflow:
+    """改造洗出单条目标前缀的蓝装。"""
+
+    prefix = workflow_id
+    transmute_id = f"{prefix}__transmute"
+    alteration_id = f"{prefix}__alteration"
+    hit = _both("命中目标前缀", target)
+    transmute = CraftStep(
+        id=transmute_id,
+        name="蜕变并检查目标前缀",
+        currency_template="currency_transmutation",
+        expected_rarity="魔法",
+        ruleset=hit,
+        on_success=TRANSITION_FINISH,
+        on_failure=TRANSITION_NEXT,
+    )
+    alteration = CraftStep(
+        id=alteration_id,
+        name="改造洗出目标前缀",
+        currency_template="currency_alteration",
+        expected_rarity="魔法",
+        ruleset=hit,
+        on_success=TRANSITION_FINISH,
+        on_failure=TRANSITION_REPEAT,
+    )
+    return CraftWorkflow(
+        id=workflow_id,
+        name=name,
+        description=description,
+        group=group,
+        steps=[transmute, alteration],
+        start_step_id=transmute_id,
+    )
+
+
+def rare_two_prefix_workflow(
+    workflow_id: str,
+    name: str,
+    description: str,
+    group: str,
+    first: MatchRule,
+    second: MatchRule,
+    step_ids: dict[str, str] | None = None,
+) -> CraftWorkflow:
+    """蜕变/改造/增幅/富豪做两条前缀的稀有底，失败重铸重来。"""
+
+    ids = {
+        "transmute": f"{workflow_id}__transmute",
+        "alteration": f"{workflow_id}__alteration",
+        "augment": f"{workflow_id}__augment",
+        "regal": f"{workflow_id}__regal",
+        "scour": f"{workflow_id}__scour",
+    }
+    if step_ids:
+        ids.update(step_ids)
+    either = _either("先保留任一 T1 目标", first, second)
+    both = _both("同时具备两个 T1 目标", first, second)
+    transmute = CraftStep(
+        id=ids["transmute"],
+        name="蜕变并检查任一目标",
+        currency_template="currency_transmutation",
+        expected_rarity="魔法",
+        ruleset=either,
+        on_success=f"{TRANSITION_GOTO_PREFIX}{ids['augment']}",
+        on_failure=TRANSITION_NEXT,
+    )
+    alteration = CraftStep(
+        id=ids["alteration"],
+        name="改造洗出任一目标",
+        currency_template="currency_alteration",
+        expected_rarity="魔法",
+        ruleset=either,
+        on_success=TRANSITION_NEXT,
+        on_failure=TRANSITION_REPEAT,
+    )
+    augmentation = CraftStep(
+        id=ids["augment"],
         name="单词缀时增幅尝试补齐另一目标",
         currency_template="currency_augmentation",
         expected_rarity="魔法",
-        ruleset=both_targets("增幅后检查元素与生命"),
-        # 无论增幅是否命中，都再用富豪：命中时升稀有并保留目标，
-        # 未命中时让富豪再提供一次补齐机会。
+        ruleset=both,
         on_success=TRANSITION_NEXT,
         on_failure=TRANSITION_NEXT,
     )
     regal = CraftStep(
-        id="regal_t1_life",
-        name="富豪尝试补齐 T1 元素与生命",
+        id=ids["regal"],
+        name="富豪尝试补齐两条目标",
         currency_template="currency_regal",
         expected_rarity="稀有",
-        ruleset=both_targets("同时具备 T1 元素与 T1 生命"),
+        ruleset=both,
         on_success=TRANSITION_FINISH,
         on_failure=TRANSITION_NEXT,
     )
     scour = CraftStep(
-        id="scour_restart",
+        id=ids["scour"],
         name="富豪失败后重铸并重来",
         currency_template="currency_scouring",
         expected_rarity="普通",
-        on_success=f"{TRANSITION_GOTO_PREFIX}{transmute.id}",
+        on_success=f"{TRANSITION_GOTO_PREFIX}{ids['transmute']}",
         on_failure=TRANSITION_REPEAT,
     )
     return CraftWorkflow(
-        name="威武皮盔：T1 元素伤害 + T1 生命底子",
+        id=workflow_id,
+        name=name,
+        description=description,
+        group=group,
         steps=[transmute, alteration, augmentation, regal, scour],
-        start_step_id=transmute.id,
+        start_step_id=ids["transmute"],
     )
+
+
+def default_workflow() -> CraftWorkflow:
+    """头盔示例：T1 元素伤害 + T1 生命。测试依赖这些步骤 ID。"""
+
+    return rare_two_prefix_workflow(
+        "helmet-ele-life",
+        "头盔·元素+生命",
+        "原示例。蜕变/改造/增幅/富豪做 T1 元素伤害 + T1 生命稀有底。",
+        "其他",
+        generic_ele_rule(),
+        life_rule(),
+        step_ids={
+            "transmute": "transmute",
+            "alteration": "alteration_t1_elemental",
+            "augment": "augment_missing_target",
+            "regal": "regal_t1_life",
+            "scour": "scour_restart",
+        },
+    )
+
+
+def belt_recombinator_workflows() -> list[CraftWorkflow]:
+    group = "腰带重组"
+    return [
+        magic_two_mod_workflow(
+            "belt-life-fireres",
+            "蓝装·生命+抗性",
+            "重组 A 料。86+ 腰带洗出 T1 生命 + 任意 T1 元素抗性（火/冰/闪可互转）。",
+            group,
+            life_rule(),
+            any_t1_res_group(),
+        ),
+        magic_two_mod_workflow(
+            "belt-ele-lightres",
+            "蓝装·攻击元素+抗性",
+            "重组 B 料。86+ 腰带洗出 T1 攻击元素伤害 + 任意 T1 元素抗性（火/冰/闪可互转）。",
+            group,
+            ele_attack_rule(),
+            any_t1_res_group(),
+        ),
+        magic_one_mod_workflow(
+            "belt-life-prefix",
+            "补前缀·生命",
+            "缺生命时用。洗出带 T1 生命的蓝装，两边点神力后再重组，约 1/3 出 2前2后。",
+            group,
+            life_rule(),
+        ),
+        magic_one_mod_workflow(
+            "belt-ele-prefix",
+            "补前缀·攻击元素",
+            "缺攻击元素时用。洗出带 T1 攻击元素伤害的蓝装，两边点神力后再重组。",
+            group,
+            ele_attack_rule(),
+        ),
+        rare_two_prefix_workflow(
+            "belt-warlord-life",
+            "督军·火伤+生命",
+            "2前2后之后。督军影响 86+ 腰带洗出 T1 火伤% + T1 生命，再重组第三前缀，约 1/2。",
+            group,
+            fire_damage_rule(),
+            life_rule(),
+        ),
+        rare_two_prefix_workflow(
+            "belt-warlord-ele",
+            "督军·火伤+攻击元素",
+            "2前2后之后。督军影响 86+ 腰带洗出 T1 火伤% + T1 攻击元素，再重组第三前缀。",
+            group,
+            fire_damage_rule(),
+            ele_attack_rule(),
+        ),
+    ]
+
+
+def default_library() -> WorkflowLibrary:
+    workflows = belt_recombinator_workflows()
+    helmet = default_workflow()
+    helmet.name = "头盔·元素+生命"
+    helmet.description = "原示例。蜕变/改造/增幅/富豪做 T1 元素伤害 + T1 生命稀有底。"
+    helmet.group = "其他"
+    workflows.append(helmet)
+    return WorkflowLibrary(active_id=workflows[0].id, workflows=workflows)

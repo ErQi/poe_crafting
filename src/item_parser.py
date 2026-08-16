@@ -109,6 +109,51 @@ def _is_explicit_modifier_descriptor(line: str) -> bool:
     )
 
 
+def _tagged_mod_kind(line: str) -> str | None:
+    if any(marker in line for marker in IMPLICIT_MARKERS):
+        return "implicit"
+    if any(marker in line for marker in ENCHANT_MARKERS + RUNE_MARKERS):
+        return "enchant"
+    return None
+
+
+def is_equipment_clipboard_text(text: str) -> bool:
+    """排除空文本、网页、通货 tooltip，避免拿去匹配。"""
+    raw = (text or "").strip()
+    if not raw or "未找到物品" in raw or raw.startswith("http"):
+        return False
+    for line in raw.splitlines():
+        normalized = _normalize_metadata_line(line)
+        if normalized.startswith("物品类别:") and "通货" in normalized.split(":", 1)[1]:
+            return False
+        if normalized.startswith("稀有度:") and normalized.split(":", 1)[1].strip() in {
+            "通货",
+            "Currency",
+        }:
+            return False
+    return True
+
+
+def _count_explicit_mods(rarity: str, affix_by_section: list[list[str]]) -> int:
+    """没开高级说明时，按分隔段区分固有/附魔与显式。"""
+    if not affix_by_section:
+        return 0
+    if len(affix_by_section) >= 2:
+        explicit_idx = len(affix_by_section) - 1
+    elif rarity.strip() == "普通":
+        explicit_idx = -1
+    else:
+        explicit_idx = 0
+    count = 0
+    for idx, lines in enumerate(affix_by_section):
+        for line in lines:
+            if _tagged_mod_kind(line) in {"implicit", "enchant"}:
+                continue
+            if idx == explicit_idx:
+                count += 1
+    return count
+
+
 def extract_numbers(text: str) -> list[float]:
     """从词缀行提取数值。优先去掉括号内范围 roll，如 (18-22)。"""
     cleaned = RANGE_IN_PARENS_RE.sub(" ", text)
@@ -194,10 +239,8 @@ def parse_item_text(text: str) -> Item:
     raw = (text or "").strip()
     if not raw:
         raise ItemParseError("剪贴板为空")
-
-    # 常见非物品内容
-    if "未找到物品" in raw or raw.startswith("http"):
-        raise ItemParseError("剪贴板内容不是物品文本")
+    if not is_equipment_clipboard_text(raw):
+        raise ItemParseError("剪贴板内容不是装备文本")
 
     sections = _split_sections(raw)
     if not sections:
@@ -251,7 +294,7 @@ def parse_item_text(text: str) -> Item:
 
     # 词缀段落：跳过明显的需求/属性头段，收集看起来像词缀的行
     # PoE 物品结构大致：header | 属性/防御 | 需求 | 插槽 | 固有 | 显式 | 风味
-    affix_candidates: list[str] = []
+    affix_by_section: list[list[str]] = []
     for idx, sec in enumerate(sections):
         if idx == 0:
             continue
@@ -264,6 +307,7 @@ def parse_item_text(text: str) -> Item:
             continue
         if normalized_first.startswith("物品等级:"):
             continue
+        sec_affixes: list[str] = []
         # 风味文本段通常很长且无数字、或不含典型词缀模式——仍尝试收集短行
         for ln in sec:
             s = ln.strip()
@@ -276,7 +320,10 @@ def parse_item_text(text: str) -> Item:
                 if s in {"已腐化", "Corrupted"}:
                     item.corrupted = True
                 continue
-            affix_candidates.append(s)
+            sec_affixes.append(s)
+        if sec_affixes:
+            affix_by_section.append(sec_affixes)
+    affix_candidates = [line for sec_affixes in affix_by_section for line in sec_affixes]
 
     # 去重保持顺序
     seen: set[str] = set()
@@ -288,13 +335,13 @@ def parse_item_text(text: str) -> Item:
         values = extract_numbers(clean)
         item.affixes.append(Affix(text=clean, values=values))
 
-    if item.explicit_mod_count is None:
-        item.explicit_mod_count = len(item.affixes)
-
     # 国服普通装备的 Ctrl+C 文本可能不带“稀有度”行。
     # 只在已确认存在物品等级时将空值视为普通，避免把任意剪贴板文字当成装备。
     if not item.rarity and item.item_level is not None:
         item.rarity = "普通"
+
+    if item.explicit_mod_count is None:
+        item.explicit_mod_count = _count_explicit_mods(item.rarity, affix_by_section)
 
     # 至少要有稀有度或名称才算解析成功
     if not item.rarity and not item.name:

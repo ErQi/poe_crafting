@@ -3,7 +3,9 @@ from __future__ import annotations
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from tkinter import messagebox
@@ -12,13 +14,13 @@ import customtkinter as ctk  # type: ignore[import-untyped]
 
 from ..automation import AutomationConfig, CraftAutomation
 from ..config_store import (
+    load_library,
     load_ruleset,
     load_settings,
-    load_workflow,
     resolve_path,
+    save_library,
     save_ruleset,
     save_settings,
-    save_workflow,
 )
 from ..currencies import CURRENCY_BY_TEMPLATE, currency_label
 from ..hotkeys import HotkeyService
@@ -30,18 +32,22 @@ from ..models import (
     CRAFT_PRESETS,
     AppSettings,
     CraftMode,
+    CraftStep,
     CraftWorkflow,
     Item,
     MatchMode,
+    RuleGroup,
     RuleSet,
     RunStatus,
     StopReason,
+    WorkflowLibrary,
 )
 from ..vision import VisionError, VisionService
 from ..workflow import validate_workflow
 from . import widgets
 from .overlay import FloatingMatchOverlay, format_completion_overlay_lines
 from .workflow_editor import WorkflowEditor
+from .workflow_switcher import WorkflowSwitcher
 
 STOP_REASON_TEXT = {
     StopReason.SUCCESS: "成功：已命中目标",
@@ -62,19 +68,24 @@ STOP_REASON_TEXT = {
 class CraftApp(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
+        # Windows + CTk：withdraw / alpha=0 后再显示经常整窗消失，构建期间保持可见。
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.title("PoE1 自动工艺")
-        self.geometry("1180x780")
-        self.minsize(1020, 680)
+        self.geometry("1180x860")
+        self.minsize(1020, 720)
 
         self.settings: AppSettings = load_settings()
         self.ruleset: RuleSet = load_ruleset(resolve_path(self.settings.rules_file))
-        self.workflow: CraftWorkflow = load_workflow(
+        self.library: WorkflowLibrary = load_library(
             resolve_path(self.settings.workflow_file)
         )
+        self.workflow: CraftWorkflow = self.library.active()
         self.current_item: Item | None = None
+        self._switching_workflow = False
+        self._ui_running: bool | None = None
+        self._last_item_ui_ts = 0.0
 
         self.automation = CraftAutomation(
             on_log=self._queue_log,
@@ -88,14 +99,15 @@ class CraftApp(ctk.CTk):
 
         self._build_ui()
         self._load_settings_to_ui()
-        self._refresh_rules_table()
+        self.rules_frame.set_ruleset(self.ruleset)
         self._set_running_ui(False)
 
         self._restart_hotkeys()
         self.after(100, self._poll_queue)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        self._log("就绪。单工艺在「工艺」页配置；通货状态机在「多步骤」页配置。")
+        self._log("就绪。单工艺在「工艺」页配置；通货状态机在「多步骤」页配置，可切换多套流程。")
+        self._log(f"当前流程: {self.workflow.name}")
         self._log(f"模板目录: {resolve_path(self.settings.templates_dir)}")
         self._log(
             f"开始热键: {self.settings.hotkey_start.upper()}  停止热键: {self.settings.hotkey_stop.upper()}"
@@ -106,7 +118,7 @@ class CraftApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        self.tabs = ctk.CTkTabview(self)
+        self.tabs = ctk.CTkTabview(self, command=self._on_main_tab)
         self.tabs.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
         tab_craft = self.tabs.add("工艺")
         tab_workflow = self.tabs.add("多步骤")
@@ -208,21 +220,31 @@ class CraftApp(ctk.CTk):
         self.preset_menu.set(CRAFT_PRESET_LABELS.get("reforge", "重铸 (Reforge)"))
 
         r = 2
+        ctk.CTkLabel(form, text="当前流程").grid(row=r, column=0, sticky="w", pady=4)
+        self.workflow_menu = ctk.CTkOptionMenu(
+            form,
+            values=[self.workflow.name or "未命名流程"],
+            command=self._on_craft_page_workflow_change,
+            dynamic_resizing=False,
+        )
+        self.workflow_menu.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
+
+        r = 3
         ctk.CTkLabel(form, text="最大次数").grid(row=r, column=0, sticky="w", pady=4)
         self.max_attempts_entry = ctk.CTkEntry(form)
         self.max_attempts_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
 
-        r = 3
+        r = 4
         ctk.CTkLabel(form, text="动作延迟 ms").grid(row=r, column=0, sticky="w", pady=4)
         self.action_delay_entry = ctk.CTkEntry(form)
         self.action_delay_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
 
-        r = 4
+        r = 5
         ctk.CTkLabel(form, text="工艺等待 ms").grid(row=r, column=0, sticky="w", pady=4)
         self.craft_wait_entry = ctk.CTkEntry(form)
         self.craft_wait_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
 
-        r = 5
+        r = 6
         ctk.CTkLabel(form, text="模板阈值").grid(row=r, column=0, sticky="w", pady=4)
         thr_row = ctk.CTkFrame(form, fg_color="transparent")
         thr_row.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
@@ -239,12 +261,12 @@ class CraftApp(ctk.CTk):
         self.threshold_slider.pack(side="left", fill="x", expand=True)
         self.threshold_label.pack(side="left", padx=6)
 
-        r = 6
+        r = 7
         ctk.CTkLabel(form, text="开始热键").grid(row=r, column=0, sticky="w", pady=4)
         self.hotkey_start_entry = ctk.CTkEntry(form)
         self.hotkey_start_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
 
-        r = 7
+        r = 8
         ctk.CTkLabel(form, text="停止热键").grid(row=r, column=0, sticky="w", pady=4)
         self.hotkey_entry = ctk.CTkEntry(form)
         self.hotkey_entry.grid(row=r, column=1, sticky="ew", pady=4, padx=8)
@@ -294,7 +316,7 @@ class CraftApp(ctk.CTk):
         workflow_wrap = ctk.CTkFrame(tab_workflow, fg_color="transparent")
         workflow_wrap.grid(row=0, column=0, sticky="nsew")
         workflow_wrap.grid_columnconfigure(0, weight=1)
-        workflow_wrap.grid_rowconfigure(1, weight=1)
+        workflow_wrap.grid_rowconfigure(2, weight=1)
         workflow_head = ctk.CTkFrame(workflow_wrap, fg_color="transparent")
         workflow_head.grid(row=0, column=0, sticky="ew", padx=4, pady=(0, 6))
         ctk.CTkLabel(
@@ -335,11 +357,19 @@ class CraftApp(ctk.CTk):
             command=self._on_save_workflow,
         )
         self.btn_save_workflow.pack(side="left")
+        self.workflow_switcher = WorkflowSwitcher(
+            workflow_wrap,
+            on_select=self._on_select_workflow,
+            on_new=self._on_new_workflow,
+            on_duplicate=self._on_duplicate_workflow,
+            on_delete=self._on_delete_workflow,
+        )
+        self.workflow_switcher.grid(row=1, column=0, sticky="ew", padx=4, pady=(0, 6))
         self.workflow_editor = WorkflowEditor(
             workflow_wrap,
             on_change=self._on_workflow_changed,
         )
-        self.workflow_editor.grid(row=1, column=0, sticky="nsew")
+        self.workflow_editor.grid(row=2, column=0, sticky="nsew")
         self.workflow_editor.set_workflow(self.workflow)
 
         # 模板页
@@ -353,6 +383,7 @@ class CraftApp(ctk.CTk):
             templates_dir=self.settings.templates_dir,
             on_log=self._log,
             on_saved=self._on_template_saved,
+            autoload_slots=False,
         )
         self.template_panel.grid(row=0, column=0, sticky="nsew")
         self.template_panel.bind_paste_shortcuts(self)
@@ -402,6 +433,7 @@ class CraftApp(ctk.CTk):
             self.preset_menu.set(label)
         self._on_craft_mode_change(self.craft_mode_menu.get())
         self._refresh_hotkey_labels()
+        self._refresh_workflow_switcher()
 
     def _collect_settings_from_ui(self) -> AppSettings:
         s = self.settings
@@ -438,6 +470,12 @@ class CraftApp(ctk.CTk):
         s.match_mode = self.ruleset.group_combine
         return s
 
+    def _on_main_tab(self) -> None:
+        if not hasattr(self, "template_panel"):
+            return
+        if self.tabs.get() == "模板":
+            self.template_panel.ensure_slots()
+
     def _refresh_rules_table(self) -> None:
         self.rules_frame.set_ruleset(self.ruleset)
 
@@ -445,12 +483,109 @@ class CraftApp(ctk.CTk):
         self.ruleset = ruleset
 
     def _on_workflow_changed(self, workflow: CraftWorkflow) -> None:
+        self.library.put(workflow)
+        self.library.active_id = workflow.id
         self.workflow = workflow
 
+    def _sync_editor_into_library(self) -> None:
+        current = self.workflow_editor.get_workflow()
+        self.library.put(current)
+        self.library.active_id = current.id
+        self.workflow = current
+
+    def _apply_selected_workflow(self, workflow: CraftWorkflow) -> None:
+        self.library.select(workflow.id)
+        self.workflow = workflow
+        self.workflow_editor.set_workflow(workflow)
+        self._refresh_workflow_switcher()
+
+    def _refresh_workflow_switcher(self) -> None:
+        self._switching_workflow = True
+        try:
+            if hasattr(self, "workflow_switcher"):
+                self.workflow_switcher.set_library(self.library)
+            if hasattr(self, "workflow_menu"):
+                names = [item.name for item in self.library.workflows] or ["(无流程)"]
+                self.workflow_menu.configure(values=names)
+                self.workflow_menu.set(self.library.active().name or names[0])
+        finally:
+            self._switching_workflow = False
+
+    def _on_select_workflow(self, workflow_id: str) -> None:
+        if self.automation.is_running() or self._switching_workflow:
+            return
+        self._sync_editor_into_library()
+        target = self.library.select(workflow_id)
+        self._apply_selected_workflow(target)
+        self._log(f"已切换流程: {target.name}")
+
+    def _on_craft_page_workflow_change(self, name: str) -> None:
+        if self._switching_workflow or self.automation.is_running():
+            return
+        target = next(
+            (item for item in self.library.workflows if item.name == name),
+            None,
+        )
+        if target is None or target.id == self.library.active_id:
+            return
+        self._on_select_workflow(target.id)
+
+    def _on_new_workflow(self) -> None:
+        if self.automation.is_running():
+            return
+        self._sync_editor_into_library()
+        step = CraftStep(
+            name="新步骤 1",
+            currency_template="currency_alteration",
+            ruleset=RuleSet(groups=[RuleGroup(name="本步条件")]),
+        )
+        workflow = CraftWorkflow(
+            name=f"新流程 {len(self.library.workflows) + 1}",
+            group="自定义",
+            steps=[step],
+            start_step_id=step.id,
+        )
+        self.library.put(workflow)
+        self._apply_selected_workflow(workflow)
+        self._log(f"已新建流程: {workflow.name}")
+
+    def _on_duplicate_workflow(self) -> None:
+        if self.automation.is_running():
+            return
+        self._sync_editor_into_library()
+        source = self.library.active()
+        cloned = CraftWorkflow.from_dict(source.to_dict())
+        cloned.id = str(uuid.uuid4())
+        cloned.name = f"{source.name} 副本"
+        cloned.group = source.group or "自定义"
+        self.library.put(cloned)
+        self._apply_selected_workflow(cloned)
+        self._log(f"已复制流程: {cloned.name}")
+
+    def _on_delete_workflow(self) -> None:
+        if self.automation.is_running():
+            return
+        current = self.library.active()
+        if len(self.library.workflows) <= 1:
+            messagebox.showwarning("删除流程", "至少保留一套流程", parent=self)
+            return
+        if not messagebox.askyesno(
+            "删除流程", f"确认删除「{current.name}」？", parent=self
+        ):
+            return
+        self.library.remove(current.id)
+        self._apply_selected_workflow(self.library.active())
+        self._log(f"已删除流程: {current.name}")
+
     def _on_craft_mode_change(self, value: str) -> None:
+        workflow_mode = "多步骤" in value
         if hasattr(self, "preset_menu"):
             self.preset_menu.configure(
-                state="disabled" if "多步骤" in value else "normal"
+                state="disabled" if workflow_mode else "normal"
+            )
+        if hasattr(self, "workflow_menu"):
+            self.workflow_menu.configure(
+                state="normal" if workflow_mode else "disabled"
             )
 
     def _on_threshold_slide(self, _value: float | str) -> None:
@@ -463,17 +598,20 @@ class CraftApp(ctk.CTk):
 
     def _queue_status(self, status: RunStatus) -> None:
         with self._queue_lock:
+            self._ui_queue = [item for item in self._ui_queue if item[0] != "status"]
             self._ui_queue.append(("status", status))
 
     def _poll_queue(self) -> None:
         with self._queue_lock:
             items = list(self._ui_queue)
             self._ui_queue.clear()
+        logs: list[str] = []
+        latest_status: RunStatus | None = None
         for kind, payload in items:
             if kind == "log":
-                self._log(str(payload), from_queue=True)
+                logs.append(str(payload))
             elif kind == "status" and isinstance(payload, RunStatus):
-                self._apply_status(payload)
+                latest_status = payload
             elif kind == "item":
                 pair = payload
                 if isinstance(pair, tuple) and len(pair) == 2:
@@ -485,11 +623,26 @@ class CraftApp(ctk.CTk):
             ):
                 results, err, thr = payload
                 self._on_template_test_done(results or [], err, float(thr))
+        if logs:
+            self._log_many(logs)
+        if latest_status is not None:
+            self._apply_status(latest_status)
         self.after(100, self._poll_queue)
 
     def _log(self, msg: str, from_queue: bool = False) -> None:
+        self._log_many([msg])
+
+    def _log_many(self, lines: list[str]) -> None:
+        if not lines:
+            return
         self.log_box.configure(state="normal")
-        self.log_box.insert("end", msg + "\n")
+        self.log_box.insert("end", "\n".join(lines) + "\n")
+        try:
+            end_line = int(float(self.log_box.index("end-1c")))
+        except (tk.TclError, ValueError):
+            end_line = 0
+        if end_line > 160:
+            self.log_box.delete("1.0", "80.0")
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
@@ -501,20 +654,25 @@ class CraftApp(ctk.CTk):
             self.status_label.configure(
                 text=f"状态: 运行中 | 第 {status.attempt} 次 | {status.message}"
             )
-            self._set_running_ui(True)
+            if self._ui_running is not True:
+                self._set_running_ui(True)
         else:
             just_finished = self._was_running
             self._was_running = False
             self.status_label.configure(
                 text=f"状态: 已停止 | {reason} | {status.message}"
             )
-            self._set_running_ui(False)
+            if self._ui_running is not False:
+                self._set_running_ui(False)
             if just_finished and status.stop_reason != StopReason.NOT_STARTED:
                 self._show_completion_toast(status)
             else:
                 self._overlay.push_status(status)
         if status.last_item is not None:
-            self._show_item(status.last_item, status.last_match)
+            now = time.monotonic()
+            if (not status.running) or now - self._last_item_ui_ts >= 1.5:
+                self._last_item_ui_ts = now
+                self._show_item(status.last_item, status.last_match)
 
     def _show_completion_toast(self, status: RunStatus) -> None:
         reason = STOP_REASON_TEXT.get(status.stop_reason, status.stop_reason.value)
@@ -525,6 +683,7 @@ class CraftApp(ctk.CTk):
         )
 
     def _set_running_ui(self, running: bool) -> None:
+        self._ui_running = running
         state = "disabled" if running else "normal"
         self.btn_start.configure(state=state)
         self.btn_start_workflow.configure(state=state)
@@ -533,6 +692,13 @@ class CraftApp(ctk.CTk):
         self.btn_save_workflow.configure(state=state)
         self.btn_stop.configure(state="normal" if running else "disabled")
         self.btn_stop_workflow.configure(state="normal" if running else "disabled")
+        if hasattr(self, "workflow_switcher"):
+            self.workflow_switcher.set_enabled(not running)
+        if hasattr(self, "workflow_menu"):
+            workflow_mode = "多步骤" in self.craft_mode_menu.get()
+            self.workflow_menu.configure(
+                state="disabled" if running or not workflow_mode else "normal"
+            )
 
     def _show_item(self, item: Item, match=None) -> None:
         self.current_item = item
@@ -584,11 +750,14 @@ class CraftApp(ctk.CTk):
         messagebox.showinfo("保存", "规则已写入 config/rules.json（支持多组 AND/OR）")
 
     def _on_save_workflow(self) -> None:
-        self.workflow = self.workflow_editor.get_workflow()
+        self._sync_editor_into_library()
+        self.settings.workflow_file = "config/workflows.json"
         path = resolve_path(self.settings.workflow_file)
-        save_workflow(self.workflow, path)
+        save_library(self.library, path)
+        save_settings(self.settings)
+        self._refresh_workflow_switcher()
         errors = validate_workflow(self.workflow)
-        self._log(f"多步骤流程已保存: {path}")
+        self._log(f"流程库已保存: {path}（当前 {self.workflow.name}）")
         if errors:
             messagebox.showwarning(
                 "流程已保存（暂不可执行）",
@@ -597,7 +766,7 @@ class CraftApp(ctk.CTk):
                 parent=self,
             )
         else:
-            messagebox.showinfo("保存", f"流程已写入\n{path}", parent=self)
+            messagebox.showinfo("保存", f"已保存 {len(self.library.workflows)} 套流程\n{path}", parent=self)
 
     def _on_save_settings(self) -> None:
         self.settings = self._collect_settings_from_ui()
@@ -642,6 +811,7 @@ class CraftApp(ctk.CTk):
 
     def _on_refresh_template_preview(self) -> None:
         self.template_panel.set_templates_dir(self.settings.templates_dir)
+        self.template_panel.ensure_slots()
         self._log("已刷新模板预览")
 
     def _on_test_templates(self) -> None:
@@ -792,7 +962,8 @@ class CraftApp(ctk.CTk):
         workflow_snapshot: CraftWorkflow | None = None
 
         if craft_mode == CraftMode.WORKFLOW.value:
-            workflow_snapshot = self.workflow_editor.get_workflow()
+            self._sync_editor_into_library()
+            workflow_snapshot = self.library.active()
             self.workflow = workflow_snapshot
             errors = validate_workflow(workflow_snapshot)
             if errors:
@@ -822,7 +993,7 @@ class CraftApp(ctk.CTk):
                 "2. 目标装备与流程会用到的通货都在当前画面可见",
                 "3. item_slot.png 截取的是目标装备本身",
                 f"4. 流程使用通货: {currencies}（图标已内置）",
-                f"5. 起始步骤: {start.name}",
+                f"5. 当前流程: {workflow_snapshot.name}  起始步骤: {start.name}",
             ]
         else:
             enabled = [
@@ -855,10 +1026,8 @@ class CraftApp(ctk.CTk):
         save_settings(self.settings)
         save_ruleset(self.ruleset, resolve_path(self.settings.rules_file))
         if workflow_snapshot is not None:
-            save_workflow(
-                workflow_snapshot,
-                resolve_path(self.settings.workflow_file),
-            )
+            self.settings.workflow_file = "config/workflows.json"
+            save_library(self.library, resolve_path(self.settings.workflow_file))
 
         # 在 GUI 主线程抢前台（比后台线程成功率高）
         self._log("正在切换到游戏窗口…")

@@ -1,19 +1,25 @@
 from __future__ import annotations
 
-import time
 import tkinter as tk
-from typing import Optional
+from collections.abc import Callable
 
-import customtkinter as ctk
+import customtkinter as ctk  # type: ignore[import-untyped]
 
 from ..matcher import format_threshold_text
 from ..models import MatchMode, MatchResult, RunStatus, StopReason
 
 
+def _ignore_destroyed_widget(action: Callable[[], object]) -> None:
+    try:
+        action()
+    except (tk.TclError, RuntimeError, OSError):
+        return
+
+
 def _monitor_work_area(anchor_point: tuple[int, int]) -> tuple[int, int, int, int]:
     """返回锚点所在显示器扣除任务栏后的工作区。"""
-    import win32api
-    import win32con
+    import win32api  # type: ignore[import-untyped]
+    import win32con  # type: ignore[import-untyped]
 
     monitor = win32api.MonitorFromPoint(
         anchor_point,
@@ -58,26 +64,12 @@ def format_completion_overlay_lines(status: RunStatus, reason: str) -> list[str]
     if message and message != reason:
         lines.append(message[:80])
     lines.append(f"尝试 {status.attempt} 次")
+    if status.workflow_name:
+        lines.append(status.workflow_name[:24])
     if status.workflow_step_name:
         name = status.workflow_step_name[:20]
         lines.append(f"步骤 {status.workflow_step_index}. {name}")
     return lines
-
-
-def _lerp_color(c1: str, c2: str, t: float) -> str:
-    """#rrggbb 线性插值。"""
-    t = max(0.0, min(1.0, t))
-
-    def parse(c: str) -> tuple[int, int, int]:
-        c = c.lstrip("#")
-        return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
-
-    r1, g1, b1 = parse(c1)
-    r2, g2, b2 = parse(c2)
-    r = int(r1 + (r2 - r1) * t)
-    g = int(g1 + (g2 - g1) * t)
-    b = int(b1 + (b2 - b1) * t)
-    return f"#{r:02x}{g:02x}{b:02x}"
 
 
 class FloatingMatchOverlay:
@@ -86,9 +78,7 @@ class FloatingMatchOverlay:
     WIDTH = 420
     HEIGHT = 276
     MAX_LINES = 8
-    FADE_IN_MS = 220
     HOLD_MS = 2800
-    FADE_OUT_MS = 450
     STEP_MS = 30
     PAD = 18
     COMPLETION_HOLD_MS = 5000
@@ -100,14 +90,17 @@ class FloatingMatchOverlay:
 
     def __init__(self, master: tk.Misc) -> None:
         self.master = master
-        self._win: Optional[ctk.CTkToplevel] = None
-        self._host: Optional[ctk.CTkFrame] = None
+        self._win: ctk.CTkToplevel | None = None
+        self._host: ctk.CTkFrame | None = None
         self._lines: list[dict] = []
+        self._pool: list[dict] = []
         self._last_attempt_shown = -1
         self._visible = False
         self._closing = False
-        self._work_area: Optional[tuple[int, int, int, int]] = None
-        self._auto_hide_id: Optional[str] = None
+        self._placed = False
+        self._work_area: tuple[int, int, int, int] | None = None
+        self._auto_hide_id: str | None = None
+        self._line_font: ctk.CTkFont | None = None
 
     def reset_run(self) -> None:
         self._last_attempt_shown = -1
@@ -122,12 +115,11 @@ class FloatingMatchOverlay:
 
     def _show_window(self) -> None:
         if self._win is not None and self._win.winfo_exists():
-            self._place()
-            try:
-                self._win.deiconify()
-                self._win.attributes("-topmost", True)
-            except Exception:
-                pass
+            win = self._win
+            if not self._placed:
+                self._place()
+            _ignore_destroyed_widget(win.deiconify)
+            _ignore_destroyed_widget(lambda: win.attributes("-topmost", True))
             self._visible = True
             return
         self._create()
@@ -137,24 +129,24 @@ class FloatingMatchOverlay:
         self._cancel_auto_hide()
         self._visible = False
         self._clear_lines()
+        self._placed = False
         if self._win is not None and self._win.winfo_exists():
-            try:
-                self._win.withdraw()
-            except Exception:
-                pass
+            _ignore_destroyed_widget(self._win.withdraw)
 
     def destroy(self) -> None:
         self._closing = True
         self._visible = False
         self._cancel_auto_hide()
         self._clear_lines()
+        for item in self._pool:
+            _ignore_destroyed_widget(item["frame"].destroy)
+        self._pool.clear()
         if self._win is not None:
-            try:
-                self._win.destroy()
-            except Exception:
-                pass
+            _ignore_destroyed_widget(self._win.destroy)
             self._win = None
             self._host = None
+            self._placed = False
+            self._line_font = None
 
     def push_status(self, status: RunStatus) -> None:
         """根据运行状态推送一行（同 attempt 不重复）。"""
@@ -164,7 +156,8 @@ class FloatingMatchOverlay:
                 return
 
             self._ensure_shown()
-            if status.last_match is None:
+            # 读失败时 last_match 仍是上一次结果，不要当成这一次的 0 命中。
+            if status.last_match is None or status.parse_failures:
                 return
             if status.attempt == self._last_attempt_shown:
                 return
@@ -173,7 +166,7 @@ class FloatingMatchOverlay:
             if status.workflow_step_name:
                 name = status.workflow_step_name[:14]
                 line = f"[{status.workflow_step_index}. {name}] {line}"
-            self.add_line(line, success=bool(status.last_match.success))
+            self.add_line(line, success=bool(status.last_match.success), persist=True)
         except (tk.TclError, RuntimeError, OSError):
             return
 
@@ -199,53 +192,35 @@ class FloatingMatchOverlay:
         if self._host is None or self._win is None:
             return
 
-        # 超限先移除最旧
         while len(self._lines) >= self.MAX_LINES:
-            old = self._lines.pop()
-            self._cancel_item(old)
-            try:
-                old["frame"].destroy()
-            except Exception:
-                pass
+            self._recycle_item(self._lines.pop())
 
         fg_target = self.FG_OK if success else self.FG_FAIL
-        frame = ctk.CTkFrame(self._host, fg_color="transparent")
-        frame.pack(fill="x", pady=2, anchor="e", before=self._top_frame())
-        label = ctk.CTkLabel(
-            frame,
-            text=text,
-            anchor="e",
-            justify="right",
-            font=ctk.CTkFont(family="Microsoft YaHei UI", size=13),
-            text_color=self.FG_DIM,
-            wraplength=self.WIDTH - 28,
-        )
-        label.pack(fill="x", padx=4)
-
-        item = {
-            "frame": frame,
-            "label": label,
-            "fg_target": fg_target,
-            "born": time.monotonic(),
-            "phase": "in",  # in | hold | out
-            "after_ids": [],
-            "alive": True,
-        }
+        item = self._acquire_line(text, fg_target)
+        if item is None:
+            return
         self._lines.insert(0, item)
-        self._animate_fade_in(item, hold_ms=None if persist else self.HOLD_MS)
-        self._place()
+        if not persist:
+            self._schedule(item, self.HOLD_MS, lambda: self._recycle_item(item))
 
     def _top_frame(self):
         if not self._lines:
             return None
         return self._lines[0].get("frame")
 
+    def _pack_line_frame(self, frame) -> None:
+        top = self._top_frame()
+        if top is None:
+            frame.pack(fill="x", pady=2, anchor="e")
+        else:
+            frame.pack(fill="x", pady=2, anchor="e", before=top)
+
     def _ensure_work_area(self) -> None:
         if self._work_area is not None:
             return
         try:
             anchor = (int(self.master.winfo_rootx()), int(self.master.winfo_rooty()))
-        except Exception:
+        except (tk.TclError, AttributeError, ValueError, TypeError):
             anchor = (0, 0)
         self._work_area = _monitor_work_area(anchor)
 
@@ -258,19 +233,66 @@ class FloatingMatchOverlay:
 
     def _clear_lines(self) -> None:
         for item in list(self._lines):
-            self._cancel_item(item)
-            try:
-                item["frame"].destroy()
-            except Exception:
-                pass
+            self._recycle_item(item)
         self._lines.clear()
 
-    def _cancel_auto_hide(self) -> None:
-        if self._auto_hide_id is not None and self._win is not None:
+    def _line_font_cached(self) -> ctk.CTkFont:
+        if self._line_font is None:
+            self._line_font = ctk.CTkFont(family="Microsoft YaHei UI", size=13)
+        return self._line_font
+
+    def _acquire_line(self, text: str, fg: str) -> dict | None:
+        if self._host is None:
+            return None
+        if self._pool:
+            item = self._pool.pop()
             try:
-                self._win.after_cancel(self._auto_hide_id)
-            except Exception:
-                pass
+                item["label"].configure(text=text, text_color=fg)
+                self._pack_line_frame(item["frame"])
+            except (tk.TclError, RuntimeError, AttributeError):
+                _ignore_destroyed_widget(item["frame"].destroy)
+                item = None
+            if item is not None:
+                item["alive"] = True
+                item["after_ids"] = []
+                return item
+        frame = ctk.CTkFrame(self._host, fg_color="transparent")
+        self._pack_line_frame(frame)
+        label = ctk.CTkLabel(
+            frame,
+            text=text,
+            anchor="e",
+            justify="right",
+            font=self._line_font_cached(),
+            text_color=fg,
+            wraplength=self.WIDTH - 28,
+        )
+        label.pack(fill="x", padx=4)
+        return {
+            "frame": frame,
+            "label": label,
+            "after_ids": [],
+            "alive": True,
+        }
+
+    def _recycle_item(self, item: dict) -> None:
+        self._cancel_item(item)
+        try:
+            if item in self._lines:
+                self._lines.remove(item)
+        except ValueError:
+            pass
+        _ignore_destroyed_widget(item["frame"].pack_forget)
+        if len(self._pool) < self.MAX_LINES:
+            self._pool.append(item)
+        else:
+            _ignore_destroyed_widget(item["frame"].destroy)
+
+    def _cancel_auto_hide(self) -> None:
+        win = self._win
+        hide_id = self._auto_hide_id
+        if win is not None and hide_id is not None:
+            _ignore_destroyed_widget(lambda: win.after_cancel(hide_id))
         self._auto_hide_id = None
 
     def _create(self) -> None:
@@ -281,11 +303,10 @@ class FloatingMatchOverlay:
         win.attributes("-topmost", True)
         # 首帧先透明布局，避免按 Toplevel 初始尺寸定位后再次跳动。
         win.attributes("-alpha", 0.0)
-        # 不抢焦点
-        try:
-            win.transient(self.master)
-        except Exception:
-            pass
+        # 不抢焦点；Wm 才满足 transient 的类型重载
+        owner = self.master
+        if isinstance(owner, (tk.Wm, tk.Tk, tk.Toplevel)):
+            _ignore_destroyed_widget(lambda: win.transient(owner))
 
         outer = ctk.CTkFrame(
             win,
@@ -314,17 +335,15 @@ class FloatingMatchOverlay:
         self._place()
         win.attributes("-alpha", 0.92)
         # 避免启动时抢焦点
-        try:
-            win.after(10, lambda: win.attributes("-topmost", True))
-        except Exception:
-            pass
+        _ignore_destroyed_widget(
+            lambda: win.after(10, lambda: win.attributes("-topmost", True))
+        )
         self._apply_no_activate(win)
 
         # 跟随主窗口关闭
-        try:
-            self.master.bind("<Destroy>", self._on_master_destroy, add="+")
-        except Exception:
-            pass
+        _ignore_destroyed_widget(
+            lambda: self.master.bind("<Destroy>", self._on_master_destroy, add="+")
+        )
 
     def _apply_no_activate(self, win) -> None:
         """Windows：尽量不抢键盘焦点。"""
@@ -351,8 +370,8 @@ class FloatingMatchOverlay:
                 GWL_EXSTYLE,
                 style | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             )
-        except Exception:
-            pass
+        except (AttributeError, OSError, tk.TclError, ValueError, TypeError):
+            return
 
     def _on_master_destroy(self, event) -> None:
         if event.widget is self.master:
@@ -373,15 +392,18 @@ class FloatingMatchOverlay:
         x = right - window_width - self.PAD
         y = bottom - window_height - self.PAD
         self._win.geometry(f"+{x}+{y}")
+        self._placed = True
 
     def _cancel_item(self, item: dict) -> None:
         item["alive"] = False
-        for aid in item.get("after_ids") or []:
-            try:
-                if self._win is not None:
-                    self._win.after_cancel(aid)
-            except Exception:
-                pass
+        win = self._win
+        if win is not None:
+            for aid in item.get("after_ids") or []:
+
+                def cancel_aid(current=aid, target=win) -> None:
+                    target.after_cancel(current)
+
+                _ignore_destroyed_widget(cancel_aid)
         item["after_ids"] = []
 
     def _schedule(self, item: dict, ms: int, fn) -> None:
@@ -395,66 +417,3 @@ class FloatingMatchOverlay:
 
         aid = self._win.after(ms, wrapper)
         item["after_ids"].append(aid)
-
-    def _animate_fade_in(self, item: dict, hold_ms: Optional[int] = HOLD_MS) -> None:
-        steps = max(1, self.FADE_IN_MS // self.STEP_MS)
-        state = {"i": 0}
-
-        def tick() -> None:
-            if not item.get("alive"):
-                return
-            state["i"] += 1
-            t = state["i"] / steps
-            color = _lerp_color(self.FG_DIM, item["fg_target"], t)
-            try:
-                item["label"].configure(text_color=color)
-            except Exception:
-                return
-            if state["i"] < steps:
-                self._schedule(item, self.STEP_MS, tick)
-            else:
-                item["phase"] = "hold"
-                if hold_ms is None:
-                    return
-                self._schedule(item, hold_ms, lambda: self._animate_fade_out(item))
-
-        tick()
-
-    def _animate_fade_out(self, item: dict) -> None:
-        if not item.get("alive"):
-            return
-        item["phase"] = "out"
-        steps = max(1, self.FADE_OUT_MS // self.STEP_MS)
-        state = {"i": 0}
-        start = item["fg_target"]
-
-        def tick() -> None:
-            if not item.get("alive"):
-                return
-            state["i"] += 1
-            t = state["i"] / steps
-            color = _lerp_color(start, self.FG_DIM, t)
-            try:
-                item["label"].configure(text_color=color)
-            except Exception:
-                self._remove_item(item)
-                return
-            if state["i"] < steps:
-                self._schedule(item, self.STEP_MS, tick)
-            else:
-                self._remove_item(item)
-
-        tick()
-
-    def _remove_item(self, item: dict) -> None:
-        self._cancel_item(item)
-        try:
-            if item in self._lines:
-                self._lines.remove(item)
-        except ValueError:
-            pass
-        try:
-            item["frame"].destroy()
-        except Exception:
-            pass
-        self._place()

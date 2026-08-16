@@ -89,6 +89,7 @@ def match_rule(item: Item, rule: MatchRule) -> RuleHit:
         op and (rule.threshold is not None or rule.threshold2 is not None)
     )
 
+    candidates: list[RuleHit] = []
     for affix in item.affixes:
         if not _affix_has_keywords(affix.text, keywords):
             continue
@@ -114,16 +115,30 @@ def match_rule(item: Item, rule: MatchRule) -> RuleHit:
                 continue
             second_ok = _compare(affix.second_value, op, float(rule.threshold2))
         ok = first_ok and second_ok
-        return RuleHit(
-            rule=rule,
-            matched=ok,
-            matched_affix=affix.text,
-            actual_value=affix.first_value,
-            actual_values=list(affix.values),
-            reason="数值匹配" if ok else "数值未达标",
+        candidates.append(
+            RuleHit(
+                rule=rule,
+                matched=ok,
+                matched_affix=affix.text,
+                actual_value=affix.first_value,
+                actual_values=list(affix.values),
+                reason="数值匹配" if ok else "数值未达标",
+            )
         )
 
-    return RuleHit(rule=rule, matched=False, reason="未找到同时包含这些关键字的词缀")
+    if not candidates:
+        return RuleHit(rule=rule, matched=False, reason="未找到同时包含这些关键字的词缀")
+    # 腰带固有生命等会先于显式词缀出现；>= 取最高值，<= 取最低值。
+    successes = [hit for hit in candidates if hit.matched]
+    pool = successes or candidates
+    reverse = op in {">=", ">", CompareOp.GE.value, CompareOp.GT.value}
+    return max(
+        pool,
+        key=lambda hit: (
+            hit.actual_value is not None,
+            hit.actual_value if reverse else -(hit.actual_value or 0),
+        ),
+    )
 
 
 def match_group(item: Item, group: RuleGroup) -> GroupMatchResult:
