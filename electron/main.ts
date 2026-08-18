@@ -1,3 +1,5 @@
+import fs from "fs";
+import os from "os";
 import path from "path";
 import { app, BrowserWindow, globalShortcut, ipcMain, screen, type IpcMainInvokeEvent } from "electron";
 import { setProjectRoot } from "./engine/configStore";
@@ -5,13 +7,31 @@ import { AppHost } from "./engine/host";
 import { formatMatchOverlayLine } from "./engine/overlayFormat";
 import { RunStatus } from "./engine/models";
 
-setProjectRoot(path.resolve(__dirname, "..", ".."));
+const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
+setProjectRoot(PROJECT_ROOT);
 
 const DEV =
   process.env.ELECTRON_DEV === "1" || process.env.POE_DEV === "1" || process.argv.includes("--dev");
 const DEV_URL = process.env.ELECTRON_START_URL || "http://127.0.0.1:5173";
 
+function resolveDevUserData(): string {
+  const local = path.join(PROJECT_ROOT, ".electron-data");
+  try {
+    fs.mkdirSync(local, { recursive: true });
+    fs.accessSync(local, fs.constants.W_OK);
+    return local;
+  } catch {
+    const tmp = path.join(os.tmpdir(), "poe-crafting-electron");
+    fs.mkdirSync(tmp, { recursive: true });
+    return tmp;
+  }
+}
+
+app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
 if (DEV) {
+  app.setPath("userData", resolveDevUserData());
+  app.commandLine.appendSwitch("disk-cache-size", "0");
+  app.commandLine.appendSwitch("disable-http-cache");
   app.commandLine.appendSwitch(
     "disable-features",
     "LocalNetworkAccessChecks,BlockInsecurePrivateNetworkRequests",
@@ -40,22 +60,47 @@ function placeOverlay(anchor: { x: number; y: number }): void {
   overlayWindow.setBounds({ x: area.x + area.width - w - 18, y: area.y + area.height - h - 18, width: w, height: h });
 }
 
+function overlaySend(channel: string, ...args: unknown[]): void {
+  const win = overlayWindow;
+  if (!win || win.isDestroyed()) return;
+  try {
+    if (win.webContents.isDestroyed()) return;
+    win.webContents.send(channel, ...args);
+  } catch (e) {
+    console.error("[overlay] send:", e);
+  }
+}
+
 function createOverlay(): BrowserWindow {
   const win = new BrowserWindow({
     width: 420,
     height: 276,
     frame: false,
-    transparent: true,
+    transparent: false,
+    backgroundColor: "#12141a",
     alwaysOnTop: true,
     focusable: false,
     skipTaskbar: true,
     resizable: false,
     show: false,
+    hasShadow: false,
     webPreferences: { nodeIntegration: true, contextIsolation: false },
   });
-  win.setIgnoreMouseEvents(true);
-  win.setAlwaysOnTop(true, "screen-saver");
-  win.loadFile(overlayFile());
+  try {
+    win.setIgnoreMouseEvents(true);
+  } catch (e) {
+    console.error("[overlay] setIgnoreMouseEvents:", e);
+  }
+  try {
+    win.setAlwaysOnTop(true, "pop-up-menu");
+  } catch {
+    try {
+      win.setAlwaysOnTop(true);
+    } catch (e) {
+      console.error("[overlay] setAlwaysOnTop:", e);
+    }
+  }
+  void win.loadFile(overlayFile()).catch((e) => console.error("[overlay] 加载失败:", e));
   return win;
 }
 
@@ -65,16 +110,30 @@ function overlayApi() {
       lastAttempt = -1;
     },
     show(anchor: { x: number; y: number }) {
-      if (!overlayWindow) overlayWindow = createOverlay();
-      placeOverlay(anchor);
-      overlayWindow.showInactive();
+      try {
+        if (!overlayWindow || overlayWindow.isDestroyed()) overlayWindow = createOverlay();
+        placeOverlay(anchor);
+        overlayWindow.showInactive();
+      } catch (e) {
+        console.error("[overlay] 显示失败:", e);
+        try {
+          overlayWindow?.destroy();
+        } catch {
+          /* ignore */
+        }
+        overlayWindow = null;
+      }
     },
     hide() {
-      overlayWindow?.hide();
-      overlayWindow?.webContents.send("overlay:clear");
+      try {
+        overlayWindow?.hide();
+        overlaySend("overlay:clear");
+      } catch (e) {
+        console.error("[overlay] hide:", e);
+      }
     },
     addLine(text: string, success = false) {
-      overlayWindow?.webContents.send("overlay:line", text, success);
+      overlaySend("overlay:line", text, success);
     },
     pushStatus(status: RunStatus) {
       if (!status.running) {
@@ -91,12 +150,50 @@ function overlayApi() {
       this.addLine(line, Boolean(status.lastMatch.success));
     },
     showCompletion(lines: string[], success: boolean) {
-      if (!overlayWindow) overlayWindow = createOverlay();
-      overlayWindow.showInactive();
-      overlayWindow.webContents.send("overlay:lines", lines, success);
-      setTimeout(() => this.hide(), 5000);
+      try {
+        if (!overlayWindow || overlayWindow.isDestroyed()) overlayWindow = createOverlay();
+        overlayWindow.showInactive();
+        overlaySend("overlay:lines", lines, success);
+        setTimeout(() => this.hide(), 5000);
+      } catch (e) {
+        console.error("[overlay] 完成提示失败:", e);
+      }
     },
   };
+}
+
+function hotkeyErrorText(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  if (/Invalid argument/i.test(raw)) return "未找到流放之路窗口";
+  return raw || "热键处理失败";
+}
+
+function notifyHotkeyFail(err: unknown): void {
+  const message = hotkeyErrorText(err);
+  console.error("[hotkey] start fail:", err);
+  try {
+    host.notifyError("启动失败", message);
+  } catch {
+    /* host 尚未就绪或窗口已销毁 */
+  }
+}
+
+function runHotkey(key: string, fn: () => unknown, kind: "start" | "stop"): void {
+  console.log(`[hotkey] ${key}`);
+  void (async () => {
+    try {
+      const result = await fn();
+      if (kind !== "start") return;
+      if (result && typeof result === "object" && "ok" in result && (result as { ok?: boolean }).ok === false) {
+        console.error("[hotkey] start fail:", (result as { error?: string }).error);
+        return;
+      }
+      console.log("[hotkey] start accepted");
+    } catch (err) {
+      if (kind === "start") notifyHotkeyFail(err);
+      else console.error(`[hotkey] ${key} fail:`, err);
+    }
+  })();
 }
 
 function registerHotkeys(): void {
@@ -104,13 +201,13 @@ function registerHotkeys(): void {
   const start = (host.settings.hotkeyStart || "f7").toUpperCase();
   const stop = (host.settings.hotkeyStop || "f8").toUpperCase();
   try {
-    globalShortcut.register(start, () => host.onHotkeyStart());
+    globalShortcut.register(start, () => runHotkey(start, () => host.onHotkeyStart(), "start"));
   } catch {
     /* ignore */
   }
   if (stop !== start) {
     try {
-      globalShortcut.register(stop, () => host.onHotkeyStop());
+      globalShortcut.register(stop, () => runHotkey(stop, () => host.onHotkeyStop(), "stop"));
     } catch {
       /* ignore */
     }
@@ -276,9 +373,35 @@ function timeout(ms: number, label: string): Promise<never> {
   return new Promise((_, reject) => setTimeout(() => reject(new Error(`${label}超时`)), ms));
 }
 
-app.whenReady().then(() => {
-  void createMain().catch((err) => console.error("[main] createMain failed:", err));
+process.on("uncaughtException", (err) => {
+  console.error("[main] uncaughtException:", err);
 });
+process.on("unhandledRejection", (reason) => {
+  console.error("[main] unhandledRejection:", reason);
+});
+
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  console.log("[main] 已有实例在运行，退出以免抢缓存");
+  app.quit();
+} else {
+  if (DEV) {
+    try {
+      fs.writeFileSync(path.join(app.getPath("userData"), "main.pid"), String(process.pid), "utf8");
+    } catch {
+      /* ignore */
+    }
+  }
+  app.on("second-instance", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+  app.whenReady().then(() => {
+    void createMain().catch((err) => console.error("[main] createMain failed:", err));
+  });
+}
 app.on("window-all-closed", () => {
   globalShortcut.unregisterAll();
   overlayWindow?.destroy();

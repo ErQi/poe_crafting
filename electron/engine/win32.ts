@@ -61,8 +61,8 @@ const GetClientRect = user32.func("int __stdcall GetClientRect(HWND hWnd, _Out_ 
 const ClientToScreen = user32.func("int __stdcall ClientToScreen(HWND hWnd, POINT *lpPoint)");
 const GetCursorPos = user32.func("int __stdcall GetCursorPos(_Out_ POINT *lpPoint)");
 const SetCursorPos = user32.func("int __stdcall SetCursorPos(int X, int Y)");
-const GetCursorInfo = user32.func("int __stdcall GetCursorInfo(CURSORINFO *pci)");
-const GetIconInfo = user32.func("int __stdcall GetIconInfo(HWND hIcon, ICONINFO *piconinfo)");
+const GetCursorInfo = user32.func("int __stdcall GetCursorInfo(_Inout_ CURSORINFO *pci)");
+const GetIconInfo = user32.func("int __stdcall GetIconInfo(uintptr hIcon, _Out_ ICONINFO *piconinfo)");
 const GetSystemMetrics = user32.func("int __stdcall GetSystemMetrics(int nIndex)");
 const GetDpiForWindow = user32.func("uint32 __stdcall GetDpiForWindow(HWND hWnd)");
 const GetDpiForSystem = user32.func("uint32 __stdcall GetDpiForSystem()");
@@ -72,21 +72,34 @@ const CreateCompatibleDC = gdi32.func("void * __stdcall CreateCompatibleDC(void 
 const CreateCompatibleBitmap = gdi32.func("void * __stdcall CreateCompatibleBitmap(void *hdc, int cx, int cy)");
 const SelectObject = gdi32.func("void * __stdcall SelectObject(void *hdc, void *h)");
 const BitBlt = gdi32.func("int __stdcall BitBlt(void *hdc, int x, int y, int cx, int cy, void *hdcSrc, int x1, int y1, uint32 rop)");
-const GetDIBits = gdi32.func("int __stdcall GetDIBits(void *hdc, void *hbm, uint32 start, uint32 lines, void *bits, BITMAPINFOHEADER *info, uint32 usage)");
+const GetDIBits = gdi32.func("int __stdcall GetDIBits(void *hdc, void *hbm, uint32 start, uint32 lines, void *bits, void *info, uint32 usage)");
 const DeleteObject = gdi32.func("int __stdcall DeleteObject(void *ho)");
 const DeleteDC = gdi32.func("int __stdcall DeleteDC(void *hdc)");
-const OpenClipboard = user32.func("int __stdcall OpenClipboard(void *hWndNewOwner)");
-const CloseClipboard = user32.func("int __stdcall CloseClipboard()");
-const EmptyClipboard = user32.func("int __stdcall EmptyClipboard()");
-const GetClipboardData = user32.func("void * __stdcall GetClipboardData(uint32 uFormat)");
-const SetClipboardData = user32.func("void * __stdcall SetClipboardData(uint32 uFormat, void *hMem)");
-const GlobalAlloc = kernel32.func("void * __stdcall GlobalAlloc(uint32 uFlags, size_t dwBytes)");
-const GlobalLock = kernel32.func("void * __stdcall GlobalLock(void *hMem)");
-const GlobalUnlock = kernel32.func("int __stdcall GlobalUnlock(void *hMem)");
-const GlobalFree = kernel32.func("void * __stdcall GlobalFree(void *hMem)");
-const GlobalSize = kernel32.func("size_t __stdcall GlobalSize(void *hMem)");
-const RtlMoveMemory = kernel32.func("void __stdcall RtlMoveMemory(void *dest, void *src, size_t length)");
-const SendInput = user32.func("uint32 __stdcall SendInput(uint32 cInputs, void *pInputs, int cbSize)");
+const MOUSEINPUT = koffi.struct("MOUSEINPUT", {
+  dx: "long",
+  dy: "long",
+  mouseData: "uint32_t",
+  dwFlags: "uint32_t",
+  time: "uint32_t",
+  dwExtraInfo: "uintptr_t",
+});
+const KEYBDINPUT = koffi.struct("KEYBDINPUT", {
+  wVk: "uint16_t",
+  wScan: "uint16_t",
+  dwFlags: "uint32_t",
+  time: "uint32_t",
+  dwExtraInfo: "uintptr_t",
+});
+const HARDWAREINPUT = koffi.struct("HARDWAREINPUT", {
+  uMsg: "uint32_t",
+  wParamL: "uint16_t",
+  wParamH: "uint16_t",
+});
+const INPUT = koffi.struct("INPUT", {
+  type: "uint32_t",
+  u: koffi.union({ mi: MOUSEINPUT, ki: KEYBDINPUT, hi: HARDWAREINPUT }),
+});
+const SendInput = user32.func("uint32 __stdcall SendInput(uint32 cInputs, INPUT *pInputs, int cbSize)");
 const keybd_event = user32.func("void __stdcall keybd_event(uint8 bVk, uint8 bScan, uint32 dwFlags, uintptr dwExtraInfo)");
 
 const GA_ROOT = 2;
@@ -94,8 +107,6 @@ const SW_RESTORE = 9;
 const SW_SHOW = 5;
 const SM_CYSCREEN = 1;
 const SRCCOPY = 0x00cc0020;
-const CF_UNICODETEXT = 13;
-const GMEM_MOVEABLE = 0x0002;
 const VK_MENU = 0x12;
 const KEYEVENTF_KEYUP = 0x0002;
 const KEYEVENTF_SCANCODE = 0x0008;
@@ -105,7 +116,11 @@ const MOUSEEVENTF_LEFTDOWN = 0x0002;
 const MOUSEEVENTF_LEFTUP = 0x0004;
 const MOUSEEVENTF_RIGHTDOWN = 0x0008;
 const MOUSEEVENTF_RIGHTUP = 0x0010;
-const INPUT_SIZE = 40;
+const INPUT_SIZE = koffi.sizeof(INPUT);
+const EXPECTED_INPUT_SIZE = process.arch === "ia32" ? 28 : 40;
+const BMIH_SIZE = koffi.sizeof(BITMAPINFOHEADER);
+const CAPTURE_MAX_EDGE = 8192;
+const CAPTURE_MAX_PIXELS = 8192 * 4320;
 const ASFW_ANY = 0xffffffff;
 
 export type Hwnd = object | bigint | number;
@@ -131,6 +146,10 @@ function hwndAddr(ptr: unknown): bigint {
   } catch {
     return 0n;
   }
+}
+
+function isNullPtr(ptr: unknown): boolean {
+  return hwndAddr(ptr) === 0n;
 }
 
 function hwndEq(a: unknown, b: unknown): boolean {
@@ -185,6 +204,7 @@ export function windowFromHwnd(hwnd: Hwnd | null | undefined, title = ""): Windo
     const br = { x: r.right, y: r.bottom };
     ClientToScreen(h, tl);
     ClientToScreen(h, br);
+    if (![tl.x, tl.y, br.x, br.y].every(Number.isFinite)) return null;
     const info: WindowInfo = {
       hwnd: h,
       title: title || windowTitle(h),
@@ -194,7 +214,7 @@ export function windowFromHwnd(hwnd: Hwnd | null | undefined, title = ""): Windo
       bottom: br.y,
     };
     const { width, height } = windowMetrics(info);
-    return width > 100 && height > 100 ? info : null;
+    return width > 100 && height > 100 && width <= CAPTURE_MAX_EDGE && height <= CAPTURE_MAX_EDGE ? info : null;
   } catch {
     return null;
   }
@@ -249,13 +269,21 @@ export function isForegroundWindow(hwnd: Hwnd | null | undefined): boolean {
 }
 
 function altUnlock(): void {
-  keybd_event(VK_MENU, 0, 0, 0);
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-  keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+  try {
+    keybd_event(VK_MENU, 0, 0, 0);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
+  } catch {
+    /* ignore */
+  }
 }
 
 function busySleep(ms: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* SharedArrayBuffer 不可用时跳过 */
+  }
 }
 
 export function focusWindow(hwnd: Hwnd | null | undefined, retries = 5, settleMs = 120): boolean {
@@ -349,29 +377,37 @@ export function getCursorPosition(): [number, number] {
   return [p.x, p.y];
 }
 
-export function getCursorHandle(): number | null {
-  const info = { cbSize: 24, flags: 0, hCursor: null, ptScreenPos: { x: 0, y: 0 } };
-  if (!GetCursorInfo(info)) return null;
-  const handle = ptrToNum(info.hCursor);
-  return handle || null;
+export function getCursorHandle(): bigint | null {
+  try {
+    const info = { cbSize: koffi.sizeof(CURSORINFO), flags: 0, hCursor: null, ptScreenPos: { x: 0, y: 0 } };
+    if (!GetCursorInfo(info)) return null;
+    const handle = hwndAddr(info.hCursor);
+    return handle || null;
+  } catch {
+    return null;
+  }
 }
 
-const hotspotCache = new Map<number, [number, number]>();
+const hotspotCache = new Map<string, [number, number]>();
 
 export function getCursorHotspot(): [number, number] {
   const handle = getCursorHandle();
   if (handle == null) return [0, 0];
-  const cached = hotspotCache.get(handle);
+  const key = handle.toString();
+  const cached = hotspotCache.get(key);
   if (cached) return cached;
   let hotspot: [number, number] = [0, 0];
   const info = { fIcon: 0, xHotspot: 0, yHotspot: 0, hbmMask: null, hbmColor: null };
-  const icon = hwndPtr(handle);
-  if (icon && GetIconInfo(icon, info)) {
-    hotspot = [info.xHotspot, info.yHotspot];
-    if (info.hbmMask) DeleteObject(info.hbmMask);
-    if (info.hbmColor) DeleteObject(info.hbmColor);
+  try {
+    if (GetIconInfo(handle, info)) {
+      hotspot = [info.xHotspot, info.yHotspot];
+      if (info.hbmMask && !isNullPtr(info.hbmMask)) DeleteObject(info.hbmMask);
+      if (info.hbmColor && !isNullPtr(info.hbmColor)) DeleteObject(info.hbmColor);
+    }
+  } catch {
+    /* 无效光标句柄时跳过 */
   }
-  hotspotCache.set(handle, hotspot);
+  hotspotCache.set(key, hotspot);
   return hotspot;
 }
 
@@ -391,31 +427,51 @@ export function cursorPatchSize(windowHeight = 0, hwnd: Hwnd | null | undefined 
 }
 
 export function moveTo(x: number, y: number): void {
-  SetCursorPos(Math.round(x), Math.round(y));
+  if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+  try {
+    SetCursorPos(Math.round(x), Math.round(y));
+  } catch (e) {
+    console.error("[win32] SetCursorPos:", e);
+  }
 }
 
-function sendMouse(flags: number): void {
-  const buf = Buffer.alloc(INPUT_SIZE);
-  buf.writeUInt32LE(INPUT_MOUSE, 0);
-  buf.writeUInt32LE(flags, 20);
-  SendInput(1, buf, INPUT_SIZE);
+type InputEvent = {
+  type: number;
+  u: {
+    mi?: { dx: number; dy: number; mouseData: number; dwFlags: number; time: number; dwExtraInfo: number };
+    ki?: { wVk: number; wScan: number; dwFlags: number; time: number; dwExtraInfo: number };
+  };
+};
+
+function sendInputs(events: InputEvent[]): boolean {
+  if (!events.length) return true;
+  if (INPUT_SIZE !== EXPECTED_INPUT_SIZE) {
+    console.error("[win32] INPUT sizeof", INPUT_SIZE, "expected", EXPECTED_INPUT_SIZE);
+    return false;
+  }
+  try {
+    return SendInput(events.length, events, INPUT_SIZE) === events.length;
+  } catch (e) {
+    console.error("[win32] SendInput:", e);
+    return false;
+  }
 }
 
-function sendKey(scan: number, up: boolean): void {
-  const buf = Buffer.alloc(INPUT_SIZE);
-  buf.writeUInt32LE(INPUT_KEYBOARD, 0);
-  buf.writeUInt16LE(0, 8);
-  buf.writeUInt16LE(scan, 10);
-  buf.writeUInt32LE(KEYEVENTF_SCANCODE | (up ? KEYEVENTF_KEYUP : 0), 12);
-  SendInput(1, buf, INPUT_SIZE);
+function mouseEvent(flags: number): InputEvent {
+  return { type: INPUT_MOUSE, u: { mi: { dx: 0, dy: 0, mouseData: 0, dwFlags: flags, time: 0, dwExtraInfo: 0 } } };
+}
+
+function keyEvent(scan: number, up: boolean): InputEvent {
+  return {
+    type: INPUT_KEYBOARD,
+    u: { ki: { wVk: 0, wScan: scan, dwFlags: KEYEVENTF_SCANCODE | (up ? KEYEVENTF_KEYUP : 0), time: 0, dwExtraInfo: 0 } },
+  };
 }
 
 export function clickButton(button: "left" | "right"): void {
   const down = button === "right" ? MOUSEEVENTF_RIGHTDOWN : MOUSEEVENTF_LEFTDOWN;
   const up = button === "right" ? MOUSEEVENTF_RIGHTUP : MOUSEEVENTF_LEFTUP;
-  sendMouse(down);
-  busySleep(20);
-  sendMouse(up);
+  if (!sendInputs([mouseEvent(down), mouseEvent(up)])) console.error("[win32] clickButton: SendInput 失败");
 }
 
 const SCAN: Record<string, number> = {
@@ -429,99 +485,81 @@ const SCAN: Record<string, number> = {
   f8: 0x42,
 };
 
-export function hotkey(...keys: string[]): void {
-  const scans = keys.map((k) => {
-    const key = k.toLowerCase();
-    if (SCAN[key] != null) return SCAN[key];
-    if (key.length === 1) return SCAN[key] ?? key.toUpperCase().charCodeAt(0);
-    throw new Error(`不支持的按键: ${k}`);
-  });
-  for (const s of scans) sendKey(s, false);
-  busySleep(12);
-  for (const s of [...scans].reverse()) sendKey(s, true);
-}
-
-export function getClipboardText(): string {
-  if (!OpenClipboard(null)) return "";
+export function hotkey(...keys: string[]): boolean {
   try {
-    const handle = GetClipboardData(CF_UNICODETEXT);
-    if (!handle) return "";
-    const ptr = GlobalLock(handle);
-    if (!ptr) return "";
-    try {
-      if (Number(GlobalSize(handle)) <= 2) return "";
-      return String(koffi.decode(ptr, "str16") || "");
-    } finally {
-      GlobalUnlock(handle);
-    }
-  } catch {
-    return "";
-  } finally {
-    CloseClipboard();
-  }
-}
-
-export function setClipboardText(text: string): boolean {
-  const encoded = Buffer.concat([Buffer.from(text ?? "", "utf16le"), Buffer.from([0, 0])]);
-  if (!OpenClipboard(null)) return false;
-  let handle: unknown = null;
-  try {
-    EmptyClipboard();
-    handle = GlobalAlloc(GMEM_MOVEABLE, encoded.length);
-    if (!handle) return false;
-    const locked = GlobalLock(handle);
-    if (!locked) {
-      GlobalFree(handle);
-      return false;
-    }
-    RtlMoveMemory(locked, encoded, encoded.length);
-    GlobalUnlock(handle);
-    if (!SetClipboardData(CF_UNICODETEXT, handle)) {
-      GlobalFree(handle);
-      return false;
-    }
-    handle = null;
-    return true;
-  } catch {
-    if (handle) GlobalFree(handle);
+    const scans = keys.map((k) => {
+      const key = k.toLowerCase();
+      if (SCAN[key] != null) return SCAN[key];
+      if (key.length === 1) return SCAN[key] ?? key.toUpperCase().charCodeAt(0);
+      throw new Error(`不支持的按键: ${k}`);
+    });
+    const events = [...scans.map((s) => keyEvent(s, false)), ...[...scans].reverse().map((s) => keyEvent(s, true))];
+    return sendInputs(events);
+  } catch (e) {
+    console.error("[win32] hotkey:", e);
     return false;
-  } finally {
-    CloseClipboard();
   }
+}
+
+function writeBmih(width: number, height: number): Buffer {
+  const header = Buffer.alloc(BMIH_SIZE);
+  header.writeUInt32LE(BMIH_SIZE, 0);
+  header.writeInt32LE(width, 4);
+  header.writeInt32LE(-height, 8);
+  header.writeUInt16LE(1, 12);
+  header.writeUInt16LE(32, 14);
+  return header;
 }
 
 export function captureRegionBgra(left: number, top: number, width: number, height: number): Buffer {
-  if (width <= 0 || height <= 0) throw new Error("截屏区域无效");
-  const hdc = GetDC(null);
-  if (!hdc) throw new Error("GetDC 失败");
-  const mem = CreateCompatibleDC(hdc);
-  const bmp = CreateCompatibleBitmap(hdc, width, height);
-  const old = SelectObject(mem, bmp);
+  if (![left, top, width, height].every(Number.isFinite)) throw new Error("截屏区域无效");
+  const w = Math.trunc(width);
+  const h = Math.trunc(height);
+  if (w < 1 || h < 1) throw new Error("截屏区域无效");
+  if (w > CAPTURE_MAX_EDGE || h > CAPTURE_MAX_EDGE || w * h > CAPTURE_MAX_PIXELS) {
+    throw new Error(`截屏尺寸过大: ${w}x${h}`);
+  }
+  let hdc: unknown = null;
+  let mem: unknown = null;
+  let bmp: unknown = null;
+  let old: unknown = null;
   try {
-    if (!BitBlt(mem, 0, 0, width, height, hdc, left, top, SRCCOPY)) {
+    hdc = GetDC(null);
+    if (isNullPtr(hdc)) throw new Error("GetDC 失败");
+    mem = CreateCompatibleDC(hdc);
+    if (isNullPtr(mem)) throw new Error("CreateCompatibleDC 失败");
+    bmp = CreateCompatibleBitmap(hdc, w, h);
+    if (isNullPtr(bmp)) throw new Error("CreateCompatibleBitmap 失败");
+    old = SelectObject(mem, bmp);
+    if (!BitBlt(mem, 0, 0, w, h, hdc, Math.trunc(left), Math.trunc(top), SRCCOPY)) {
       throw new Error("BitBlt 失败");
     }
-    const header = {
-      biSize: 40,
-      biWidth: width,
-      biHeight: -height,
-      biPlanes: 1,
-      biBitCount: 32,
-      biCompression: 0,
-      biSizeImage: 0,
-      biXPelsPerMeter: 0,
-      biYPelsPerMeter: 0,
-      biClrUsed: 0,
-      biClrImportant: 0,
-    };
-    const pixels = Buffer.alloc(width * height * 4);
-    const ok = GetDIBits(hdc, bmp, 0, height, pixels, header, 0);
-    if (!ok) throw new Error("GetDIBits 失败");
+    const pixels = Buffer.alloc(w * h * 4);
+    if (!GetDIBits(hdc, bmp, 0, h, pixels, writeBmih(w, h), 0)) throw new Error("GetDIBits 失败");
     return pixels;
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(/截屏|GetDC|BitBlt|GetDIBits|CreateCompatible/.test(msg) ? msg : `截屏失败: ${msg}`);
   } finally {
-    SelectObject(mem, old);
-    DeleteObject(bmp);
-    DeleteDC(mem);
-    ReleaseDC(null, hdc);
+    try {
+      if (!isNullPtr(mem) && !isNullPtr(old)) SelectObject(mem, old);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (!isNullPtr(bmp)) DeleteObject(bmp);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (!isNullPtr(mem)) DeleteDC(mem);
+    } catch {
+      /* ignore */
+    }
+    try {
+      if (!isNullPtr(hdc)) ReleaseDC(null, hdc);
+    } catch {
+      /* ignore */
+    }
   }
 }

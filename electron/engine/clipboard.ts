@@ -1,25 +1,33 @@
-import { getClipboardText, setClipboardText } from "./win32";
+import { clipboard } from "electron";
 
 export function getClipboard(): string {
   try {
-    return getClipboardText();
-  } catch {
+    return clipboard.readText() || "";
+  } catch (e) {
+    console.error("[craft] copy: read clipboard failed", e);
     return "";
   }
 }
 
 export function setClipboard(text: string): boolean {
   try {
-    return setClipboardText(text);
-  } catch {
+    if (!text) {
+      clipboard.clear();
+      return true;
+    }
+    clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    console.error("[craft] 复制失败", e);
     return false;
   }
 }
 
 export function clearClipboard(): void {
-  for (let i = 0; i < 6; i++) {
-    if (setClipboard("")) return;
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 2);
+  try {
+    clipboard.clear();
+  } catch (e) {
+    console.error("[craft] 复制失败", e);
   }
 }
 

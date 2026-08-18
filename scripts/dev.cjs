@@ -8,6 +8,8 @@ const web = path.join(root, "web");
 const electronDir = path.join(root, "electron");
 const DEV_URL = "http://127.0.0.1:5173";
 
+let electron = null;
+
 function httpStatus(url) {
   return new Promise((resolve) => {
     const req = http.get(url, (res) => {
@@ -45,12 +47,98 @@ function electronExe() {
   return exe;
 }
 
-function killTree(child) {
-  if (!child || child.killed || child.exitCode != null) return;
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function pidFile() {
+  return path.join(root, ".electron-data", "main.pid");
+}
+
+function readPidFile() {
+  try {
+    return Number(fs.readFileSync(pidFile(), "utf8").trim()) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+function livePidFile() {
+  const pid = readPidFile();
+  return pidAlive(pid) ? pid : 0;
+}
+
+function listAppMainElectrons() {
+  if (process.platform !== "win32") {
+    return electron && electron.exitCode == null && electron.pid ? [electron.pid] : [];
+  }
+  const marker = path.normalize(electronExe()).toLowerCase().replace(/'/g, "''");
+  const ps =
+    `Get-CimInstance Win32_Process -Filter "Name='electron.exe'" | ` +
+    `Where-Object { $_.CommandLine -and $_.CommandLine.ToLower().Contains('${marker}') -and $_.CommandLine -notmatch '--type=' } | ` +
+    `ForEach-Object { $_.ProcessId }`;
+  try {
+    const out = execSync(`powershell -NoProfile -NonInteractive -Command ${JSON.stringify(ps)}`, {
+      encoding: "utf8",
+      timeout: 10000,
+      windowsHide: true,
+    });
+    return String(out)
+      .split(/\r?\n/)
+      .map((s) => Number(s.trim()))
+      .filter((pid) => pid > 0);
+  } catch {
+    return [];
+  }
+}
+
+function appElectronPids() {
+  const pids = new Set();
+  const filePid = livePidFile();
+  if (filePid) pids.add(filePid);
+  for (const pid of listAppMainElectrons()) pids.add(pid);
+  if (electron && electron.pid && electron.exitCode == null) pids.add(electron.pid);
+  return [...pids];
+}
+
+function killPid(pid) {
+  if (!pid) return;
   if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], { stdio: "ignore" });
+    spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
   } else {
-    child.kill("SIGTERM");
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function killAppElectrons() {
+  for (const pid of appElectronPids()) killPid(pid);
+}
+
+function killTree(child) {
+  if (child && !child.killed && child.exitCode == null && child.pid) killPid(child.pid);
+  killAppElectrons();
+}
+
+async function waitPidsGone(pids, timeoutMs = 0) {
+  const start = Date.now();
+  const list = [...new Set(pids.filter(Boolean))];
+  while (list.some((pid) => pidAlive(pid))) {
+    if (timeoutMs && Date.now() - start > timeoutMs) return;
+    await sleep(300);
   }
 }
 
@@ -93,7 +181,6 @@ async function main() {
     ELECTRON_START_URL: DEV_URL,
   };
 
-  let electron = null;
   let generation = 0;
   let restarting = false;
 
@@ -104,12 +191,15 @@ async function main() {
 
   function startElectron() {
     const gen = generation;
+    // 不用 shell:true：Windows 上 cmd 会因 GUI 子系统立刻退出，electron.exe 变成孤儿，父进程误 process.exit
     electron = spawn(electronExe(), [".", "--dev"], {
       stdio: "inherit",
       windowsHide: false,
       cwd: root,
       env,
+      shell: false,
     });
+    const spawnPid = electron.pid;
     electron.on("error", (err) => {
       console.error(err);
       process.exit(1);
@@ -117,8 +207,28 @@ async function main() {
     electron.on("exit", (code) => {
       if (gen !== generation) return;
       electron = null;
-      stop(code ?? 0);
+      void waitForRealElectron(gen, spawnPid, code ?? 0);
     });
+  }
+
+  async function waitForRealElectron(gen, spawnPid, code) {
+    let live = [];
+    const deadline = Date.now() + 800;
+    do {
+      if (gen !== generation) return;
+      live = appElectronPids().filter((pid) => pid !== spawnPid && pidAlive(pid));
+      if (live.length) break;
+      await sleep(150);
+    } while (Date.now() < deadline);
+    if (gen !== generation) return;
+    if (live.length) {
+      console.log("[dev] spawn 已退出，继续等待 electron.exe", live.join(", "));
+      while (gen === generation && appElectronPids().some((pid) => pidAlive(pid))) {
+        await sleep(500);
+      }
+    }
+    if (gen !== generation) return;
+    stop(code);
   }
 
   function waitExit(child) {
@@ -139,6 +249,7 @@ async function main() {
       buildElectron();
       killTree(prev);
       await waitExit(prev);
+      await waitPidsGone(appElectronPids(), 4000);
       startElectron();
     } catch (err) {
       console.error("[dev] 重启失败:", err);
@@ -148,6 +259,8 @@ async function main() {
   }
 
   console.log(`[dev] 加载 ${DEV_URL}（Vue 热更新；改 electron/ 会重启进程）`);
+  killAppElectrons();
+  await waitPidsGone(appElectronPids(), 4000);
   startElectron();
 
   let debounce;

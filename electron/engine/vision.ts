@@ -22,6 +22,15 @@ export class VisionError extends Error {
   }
 }
 
+/** opencv-wasm 失败时常抛出裸整数（Emscripten 异常指针），不是 BGR/阈值。 */
+export function visionErrText(e: unknown): string {
+  if (e instanceof VisionError) return e.message;
+  const raw = e instanceof Error ? e.message : String(e);
+  const trimmed = raw.trim();
+  if (/^\d+$/.test(trimmed)) return `OpenCV内部异常 ${trimmed}`;
+  return raw || "未知错误";
+}
+
 export interface MatchHit {
   name: string;
   score: number;
@@ -59,13 +68,88 @@ function requireCv(): CvApi {
   return cv;
 }
 
+/** opencv-wasm 堆有限，禁止把 4K 整图送进 matFromArray / matchTemplate。 */
+const WASM_MAX_SHORT = 1080;
+
+function shrinkBgraForWasm(
+  bgra: Buffer,
+  width: number,
+  height: number,
+): { data: Uint8Array; width: number; height: number; scaleX: number; scaleY: number } {
+  const short = Math.min(width, height);
+  if (short <= WASM_MAX_SHORT) {
+    return { data: new Uint8Array(bgra), width, height, scaleX: 1, scaleY: 1 };
+  }
+  const scale = WASM_MAX_SHORT / short;
+  const nw = Math.max(1, Math.round(width * scale));
+  const nh = Math.max(1, Math.round(height * scale));
+  const out = new Uint8Array(nw * nh * 4);
+  for (let y = 0; y < nh; y++) {
+    const sy = Math.min(height - 1, Math.floor(((y + 0.5) * height) / nh));
+    const srcRow = sy * width * 4;
+    const dstRow = y * nw * 4;
+    for (let x = 0; x < nw; x++) {
+      const sx = Math.min(width - 1, Math.floor(((x + 0.5) * width) / nw));
+      const si = srcRow + sx * 4;
+      const di = dstRow + x * 4;
+      out[di] = bgra[si];
+      out[di + 1] = bgra[si + 1];
+      out[di + 2] = bgra[si + 2];
+      out[di + 3] = bgra[si + 3];
+    }
+  }
+  return { data: out, width: nw, height: nh, scaleX: nw / width, scaleY: nh / height };
+}
+
+function attachSrcScale(mat: Mat, scaleX: number, scaleY: number): Mat {
+  mat._srcScaleX = scaleX;
+  mat._srcScaleY = scaleY;
+  return mat;
+}
+
+function matScale(mat: Mat | null | undefined): { x: number; y: number } {
+  const x = mat?._srcScaleX;
+  const y = mat?._srcScaleY;
+  return {
+    x: typeof x === "number" && x > 0 ? x : 1,
+    y: typeof y === "number" && y > 0 ? y : 1,
+  };
+}
+
+function toClient(v: number, scale: number): number {
+  return scale === 1 ? Math.round(v) : Math.round(v / scale);
+}
+
+function scaleNeedles(scales: readonly number[], srcScale: number): number[] {
+  if (srcScale >= 0.999) return [...scales];
+  return scales.map((s) => s * srcScale);
+}
+
+function scaleExcludes(
+  regions: [number, number, number, number][] | undefined,
+  sx: number,
+  sy: number,
+): [number, number, number, number][] | undefined {
+  if (!regions?.length || (sx === 1 && sy === 1)) return regions;
+  return regions.map(([l, t, r, b]) => [l * sx, t * sy, r * sx, b * sy]);
+}
+
 export function bgraToBgr(bgra: Buffer, width: number, height: number): Mat {
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
+    throw new VisionError("截图像素尺寸无效");
+  }
+  if (bgra.length < width * height * 4) throw new VisionError("截图像素缓冲大小不符");
   const api = requireCv();
-  const src = api.matFromArray(height, width, api.CV_8UC4, new Uint8Array(bgra));
-  const bgr = new api.Mat();
-  api.cvtColor(src, bgr, api.COLOR_BGRA2BGR);
-  src.delete();
-  return bgr;
+  const fitted = shrinkBgraForWasm(bgra, width, height);
+  try {
+    const src = api.matFromArray(fitted.height, fitted.width, api.CV_8UC4, fitted.data);
+    const bgr = new api.Mat();
+    api.cvtColor(src, bgr, api.COLOR_BGRA2BGR);
+    src.delete();
+    return attachSrcScale(bgr, fitted.scaleX, fitted.scaleY);
+  } catch (e) {
+    throw new VisionError(`图像转换失败: ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 export function captureRegion(left: number, top: number, width: number, height: number): Mat {
@@ -74,6 +158,7 @@ export function captureRegion(left: number, top: number, width: number, height: 
 
 export function captureWindow(window: WindowInfo): Mat {
   const { width, height } = windowMetrics(window);
+  if (width < 32 || height < 32) throw new VisionError("游戏窗口尺寸无效");
   return captureRegion(window.left, window.top, width, height);
 }
 
@@ -120,21 +205,33 @@ export function loadTemplate(file: string): Mat {
   const api = requireCv();
   if (!fs.existsSync(file)) throw new VisionError(`模板不存在: ${file}`);
   if (typeof api.imdecode === "function") {
-    const bytes = fs.readFileSync(file);
-    const buf = api.matFromArray(1, bytes.length, api.CV_8UC1, new Uint8Array(bytes));
-    const img = api.imdecode(buf, api.IMREAD_UNCHANGED);
-    buf.delete();
-    if (img && !img.empty()) return img;
+    try {
+      const bytes = fs.readFileSync(file);
+      if (bytes.length < 24) throw new VisionError(`模板文件过小: ${file}`);
+      const buf = api.matFromArray(1, bytes.length, api.CV_8UC1, new Uint8Array(bytes));
+      try {
+        const img = api.imdecode(buf, api.IMREAD_UNCHANGED);
+        if (img && !img.empty()) return img;
+        img?.delete?.();
+      } finally {
+        buf.delete();
+      }
+    } catch (e) {
+      console.error("[vision] imdecode 失败，改用 Electron 读图:", e);
+    }
   }
   const { nativeImage } = require("electron");
   const ni = nativeImage.createFromPath(file);
   if (ni.isEmpty()) throw new VisionError(`无法读取模板: ${file}`);
   const { width, height } = ni.getSize();
+  if (width < 1 || height < 1) throw new VisionError(`模板尺寸无效: ${file}`);
   return api.matFromArray(height, width, api.CV_8UC4, new Uint8Array(ni.toBitmap()));
 }
 
 function sanitizeResult(result: Mat, fill: number): void {
-  const data = result.data32F as Float32Array;
+  if (!result || result.rows <= 0 || result.cols <= 0) return;
+  const data = result.data32F as Float32Array | undefined;
+  if (!data || typeof data.length !== "number") return;
   for (let i = 0; i < data.length; i++) {
     if (!Number.isFinite(data[i])) data[i] = fill;
   }
@@ -195,6 +292,9 @@ export function matchTemplate(
   try {
     const hImg = grayH.rows;
     const wImg = grayH.cols;
+    if (Math.min(hImg, wImg) > WASM_MAX_SHORT + 16) {
+      throw new VisionError(`画面过大，已拒绝送入 OpenCV: ${wImg}x${hImg}`);
+    }
     const scaleList = [...(scales ?? DEFAULT_SCALES_FAST)];
     let ss = searchScale > 0 ? Math.min(searchScale, 1) : 1;
     let smallH = grayH;
@@ -217,22 +317,29 @@ export function matchTemplate(
         let mask: Mat | null = null;
         if (needleMask) {
           mask = noResize ? needleMask : resizeGray(needleMask, nw, nh, scale * ss);
-          const data = mask.data as Uint8Array;
-          for (let i = 0; i < data.length; i++) if (data[i] < 8) data[i] = 0;
+          const data = mask.data as Uint8Array | undefined;
+          if (data) {
+            for (let i = 0; i < data.length; i++) if (data[i] < 8) data[i] = 0;
+          }
         }
         const result = new api.Mat();
         const method = mask ? api.TM_CCORR_NORMED : api.TM_CCOEFF_NORMED;
-        if (mask) api.matchTemplate(smallH, needle, result, method, mask);
-        else api.matchTemplate(smallH, needle, result, method);
-        sanitizeResult(result, -1);
-        applyExclusions(result, excludeRegions, ss, nw, nh, -1);
-        const loc = api.minMaxLoc(result);
-        const score = loc.maxVal;
-        const ox = Math.round(loc.maxLoc.x / ss);
-        const oy = Math.round(loc.maxLoc.y / ss);
-        const ow = Math.max(1, Math.round(needle.cols / ss));
-        const oh = Math.max(1, Math.round(needle.rows / ss));
-        if (!best || score > best[0]) best = [score, ox, oy, ow, oh];
+        let score = -1;
+        try {
+          if (mask) api.matchTemplate(smallH, needle, result, method, mask);
+          else api.matchTemplate(smallH, needle, result, method);
+          sanitizeResult(result, -1);
+          applyExclusions(result, excludeRegions, ss, nw, nh, -1);
+          const loc = api.minMaxLoc(result);
+          score = loc.maxVal;
+          const ox = Math.round(loc.maxLoc.x / ss);
+          const oy = Math.round(loc.maxLoc.y / ss);
+          const ow = Math.max(1, Math.round(needle.cols / ss));
+          const oh = Math.max(1, Math.round(needle.rows / ss));
+          if (!best || score > best[0]) best = [score, ox, oy, ow, oh];
+        } catch (e) {
+          console.warn("[vision] 模板匹配跳过 scale", scale, visionErrText(e));
+        }
         result.delete();
         if (!noResize) needle.delete();
         if (mask && !noResize) mask.delete();
@@ -262,6 +369,9 @@ export function matchTemplateColorRmse(
   if (!haystackBgr || !needleBgr || haystackBgr.channels() < 3 || needleBgr.channels() < 3) return null;
   const hImg = haystackBgr.rows;
   const wImg = haystackBgr.cols;
+  if (Math.min(hImg, wImg) > WASM_MAX_SHORT + 16) {
+    throw new VisionError(`画面过大，已拒绝送入 OpenCV: ${wImg}x${hImg}`);
+  }
   let ss = searchScale > 0 ? Math.min(searchScale, 1) : 1;
   let smallH = haystackBgr;
   let ownSmall = false;
@@ -308,7 +418,15 @@ export function matchTemplateColorRmse(
         continue;
       }
       const result = new api.Mat();
-      api.matchTemplate(smallH, needle, result, api.TM_SQDIFF, mask);
+      try {
+        api.matchTemplate(smallH, needle, result, api.TM_SQDIFF, mask);
+      } catch (e) {
+        result.delete();
+        needle.delete();
+        if (ownMask) mask.delete();
+        console.warn("[vision] 颜色匹配跳过 scale", scale, visionErrText(e));
+        continue;
+      }
       sanitizeResult(result, 1e30);
       applyExclusions(result, excludeRegions, ss, nw, nh, 1e30);
       const loc = api.minMaxLoc(result);
@@ -338,6 +456,7 @@ function extractSift(image: Mat, mask?: Mat | null): [unknown[], Mat | null] {
   const api = requireCv();
   try {
     if (typeof api.SIFT_create !== "function") return [[], null];
+    if (Math.min(image.rows, image.cols) > WASM_MAX_SHORT + 16) return [[], null];
     const sift = api.SIFT_create(0, 3, 0.02, 10);
     const gray = image.channels() === 1 ? image : toGray(image);
     const keypoints = new api.KeyPointVector();
@@ -569,7 +688,16 @@ export class VisionService {
 
   grabWindow(window: WindowInfo): Mat {
     this.noteWindow(window);
-    return captureWindow(window);
+    try {
+      const frame = captureWindow(window);
+      const { x: sx, y: sy } = matScale(frame);
+      if (sx < 0.999 || sy < 0.999) {
+        console.log("[vision] wasm frame", frame.cols, "x", frame.rows, "srcScale", sx.toFixed(3));
+      }
+      return frame;
+    } catch (e) {
+      throw e instanceof VisionError ? e : new VisionError(`截屏失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }
 
   captureCursorPatch(size?: number): Mat | null {
@@ -586,37 +714,51 @@ export class VisionService {
     scales?: number[],
     useFallbackScales = true,
     excludeRegions?: [number, number, number, number][],
+    cachePosition = true,
   ): MatchHit | null {
     this.noteWindow(window);
     const thr = threshold ?? this.threshold;
-    let hit = matchTemplate(
-      frameBgr,
-      null,
-      thr,
-      scales ?? this.scales,
-      frameGray ?? undefined,
-      this.getTemplateGray(templateName),
-      this.getTemplateMask(templateName),
-      this.searchScale,
-      excludeRegions,
-    );
-    if (!hit && useFallbackScales && !scales) {
-      hit = matchTemplate(
+    const { x: sx, y: sy } = matScale(frameBgr);
+    const srcScale = (sx + sy) / 2;
+    const excludes = scaleExcludes(excludeRegions, sx, sy);
+    console.log("[craft] match begin", templateName, frameBgr.cols, "x", frameBgr.rows, "srcScale", srcScale.toFixed(3));
+    try {
+      let hit = matchTemplate(
         frameBgr,
         null,
         thr,
-        DEFAULT_SCALES_FALLBACK,
+        scaleNeedles(scales ?? this.scales, srcScale),
         frameGray ?? undefined,
         this.getTemplateGray(templateName),
         this.getTemplateMask(templateName),
-        Math.min(1, this.searchScale + 0.1),
-        excludeRegions,
+        this.searchScale,
+        excludes,
       );
+      if (!hit && useFallbackScales) {
+        hit = matchTemplate(
+          frameBgr,
+          null,
+          thr,
+          scaleNeedles(DEFAULT_SCALES_FALLBACK, srcScale),
+          frameGray ?? undefined,
+          this.getTemplateGray(templateName),
+          this.getTemplateMask(templateName),
+          Math.min(1, this.searchScale + 0.1),
+          excludes,
+        );
+      }
+      if (!hit) {
+        console.log("[craft] match miss", templateName);
+        return null;
+      }
+      const result = this.makeHit(window, templateName, hit[0], hit[1], hit[2], hit[3], hit[4], undefined, sx, sy);
+      if (cachePosition) this.posCache.set(templateName, result);
+      console.log("[craft] match ok", templateName, "score", result.score.toFixed(3));
+      return result;
+    } catch (e) {
+      console.warn("[vision] 模板匹配失败", templateName, visionErrText(e));
+      return null;
     }
-    if (!hit) return null;
-    const result = this.makeHit(window, templateName, hit[0], hit[1], hit[2], hit[3], hit[4]);
-    this.posCache.set(templateName, result);
-    return result;
   }
 
   matchColorInFrame(
@@ -629,19 +771,26 @@ export class VisionService {
     cachePosition = false,
   ): MatchHit | null {
     this.noteWindow(window);
-    const raw = matchTemplateColorRmse(
-      frameBgr,
-      this.getTemplate(templateName),
-      this.getTemplateMask(templateName),
-      maxRmse,
-      scales ?? this.scales,
-      this.searchScale,
-      excludeRegions,
-    );
-    if (!raw) return null;
-    const hit = this.makeHit(window, templateName, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5]);
-    if (cachePosition) this.posCache.set(templateName, hit);
-    return hit;
+    const { x: sx, y: sy } = matScale(frameBgr);
+    const srcScale = (sx + sy) / 2;
+    try {
+      const raw = matchTemplateColorRmse(
+        frameBgr,
+        this.getTemplate(templateName),
+        this.getTemplateMask(templateName),
+        maxRmse,
+        scaleNeedles(scales ?? this.scales, srcScale),
+        this.searchScale,
+        scaleExcludes(excludeRegions, sx, sy),
+      );
+      if (!raw) return null;
+      const hit = this.makeHit(window, templateName, raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], sx, sy);
+      if (cachePosition) this.posCache.set(templateName, hit);
+      return hit;
+    } catch (e) {
+      console.warn("[vision] 颜色匹配失败", templateName, visionErrText(e));
+      return null;
+    }
   }
 
   featureCandidatesInFrame(
@@ -652,6 +801,7 @@ export class VisionService {
     excludeRegions?: [number, number, number, number][],
     maxCandidates = 6,
   ): MatchHit[] {
+    const { x: sx, y: sy } = matScale(frameBgr);
     if (this.featureFrame !== frameBgr) {
       this.featureData?.[1]?.delete();
       this.featureFrame = frameBgr;
@@ -661,20 +811,20 @@ export class VisionService {
       frameBgr,
       this.getTemplate(templateName),
       this.getTemplateMask(templateName),
-      targetWidth,
-      excludeRegions,
+      Math.max(12, Math.round(targetWidth * ((sx + sy) / 2))),
+      scaleExcludes(excludeRegions, sx, sy),
       maxCandidates,
       this.featureData ?? undefined,
     );
     return candidates.map((c) => ({
       name: templateName,
       score: Math.min(1, c.matchCount / 12),
-      screenX: window.left + c.centerX,
-      screenY: window.top + c.centerY,
-      clientX: c.centerX,
-      clientY: c.centerY,
-      width: c.width,
-      height: c.height,
+      screenX: window.left + toClient(c.centerX, sx),
+      screenY: window.top + toClient(c.centerY, sy),
+      clientX: toClient(c.centerX, sx),
+      clientY: toClient(c.centerY, sy),
+      width: Math.max(1, toClient(c.width, sx)),
+      height: Math.max(1, toClient(c.height, sy)),
       featureMatches: c.matchCount,
     }));
   }
@@ -721,11 +871,12 @@ export class VisionService {
       try {
         const hit = this.matchInFrame(win, frame, name, thr, gray, undefined, true);
         if (!hit) {
+          const { x: sx, y: sy } = matScale(frame);
           const raw = matchTemplate(
             frame,
             null,
             0,
-            DEFAULT_SCALES_FALLBACK,
+            scaleNeedles(DEFAULT_SCALES_FALLBACK, (sx + sy) / 2),
             gray,
             this.getTemplateGray(name),
             this.getTemplateMask(name),
@@ -758,9 +909,11 @@ export class VisionService {
     w: number,
     h: number,
     rmse?: number,
+    scaleX = 1,
+    scaleY = 1,
   ): MatchHit {
-    const cx = x + Math.floor(w / 2);
-    const cy = y + Math.floor(h / 2);
+    const cx = toClient(x + w / 2, scaleX);
+    const cy = toClient(y + h / 2, scaleY);
     const hit: MatchHit = {
       name,
       score,
@@ -768,8 +921,8 @@ export class VisionService {
       screenY: window.top + cy,
       clientX: cx,
       clientY: cy,
-      width: w,
-      height: h,
+      width: Math.max(1, toClient(w, scaleX)),
+      height: Math.max(1, toClient(h, scaleY)),
       colorRmse: rmse,
     };
     return hit;

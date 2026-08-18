@@ -50,11 +50,20 @@ const TEMPLATE_SLOTS: [string, string, boolean][] = [
   ["item_slot", "目标装备位置（工艺槽/背包）", true],
 ];
 
-function ok(extra: Record<string, unknown> = {}) {
+type HostResult =
+  | ({ ok: true } & Record<string, unknown>)
+  | ({ ok: false; error: string } & Record<string, unknown>);
+
+function ok(extra: Record<string, unknown> = {}): HostResult {
   return { ok: true, ...extra };
 }
-function err(message: string, extra: Record<string, unknown> = {}) {
+function err(message: string, extra: Record<string, unknown> = {}): HostResult {
   return { ok: false, error: message, ...extra };
+}
+function startErrorText(e: unknown): string {
+  const msg = e instanceof Error ? e.message : String(e);
+  if (/Invalid argument/i.test(msg)) return "未找到流放之路窗口";
+  return msg || "启动失败";
 }
 
 function normalizeRuleset(data: Record<string, unknown>): RuleSet {
@@ -143,6 +152,7 @@ export class AppHost {
   private templateRowCache: { key: string; rows: ReturnType<AppHost["buildTemplateRows"]> } | null = null;
   private pendingPreviewUrl: string | null = null;
   initError = "";
+  private launchQueued = false;
 
   constructor() {
     this.settings = loadSettings();
@@ -183,6 +193,15 @@ export class AppHost {
     this.log(message);
   }
 
+  notifyError(title: string, message: string): void {
+    try {
+      this.setAlert(title, message);
+      this.log(message);
+    } catch (e) {
+      console.error("[hotkey] 通知窗口失败:", e);
+    }
+  }
+
   attach(push: (rt: Record<string, unknown>) => void, overlay: OverlayBridge): void {
     this.pushFn = push;
     this.overlay = overlay;
@@ -197,21 +216,35 @@ export class AppHost {
     this.hotkeyStop = stop;
   }
 
-  onHotkeyStart(): void {
-    if (this.automation.isRunning()) return;
-    if (IDLE_START_PAGES.includes(this.uiPage)) {
-      this.log(`热键 ${this.settings.hotkeyStart.toUpperCase()}：${this.uiPage === UI_HELP ? "使用说明" : "设置"}页不启动工艺`);
-      return;
+  async onHotkeyStart(): Promise<{ ok: boolean; error?: string }> {
+    try {
+      if (this.busy()) return ok();
+      if (IDLE_START_PAGES.includes(this.uiPage)) {
+        this.log(`热键 ${this.settings.hotkeyStart.toUpperCase()}：${this.uiPage === UI_HELP ? "使用说明" : "设置"}页不启动工艺`);
+        return ok();
+      }
+      const kind = this.resolveKind("");
+      this.log(`热键 ${this.settings.hotkeyStart.toUpperCase()}：开始（${kind === UI_GARDEN ? "花园工艺" : "普通工艺"}）`);
+      const result = await this.start(kind);
+      if (result && result.ok === false) {
+        this.notifyError("启动失败", String(result.error || "启动失败"));
+      }
+      return result;
+    } catch (e) {
+      const message = startErrorText(e);
+      this.notifyError("启动失败", message);
+      return err(message);
     }
-    const kind = this.resolveKind("");
-    this.log(`热键 ${this.settings.hotkeyStart.toUpperCase()}：开始（${kind === UI_GARDEN ? "花园工艺" : "普通工艺"}）`);
-    void this.start(kind);
   }
 
   onHotkeyStop(): void {
-    if (this.automation.isRunning()) {
-      this.automation.requestStop(StopReason.USER_STOP);
-      this.log(`热键 ${this.settings.hotkeyStop.toUpperCase()}：请求停止`);
+    try {
+      if (this.automation.isRunning()) {
+        this.automation.requestStop(StopReason.USER_STOP);
+        this.log(`热键 ${this.settings.hotkeyStop.toUpperCase()}：请求停止`);
+      }
+    } catch (e) {
+      console.error("[hotkey] stop fail:", e);
     }
   }
 
@@ -320,11 +353,15 @@ export class AppHost {
   }
 
   private push(): void {
-    this.pushFn?.(this.runtime());
+    try {
+      this.pushFn?.(this.runtime());
+    } catch {
+      /* 窗口已销毁时忽略 */
+    }
   }
 
   private busy(): boolean {
-    return this.automation.isRunning();
+    return this.automation.isRunning() || this.launchQueued;
   }
 
   async invoke(name: string, args: unknown[]): Promise<unknown> {
@@ -591,16 +628,29 @@ export class AppHost {
   }
 
   start(kind = "") {
-    if (this.busy()) return err("已在运行");
-    const resolved = this.applyKind(kind);
-    const [errors] = this.startCheck();
-    if (errors.length) return err(errors.join("\n"));
-    this.log(`启动${resolved === UI_GARDEN ? "花园工艺" : "普通工艺"}`);
     try {
-      return this.launch();
+      if (this.busy()) return err("已在运行");
+      const resolved = this.applyKind(kind);
+      const [errors] = this.startCheck();
+      if (errors.length) return err(errors.join("\n"));
+      this.log(`启动${resolved === UI_GARDEN ? "花园工艺" : "普通工艺"}`);
+      this.launchQueued = true;
+      setImmediate(() => this.beginLaunch());
+      return ok();
     } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      return err(/Invalid argument/i.test(msg) ? "未找到流放之路窗口" : msg);
+      this.launchQueued = false;
+      return err(startErrorText(e));
+    }
+  }
+
+  private beginLaunch(): void {
+    try {
+      const result = this.launch();
+      if (result && result.ok === false) this.notifyError("启动失败", String(result.error || "启动失败"));
+    } catch (e) {
+      this.notifyError("启动失败", startErrorText(e));
+    } finally {
+      this.launchQueued = false;
     }
   }
 
@@ -623,10 +673,10 @@ export class AppHost {
         [],
         [
           "请确认：",
-          "1. 游戏为窗口/无边框模式，背包或通货仓库页保持打开",
-          "2. 目标装备与流程会用到的通货都在当前画面可见",
+          "1. 游戏为窗口/无边框模式，仓库打开「非绑定 / 通用」通货页",
+          "2. 目标装备在画面中，流程通货在仓库固定格子里",
           "3. item_slot.png 截取的是目标装备本身",
-          `4. 流程使用通货: ${currencies}（图标已内置）`,
+          `4. 流程使用通货: ${currencies}（按仓库格坐标悬停后 Ctrl+C 核名）`,
           `5. 当前流程: ${workflow.name}  起始步骤: ${start.name}`,
           `6. 紧急停止热键: ${s.hotkeyStop.toUpperCase()}`,
           "\n第三方自动化可能违反游戏条款，风险自负。是否开始？",
@@ -652,52 +702,75 @@ export class AppHost {
   }
 
   private launch() {
-    const s = this.settings;
-    const workflow = s.craftMode === CraftMode.WORKFLOW ? this.library.active() : null;
-    saveSettings(s);
-    saveRuleset(this.ruleset, resolvePath(s.rulesFile));
-    if (workflow) {
-      s.workflowFile = "config/workflows.json";
-      saveLibrary(this.library, resolvePath(s.workflowFile));
-    }
-    this.log("正在切换到游戏窗口…");
-    let [win, focused] = focusGameWindow(s.windowTitleKeywords, 8);
-    if (!win) {
-      this.log("未找到流放之路窗口，已取消启动");
-      return err("未找到流放之路窗口");
-    }
-    let focusNote = "";
-    if (focused) this.log(`已切换到游戏: ${win.title}`);
-    else {
-      this.log(`已找到窗口但未能置前: ${win.title}，将继续启动并重试`);
-      const retry = focusGameWindow(s.windowTitleKeywords, 6);
-      if (retry[0]) win = retry[0];
-      if (retry[1]) this.log("重试后已切换到游戏窗口");
-      else {
-        this.log("仍可能未置前，点击/复制可能失败");
-        focusNote = "未能自动置前，请手动点一下游戏窗口。";
-      }
-    }
-    const cfg: AutomationConfig = {
-      settings: s,
-      ruleset: this.ruleset,
-      craftMode: s.craftMode,
-      craftPreset: s.craftPreset,
-      workflow,
-    };
     try {
+      console.log("[craft] launch began");
+      const s = this.settings;
+      const workflow = s.craftMode === CraftMode.WORKFLOW ? this.library.active() : null;
+      saveSettings(s);
+      saveRuleset(this.ruleset, resolvePath(s.rulesFile));
+      if (workflow) {
+        s.workflowFile = "config/workflows.json";
+        saveLibrary(this.library, resolvePath(s.workflowFile));
+      }
+      this.log("正在切换到游戏窗口…");
+      let win = null;
+      let focused = false;
+      try {
+        [win, focused] = focusGameWindow(s.windowTitleKeywords, 8);
+      } catch (e) {
+        return err(startErrorText(e));
+      }
+      if (!win) {
+        this.log("未找到流放之路窗口，已取消启动");
+        return err("未找到流放之路窗口");
+      }
+      let focusNote = "";
+      if (focused) this.log(`已切换到游戏: ${win.title}`);
+      else {
+        this.log(`已找到窗口但未能置前: ${win.title}，将继续启动并重试`);
+        try {
+          const retry = focusGameWindow(s.windowTitleKeywords, 6);
+          if (retry[0]) win = retry[0];
+          if (retry[1]) this.log("重试后已切换到游戏窗口");
+          else {
+            this.log("仍可能未置前，点击/复制可能失败");
+            focusNote = "未能自动置前，请手动点一下游戏窗口。";
+          }
+        } catch (e) {
+          this.log(`重试置前失败: ${startErrorText(e)}`);
+          focusNote = "未能自动置前，请手动点一下游戏窗口。";
+        }
+      }
+      const cfg: AutomationConfig = {
+        settings: s,
+        ruleset: this.ruleset,
+        craftMode: s.craftMode,
+        craftPreset: s.craftPreset,
+        workflow,
+      };
       this.wasRunning = true;
-      const { x, y } = { x: win.left + Math.floor((win.right - win.left) / 2), y: win.top + Math.floor((win.bottom - win.top) / 2) };
-      this.overlay?.resetRun();
-      this.overlay?.show({ x, y });
-      this.overlay?.addLine("▶ 开始匹配…", false);
       this.automation.start(cfg);
+      const { x, y } = {
+        x: win.left + Math.floor((win.right - win.left) / 2),
+        y: win.top + Math.floor((win.bottom - win.top) / 2),
+      };
+      try {
+        this.overlay?.resetRun();
+        this.overlay?.show({ x, y });
+        this.overlay?.addLine("▶ 开始匹配…", false);
+      } catch (e) {
+        console.error("[overlay] 显示失败，继续工艺:", e);
+      }
+      console.log("[craft] launch queued");
       return ok({ focus_warning: focusNote });
     } catch (e) {
       this.wasRunning = false;
-      this.overlay?.hide();
-      const msg = e instanceof Error ? e.message : String(e);
-      return err(/Invalid argument/i.test(msg) ? "未找到流放之路窗口" : msg);
+      try {
+        this.overlay?.hide();
+      } catch {
+        /* ignore */
+      }
+      return err(startErrorText(e));
     }
   }
 
@@ -827,13 +900,10 @@ export class AppHost {
   testTemplates() {
     if (this.templateTest.testing) return ok({ testing: true });
     const names = ["craft_button", "item_slot"];
-    for (const step of this.workflow.enabledSteps()) {
-      if (step.currencyTemplate && !names.includes(step.currencyTemplate)) names.push(step.currencyTemplate);
-    }
     const vision = new VisionService(this.settings.templatesDir, this.settings.templateThreshold);
     for (const fname of vision.listTemplates()) {
       const stem = path.parse(fname).name;
-      if (stem in CURRENCY_BY_TEMPLATE && !names.includes(stem)) continue;
+      if (stem in CURRENCY_BY_TEMPLATE) continue;
       if (!names.includes(stem)) names.push(stem);
     }
     this.templateTest = { status: "正在测试（请保持游戏窗口可见）…", color: "#f4a261", testing: true };

@@ -100,7 +100,7 @@ export const CURRENCIES: CurrencyDefinition[] = [
   },
   {
     key: "jewellers",
-    label: "珠宝匠之石",
+    label: "工匠石",
     templateName: "currency_jewellers",
     tradeId: "jewellers",
     officialName: "Jeweller's Orb",

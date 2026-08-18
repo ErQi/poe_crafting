@@ -1,4 +1,5 @@
 .venv/
+.electron-data/
 node_modules/
 web/node_modules/
 electron/dist/
@@ -11,6 +12,7 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+tmp_crops/
 *.log
 .DS_Store
 Thumbs.db

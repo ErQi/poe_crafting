@@ -28,7 +28,8 @@ import {
   type StopReasonValue,
 } from "./models";
 import { sleepMs, waitUntil } from "./timing";
-import { initVision, patchRmse, VisionError, VisionService, type MatchHit, type Mat } from "./vision";
+import { currencySlotCandidates } from "./stashGrid";
+import { initVision, patchRmse, VisionError, visionErrText, VisionService, type MatchHit, type Mat } from "./vision";
 import {
   evaluateStep,
   firstEnabledStep,
@@ -48,8 +49,6 @@ export interface AutomationConfig {
   workflow?: CraftWorkflow | null;
 }
 
-const WORKFLOW_CURRENCY_MAX_RMSE = 80;
-const WORKFLOW_CURRENCY_VERIFY_ATTEMPTS = 6;
 const LOCATE_CURRENCY_TRIES = 4;
 const COPY_TIMEOUT_MS = 280;
 const COPY_SLICE_MS = 40;
@@ -59,7 +58,6 @@ const APPLY_CONFIRM_TRIES = 3;
 const PUT_BACK_TRIES = 3;
 const HOLD_CHECK_MS = 80;
 const WINDOW_MOVE_PX = 12;
-const TOOLTIP_CLEAR_MS = 80;
 const CURSOR_ON_CURRENCY_RMSE = 18;
 const CURSOR_CONFIRM_TIMEOUT_MS = 280;
 
@@ -78,6 +76,17 @@ function hitClientRegion(hit: MatchHit): [number, number, number, number] {
 function hitCenterInRegion(hit: MatchHit, region: [number, number, number, number]): boolean {
   const [left, top, right, bottom] = region;
   return left <= hit.clientX && hit.clientX < right && top <= hit.clientY && hit.clientY < bottom;
+}
+
+function hitInWindow(hit: MatchHit, win: WindowInfo): boolean {
+  return (
+    Number.isFinite(hit.screenX) &&
+    Number.isFinite(hit.screenY) &&
+    hit.screenX >= win.left &&
+    hit.screenX < win.right &&
+    hit.screenY >= win.top &&
+    hit.screenY < win.bottom
+  );
 }
 
 function pointInHit(x: number, y: number, hit: MatchHit): boolean {
@@ -117,16 +126,6 @@ function currencyHitConflict(hit: MatchHit, other: MatchHit): boolean {
   return dx * dx + dy * dy < half * half;
 }
 
-function currencyCenterBand(win: WindowInfo): [number, number, number, number] | null {
-  const { width, height } = windowMetrics(win);
-  if (width <= 0 || height <= 0) return null;
-  const panelWidth = Math.min(width, Math.round(height * 0.68));
-  const left = panelWidth;
-  const right = width - panelWidth;
-  if (right <= left) return null;
-  return [left, 0, right, height];
-}
-
 function isCurrencyClipboardText(text: string): boolean {
   const raw = (text || "").trim();
   if (!raw || raw.includes("未找到物品") || raw.startsWith("http")) return false;
@@ -134,44 +133,8 @@ function isCurrencyClipboardText(text: string): boolean {
   return raw.includes("通货") || raw.includes("Currency");
 }
 
-function workflowCurrencyScales(win: WindowInfo, verifiedIconSize?: number, templateSize = 48): number[] {
-  if (verifiedIconSize && templateSize > 0) {
-    const measured = Math.max(0.25, verifiedIconSize / templateSize);
-    return [0.96, 1, 1.04].map((m) => Math.round(measured * m * 1000) / 1000);
-  }
-  const { height } = windowMetrics(win);
-  const base = Math.max(0.75, Math.min(3, height / 1080));
-  return [0.75, 0.875, 1, 1.125].map((m) => Math.round(base * m * 1000) / 1000);
-}
-
-function workflowCurrencyPanelExclusions(
-  win: WindowInfo,
-  verifiedHits: MatchHit[],
-): [[number, number, number, number][], string] {
-  const { width, height } = windowMetrics(win);
-  if (!verifiedHits.length || !width) return [[], "全屏"];
-  const midpoint = width / 2;
-  const onLeft = verifiedHits.map((h) => h.clientX < midpoint);
-  if (!onLeft.every(Boolean) && onLeft.some(Boolean)) return [[], "全屏"];
-  const panelWidth = Math.min(width, Math.round(height * 0.68));
-  if (onLeft.every(Boolean)) {
-    const panelRight = Math.max(panelWidth, Math.max(...verifiedHits.map((h) => h.clientX + h.width)));
-    if (panelRight >= width) return [[], "全屏"];
-    return [[[panelRight, 0, width, height]], "左侧面板"];
-  }
-  const panelLeft = Math.min(width - panelWidth, Math.min(...verifiedHits.map((h) => h.clientX - h.width)));
-  if (panelLeft <= 0) return [[], "全屏"];
-  return [[[0, 0, panelLeft, height]], "右侧面板"];
-}
-
 function shouldSkipAugmentation(step: CraftStep, item: Item): boolean {
   return step.currencyTemplate === "currency_augmentation" && item.craftAffixCount !== 1;
-}
-
-function median(values: number[]): number {
-  const s = [...values].sort((a, b) => a - b);
-  const mid = Math.floor(s.length / 2);
-  return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
 }
 
 export class CraftAutomation {
@@ -186,7 +149,7 @@ export class CraftAutomation {
   private currencyUseArmed = false;
   private itemUseClicked = false;
   private itemPointerPatch: Mat | null = null;
-  private itemPointerHandle: number | null = null;
+  private itemPointerHandle: bigint | null = null;
 
   constructor(onLog?: (m: string) => void, onStatus?: (s: RunStatus) => void) {
     this.onLog = onLog ?? (() => undefined);
@@ -242,6 +205,7 @@ export class CraftAutomation {
   }
 
   private async run(config: AutomationConfig): Promise<void> {
+    console.log("[craft] run began", config.craftMode);
     await initVision();
     const s = config.settings;
     const scales = config.craftMode === CraftMode.WORKFLOW ? [1, 0.9, 1.1, 0.8, 1.2] : [1];
@@ -333,10 +297,9 @@ export class CraftAutomation {
       this.finish(StopReason.ERROR, `流程配置无效：${errors.join("；")}`, 0, 0, 0);
       return;
     }
-    const required = ["item_slot", ...workflow.enabledSteps().map((st) => st.currencyTemplate).filter((n, i, a) => a.indexOf(n) === i)];
-    const missing = required.filter((n) => !fs.existsSync(vision.templatePath(n))).map(workflowAssetLabel);
-    if (missing.length) {
-      const msg = `多步骤流程缺少内置资源: ${missing.join(", ")}`;
+    const currencyNames = workflow.enabledSteps().map((st) => st.currencyTemplate).filter((n, i, a) => a.indexOf(n) === i);
+    if (!fs.existsSync(vision.templatePath("item_slot"))) {
+      const msg = `多步骤流程缺少内置资源: ${workflowAssetLabel("item_slot")}`;
       this.log(msg);
       this.finish(StopReason.TEMPLATE_NOT_FOUND, msg, 0, 0, 0);
       return;
@@ -351,6 +314,7 @@ export class CraftAutomation {
     this.log(`开始多步骤流程「${workflow.name}」 | 启用步骤=${workflow.enabledSteps().length} | 最大动作数=${s.maxAttempts}`);
     this.log("首次定位目标装备…");
     if (!(await this.locateWorkflowRequired(vision, win, s, ["item_slot"]))) return;
+    console.log("[craft] after first: locate done");
 
     let current = firstEnabledStep(workflow);
     if (!current) {
@@ -360,6 +324,7 @@ export class CraftAutomation {
 
     let parseFailures = 0;
     this.log("启动检查：正在悬停目标装备并按 Ctrl+C（不点击）…");
+    console.log("[craft] after first: read begin");
     let initialItem: Item | null = null;
     for (let readTry = 1; readTry <= s.maxParseFailures; readTry++) {
       try {
@@ -419,8 +384,9 @@ export class CraftAutomation {
       this.log(`启动后将从步骤「${current.name}」继续`);
     }
 
-    this.log("正在定位通货，并逐个悬停 Ctrl+C 核对中文名称…");
-    if (!(await this.locateAndVerifyCurrencies(vision, win, s, required.slice(1)))) {
+    this.log("正在按仓库通货格坐标定位，并逐个悬停 Ctrl+C 核对中文名称…");
+    console.log("[craft] after first: currency locate");
+    if (!(await this.locateAndVerifyCurrencies(vision, win, s, currencyNames))) {
       this.finish(StopReason.CURRENCY_UNAVAILABLE, "未找到数量可确认的流程通货，未执行任何通货点击", 0, 0, 0);
       return;
     }
@@ -429,7 +395,7 @@ export class CraftAutomation {
       await this.moveToHit(itemHit);
       if (this.captureItemPointerBaseline(vision)) this.log("已更新装备格普通指针基线");
     }
-    await this.runWorkflowLoop(vision, win, s, workflow, current, initialItem, required.slice(1));
+    await this.runWorkflowLoop(vision, win, s, workflow, current, initialItem, currencyNames);
   }
 
   private async runWorkflowLoop(
@@ -464,6 +430,7 @@ export class CraftAutomation {
       }
       step = live;
       const stepIndex = workflow.steps.indexOf(step) + 1;
+      console.log("[craft] after first: step", stepIndex, step.name);
       this.update({ attempt, workflowStepName: step.name, workflowStepIndex: stepIndex, message: `步骤 ${stepIndex}: ${step.name}` }, false);
       const t0 = Date.now();
       const actionPerformed = !shouldSkipAugmentation(step, item);
@@ -578,6 +545,7 @@ export class CraftAutomation {
     this.log(focused ? `已切换到游戏: ${win.title}` : `已定位窗口: ${win.title}（未完全置前，继续运行）`);
     this.log("首次定位模板坐标…");
     if (!(await this.locateRequired(vision, win, s))) return;
+    console.log("[craft] after first: locate done");
     let parseFailures = 0;
     let unchanged = 0;
     let lastRaw = "";
@@ -694,8 +662,11 @@ export class CraftAutomation {
   }
 
   private async locateWorkflowRequired(vision: VisionService, win: WindowInfo, s: AppSettings, names: string[]): Promise<boolean> {
-    const frame = vision.grabWindow(win);
+    console.log("[craft] grab begin", windowMetrics(win).width, "x", windowMetrics(win).height);
+    let frame: Mat | null = null;
     try {
+      frame = vision.grabWindow(win);
+      console.log("[craft] grab ok", frame.cols, "x", frame.rows);
       for (const name of names) {
         const hit = vision.matchInFrame(win, frame, name, s.templateThreshold);
         if (!hit) {
@@ -707,9 +678,22 @@ export class CraftAutomation {
         }
         this.log(`定位${workflowAssetLabel(name)} @(${hit.screenX},${hit.screenY}) score=${hit.score.toFixed(3)}`);
       }
+      console.log("[craft] first action ok");
       return true;
+    } catch (e) {
+      const msg = `截屏或识别失败: ${e instanceof Error ? e.message : String(e)}`;
+      console.error("[craft]", msg);
+      this.log(msg);
+      this.update({ running: false, stopReason: StopReason.ERROR, message: msg });
+      this.active = false;
+      return false;
     } finally {
-      frame.delete();
+      console.log("[craft] after first: frame delete", frame?.cols ?? 0, "x", frame?.rows ?? 0);
+      try {
+        frame?.delete();
+      } catch (e) {
+        console.error("[craft] after first: frame delete err", e);
+      }
     }
   }
 
@@ -728,7 +712,7 @@ export class CraftAutomation {
     for (const name of names) {
       const hit = await this.findVerifiedCurrency(vision, win, s, name, excluded);
       if (!hit) {
-        this.log(`未能通过 Ctrl+C 核对${currencyLabel(name)}，为避免误点已停止`);
+        this.log(`未找到${currencyLabel(name)}`);
         return false;
       }
       excluded.push(hitClientRegion(hit));
@@ -742,7 +726,7 @@ export class CraftAutomation {
     s: AppSettings,
     templateName: string,
     excluded: [number, number, number, number][],
-    allowItemSlot = false,
+    _allowItemSlot = false,
   ): Promise<MatchHit | null> {
     const expected = currencyLabel(templateName);
     for (let attempt = 1; attempt <= LOCATE_CURRENCY_TRIES; attempt++) {
@@ -750,17 +734,14 @@ export class CraftAutomation {
       vision.clearPositionCache(templateName);
       this.verifiedCurrency.delete(templateName);
       this.stackCounts.delete(templateName);
-      const park = this.safeParkHit(vision, undefined, allowItemSlot && !this.currencyUseArmed, !this.currencyUseArmed);
-      const frame = await this.grabFrameWithoutTooltip(vision, win, park);
-      if (!frame) return null;
       try {
-        const hit = await this.findAndVerifyInFrame(vision, win, s, templateName, frame, excluded);
+        const hit = await this.findAndVerifyInFrame(vision, win, s, templateName, excluded);
         if (hit) return hit;
-      } finally {
-        frame.delete();
+      } catch (e) {
+        this.log(`${expected}定位失败：${visionErrText(e)}`);
       }
       if (attempt < LOCATE_CURRENCY_TRIES) {
-        this.log(`未能核对${expected}（${attempt}/${LOCATE_CURRENCY_TRIES}），清缓存并重新截图后再试`);
+        this.log(`未能核对${expected}（${attempt}/${LOCATE_CURRENCY_TRIES}），请确认已打开「非绑定 / 通用」通货页后再试`);
       }
     }
     return null;
@@ -787,15 +768,6 @@ export class CraftAutomation {
     return null;
   }
 
-  private async grabFrameWithoutTooltip(vision: VisionService, win: WindowInfo, park?: MatchHit | null): Promise<Mat | null> {
-    if (park && !hitsClose(park, this.lastHoverHit)) {
-      await moveScreen(park.screenX, park.screenY, 20);
-      this.lastHoverHit = park;
-      if (await sleepMs(TOOLTIP_CLEAR_MS, () => this.shouldStop())) return null;
-    }
-    return vision.grabWindow(win);
-  }
-
   private conflictingCurrencyName(vision: VisionService, hit: MatchHit, templateName: string): string | null {
     for (const name of this.verifiedCurrency) {
       if (name === templateName) continue;
@@ -810,119 +782,58 @@ export class CraftAutomation {
     win: WindowInfo,
     s: AppSettings,
     templateName: string,
-    frame: Mat,
     baseExcluded: [number, number, number, number][],
   ): Promise<MatchHit | null> {
-    const rejected: [number, number, number, number][] = [];
     const expectedName = currencyLabel(templateName);
-    const verifiedHits = [...this.verifiedCurrency]
-      .map((n) => vision.getCachedPosition(n))
-      .filter((h): h is MatchHit => !!h);
     const itemHit = vision.getCachedPosition("item_slot");
     const itemRegion = itemHit ? hitClientRegion(itemHit) : null;
-    const centerBand = currencyCenterBand(win);
-    const uiExclusions: [number, number, number, number][] = centerBand ? [centerBand] : [];
-    let panelExclusions: [number, number, number, number][] = [];
-    let measuredSize = 0;
-    let phases: [string, number[], [number, number, number, number][], number][];
-    if (verifiedHits.length) {
-      measuredSize = median(verifiedHits.map((h) => h.width));
-      const templateWidth = vision.getTemplate(templateName).cols;
-      const calibrated = workflowCurrencyScales(win, measuredSize, templateWidth);
-      const [exclusions, panelLabel] = workflowCurrencyPanelExclusions(win, verifiedHits);
-      panelExclusions = exclusions;
-      this.log(`${expectedName}按本次画面动态校准：图标约 ${measuredSize}px，只搜${panelLabel}侧栏`);
-      phases = [["校准侧栏", calibrated, [...panelExclusions, ...uiExclusions], 4]];
-    } else {
-      phases = [["侧栏", workflowCurrencyScales(win), uiExclusions, WORKFLOW_CURRENCY_VERIFY_ATTEMPTS]];
+    const hits = currencySlotCandidates(win, templateName);
+    if (!hits.length) {
+      this.log(`没有${expectedName}的仓库格坐标，请打开「非绑定 / 通用」通货页`);
+      return null;
     }
     let verifyTry = 0;
-    const hitInUi = (hit: MatchHit): boolean => {
+    for (const hit of hits) {
+      if (this.shouldStop()) return null;
       if (itemRegion && hitCenterInRegion(hit, itemRegion)) {
-        this.log(`${expectedName}候选落在装备格内，不悬停`);
-        return false;
+        this.log(`${expectedName}格落在装备区域内，不悬停`);
+        continue;
       }
-      if (centerBand && hitCenterInRegion(hit, centerBand)) {
-        this.log(`${expectedName}候选 @(${hit.screenX},${hit.screenY}) 在窗口中心带，不悬停`);
-        return false;
-      }
+      if (baseExcluded.some((region) => hitCenterInRegion(hit, region))) continue;
       const other = this.conflictingCurrencyName(vision, hit, templateName);
       if (other) {
-        this.log(`${expectedName}候选与已核实${currencyLabel(other)}中心过近或重叠，排除`);
-        return false;
+        this.log(`${expectedName}格与已核实${currencyLabel(other)}重叠，排除`);
+        continue;
       }
-      return true;
-    };
-    const verifyHit = async (hit: MatchHit, phaseName: string): Promise<boolean> => {
-      if (!hitInUi(hit)) return false;
       verifyTry += 1;
-      const metric =
-        hit.featureMatches != null
-          ? `特征聚类=${hit.featureMatches}`
-          : `色差=${hit.colorRmse != null ? hit.colorRmse.toFixed(1) : "-"}`;
       this.log(
-        `${expectedName}候选 ${verifyTry}/${WORKFLOW_CURRENCY_VERIFY_ATTEMPTS} [${phaseName}] @(${hit.screenX},${hit.screenY}) 尺寸=${hit.width}x${hit.height} ${metric}，正在 Ctrl+C 核对…`,
+        `${expectedName}仓库格 ${verifyTry}/${hits.length} @(${hit.screenX},${hit.screenY})，正在 Ctrl+C 核对…`,
       );
       const copied = await this.copyHoveredText(hit, s);
       if (!copied) {
-        this.log(`候选未能复制到${expectedName}文本，将尝试其他位置`);
-        return false;
+        this.log(`该格未能复制到${expectedName}文本，将尝试相邻格`);
+        continue;
       }
       if (copied.includes(expectedName)) {
         const remaining = currencyStackCount(copied);
         if (remaining == null) {
-          this.log(`候选是${expectedName}，但未识别到堆叠数量；为避免误点已拒绝`);
-          return false;
+          this.log(`该格是${expectedName}，但未识别到堆叠数量；为避免误点已拒绝`);
+          continue;
         }
         if (remaining <= 0) {
           this.log(`${expectedName}堆叠数量为 0，已拒绝`);
-          return false;
+          continue;
         }
         vision.setCachedPosition(templateName, hit);
         this.verifiedCurrency.add(templateName);
         this.stackCounts.set(templateName, remaining);
         this.log(`已验证${expectedName} @(${hit.screenX},${hit.screenY}) | 剩余=${remaining}`);
-        return true;
+        return hit;
       }
       const observed = copied.split(/\r?\n/).map((l) => l.trim()).find(Boolean) || "未复制到物品文本";
-      this.log(`候选不是${expectedName}：${observed}`);
-      return false;
-    };
-
-    if (verifiedHits.length) {
-      try {
-        const features = vision.featureCandidatesInFrame(
-          win,
-          frame,
-          templateName,
-          Math.round(measuredSize),
-          [...baseExcluded, ...panelExclusions, ...uiExclusions],
-          4,
-        );
-        for (const hit of features) {
-          if (this.shouldStop()) return null;
-          if (await verifyHit(hit, "SIFT特征")) return hit;
-          rejected.push(hitClientRegion(hit));
-          if (verifyTry >= WORKFLOW_CURRENCY_VERIFY_ATTEMPTS) return null;
-        }
-      } catch (e) {
-        this.log(`${expectedName}特征定位不可用，转入颜色回退：${e}`);
-      }
+      this.log(`该格不是${expectedName}：${observed}`);
     }
-    for (const [phaseName, scales, phaseExclusions, budget] of phases) {
-      for (let i = 0; i < budget; i++) {
-        if (this.shouldStop()) return null;
-        const hit = vision.matchColorInFrame(win, frame, templateName, WORKFLOW_CURRENCY_MAX_RMSE, scales, [
-          ...baseExcluded,
-          ...rejected,
-          ...phaseExclusions,
-        ]);
-        if (!hit) break;
-        if (await verifyHit(hit, phaseName)) return hit;
-        rejected.push(hitClientRegion(hit));
-        if (verifyTry >= WORKFLOW_CURRENCY_VERIFY_ATTEMPTS) return null;
-      }
-    }
+    this.log(`未能在仓库通货格核到${expectedName}，请打开「非绑定 / 通用」通货页`);
     return null;
   }
 
@@ -1178,6 +1089,7 @@ export class CraftAutomation {
   }
 
   private async copyHoveredText(hit: MatchHit, s: AppSettings): Promise<string | null> {
+    console.log("[craft] copy: hover", hit.screenX, hit.screenY);
     await this.moveToHit(hit);
     return this.copyItemText(COPY_TIMEOUT_MS, "", false, true);
   }
@@ -1323,7 +1235,9 @@ export class CraftAutomation {
       this.log("未能停在已核实通货堆叠上，本轮不右键");
       return false;
     }
+    console.log("[craft] after first: click begin right currency");
     await clickScreen(stackHit.screenX, stackHit.screenY, CURSOR_MS, "right");
+    console.log("[craft] after first: click ok right currency");
     this.lastHoverHit = stackHit;
     return true;
   }
@@ -1365,7 +1279,9 @@ export class CraftAutomation {
       return false;
     };
     if (!(await waitUntil(holds, CURSOR_CONFIRM_TIMEOUT_MS, 20, () => this.shouldStop()))) return "like_pointer";
+    console.log("[craft] after first: click begin item_slot left");
     await this.clickItemSlotLeft(itemHit);
+    console.log("[craft] after first: click ok item_slot left");
     return "ok";
   }
 
@@ -1391,7 +1307,9 @@ export class CraftAutomation {
       this.log("item_slot 只能在使用或确认放回时左键，已拒绝通用点击");
       return false;
     }
+    console.log("[craft] after first: click begin", templateName, button);
     await clickScreen(hit.screenX, hit.screenY, 15, button);
+    console.log("[craft] after first: click ok", templateName);
     return true;
   }
 
@@ -1403,41 +1321,67 @@ export class CraftAutomation {
   ): Promise<string | null> {
     const stale = normalizeClipboardText(staleText);
     const rejectTexts = stale ? [stale] : [];
-    clearClipboard();
+    console.log("[craft] copy: clear clipboard");
+    try {
+      clearClipboard();
+    } catch (e) {
+      console.error("[craft] 复制失败", e);
+      throw new ItemParseError("复制失败");
+    }
     let previous = "";
     let found: string | null = null;
+    let logged = false;
+    let sendFailed = false;
     const deadline = Date.now() + Math.max(1, timeoutMs);
     const pred = async () => {
+      if (sendFailed) return false;
       const remain = deadline - Date.now();
       if (remain <= 0) return false;
-      hotkey("ctrl", "c");
-      const text = await waitClipboardChange(previous, Math.min(COPY_SLICE_MS, remain), COPY_POLL_MS, true, rejectTexts);
-      if (!text) return false;
-      if (requireCurrency) {
-        if (!isCurrencyClipboardText(text)) {
-          previous = normalizeClipboardText(text);
+      try {
+        if (!logged) console.log("[craft] copy: keydown");
+        if (!hotkey("ctrl", "c")) {
+          sendFailed = true;
+          console.error("[craft] 复制失败");
           return false;
         }
-      } else if (requireItem) {
-        if (!isEquipmentClipboardText(text)) {
-          previous = normalizeClipboardText(text);
-          return false;
+        if (!logged) {
+          console.log("[craft] copy: keyup");
+          console.log("[craft] copy: read clipboard");
+          logged = true;
         }
-        try {
-          const parsed = parseItemText(text);
-          if ((parsed.rarity === "魔法" || parsed.rarity === "稀有") && !parsed.affixes.length) {
+        const text = await waitClipboardChange(previous, Math.min(COPY_SLICE_MS, remain), COPY_POLL_MS, true, rejectTexts);
+        if (!text) return false;
+        if (requireCurrency) {
+          if (!isCurrencyClipboardText(text)) {
             previous = normalizeClipboardText(text);
             return false;
           }
-        } catch {
-          previous = normalizeClipboardText(text);
-          return false;
+        } else if (requireItem) {
+          if (!isEquipmentClipboardText(text)) {
+            previous = normalizeClipboardText(text);
+            return false;
+          }
+          try {
+            const parsed = parseItemText(text);
+            if ((parsed.rarity === "魔法" || parsed.rarity === "稀有") && !parsed.affixes.length) {
+              previous = normalizeClipboardText(text);
+              return false;
+            }
+          } catch {
+            previous = normalizeClipboardText(text);
+            return false;
+          }
         }
+        found = text;
+        return true;
+      } catch (e) {
+        sendFailed = true;
+        console.error("[craft] 复制失败", e);
+        return false;
       }
-      found = text;
-      return true;
     };
     if (await waitUntil(pred, timeoutMs, COPY_POLL_MS, () => this.shouldStop())) return found;
+    if (sendFailed) throw new ItemParseError("复制失败");
     return null;
   }
 
@@ -1455,14 +1399,18 @@ export class CraftAutomation {
       hit = vision.findInWindow(win, "item_slot", s.templateThreshold) ?? undefined;
     }
     if (!hit) throw new VisionError("未找到 item_slot.png（工艺槽物品区域）");
+    if (!hitInWindow(hit, win)) throw new VisionError("装备格坐标不在游戏窗口内");
+    console.log("[craft] copy: hover", hit.screenX, hit.screenY);
     if (!alreadyOnItem) await this.moveToHit(hit);
     else this.lastHoverHit = hit;
+    console.log("[craft] after first: copy begin");
     const text = await this.copyItemText(timeoutMs, staleText, true);
     if (!text) {
       throw new ItemParseError(
         staleText ? "未读到通货动作后的新物品文本" : "等待剪贴板超时，请确认鼠标悬停在物品上且复制键为 Ctrl+C",
       );
     }
+    console.log("[craft] after first: copy ok");
     const item = parseItemText(text);
     if ((item.rarity === "魔法" || item.rarity === "稀有") && !item.affixes.length) {
       throw new ItemParseError("物品词缀尚未刷新");
