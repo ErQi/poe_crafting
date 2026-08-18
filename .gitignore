@@ -12,6 +12,8 @@ __pycache__/
 .ruff_cache/
 dist/
 build/
+release/
+dist_electron/
 tmp_crops/
 *.log
 .DS_Store

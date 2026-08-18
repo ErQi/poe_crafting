@@ -1,20 +1,16 @@
 import fs from "fs";
 import path from "path";
 import { AppSettings, CraftWorkflow, RuleSet, WorkflowLibrary } from "./models";
+import { dataPath, setDataRoot } from "./paths";
 import { defaultLibrary } from "./workflow";
 
-let projectRootPath = "";
-
 export function setProjectRoot(root: string): void {
-  projectRootPath = root;
+  setDataRoot(root);
 }
 
-export function projectRoot(): string {
-  return projectRootPath || path.resolve(__dirname, "..", "..");
-}
-
+/** 配置、模板等可写资源统一走这里：开发时是项目目录，打包后是 userData */
 export function resolvePath(relative: string): string {
-  return path.isAbsolute(relative) ? relative : path.join(projectRoot(), relative);
+  return dataPath(relative);
 }
 
 export function loadJson(file: string, fallback: unknown): unknown {

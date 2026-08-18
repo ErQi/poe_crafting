@@ -2,20 +2,18 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { app, BrowserWindow, globalShortcut, ipcMain, screen, type IpcMainInvokeEvent } from "electron";
-import { setProjectRoot } from "./engine/configStore";
 import { AppHost } from "./engine/host";
 import { formatMatchOverlayLine } from "./engine/overlayFormat";
 import { RunStatus } from "./engine/models";
-
-const PROJECT_ROOT = path.resolve(__dirname, "..", "..");
-setProjectRoot(PROJECT_ROOT);
+import { bundlePath, seedUserData } from "./engine/paths";
 
 const DEV =
-  process.env.ELECTRON_DEV === "1" || process.env.POE_DEV === "1" || process.argv.includes("--dev");
+  !app.isPackaged &&
+  (process.env.ELECTRON_DEV === "1" || process.env.POE_DEV === "1" || process.argv.includes("--dev"));
 const DEV_URL = process.env.ELECTRON_START_URL || "http://127.0.0.1:5173";
 
 function resolveDevUserData(): string {
-  const local = path.join(PROJECT_ROOT, ".electron-data");
+  const local = bundlePath(".electron-data");
   try {
     fs.mkdirSync(local, { recursive: true });
     fs.accessSync(local, fs.constants.W_OK);
@@ -310,6 +308,7 @@ async function createMain(): Promise<void> {
   });
   console.log("[main] 窗口已创建");
   if (DEV) allowViteHmr(mainWindow);
+  for (const line of seedUserData()) console.log("[main]", line);
   host = new AppHost();
   host.attach((rt) => mainWindow?.webContents.send("poe-push", rt), overlayApi());
   host.bindHotkeys(registerHotkeys, registerHotkeys);
@@ -350,7 +349,7 @@ async function createMain(): Promise<void> {
     } else {
       console.log("[main] 生产模式加载 web/dist（npm start 不会自动刷新）");
       await Promise.race([
-        mainWindow.loadFile(path.join(__dirname, "..", "..", "web", "dist", "index.html")),
+        mainWindow.loadFile(bundlePath("web/dist/index.html")),
         timeout(15000, "页面加载"),
       ]);
     }

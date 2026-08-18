@@ -34,6 +34,7 @@ import {
   StopReason,
 } from "./models";
 import { formatCompletionOverlayLines, STOP_REASON_TEXT } from "./overlayFormat";
+import { dataRoot } from "./paths";
 import { initVision, VisionError, VisionService } from "./vision";
 import { TRANSITION_GOTO_PREFIX, TRANSITION_STOP, validateWorkflow } from "./workflow";
 
@@ -184,6 +185,7 @@ export class AppHost {
     }
     this.log("就绪。当前页决定启动哪套：花园工艺 / 普通工艺。");
     this.log(`当前流程: ${this.workflow.name}`);
+    this.log(`用户数据目录: ${dataRoot()}`);
     this.log(`模板目录: ${resolvePath(this.settings.templatesDir)}`);
     this.log(`开始热键: ${this.settings.hotkeyStart.toUpperCase()}  停止热键: ${this.settings.hotkeyStop.toUpperCase()}`);
   }

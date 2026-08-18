@@ -3,11 +3,14 @@
   "private": true,
   "version": "0.2.0",
   "description": "PoE1 自动工艺 — Electron",
+  "productName": "PoeCrafting",
+  "author": "poe-crafting",
   "main": "electron/dist/main.js",
   "scripts": {
     "build:electron": "node scripts/build-electron.cjs",
     "build:web": "npm run build --prefix web",
     "build": "npm run build:web && npm run build:electron",
+    "build:exe": "npm run build && electron-builder --win portable",
     "dev": "node scripts/dev.cjs",
     "start": "npm run build && electron .",
     "postinstall": "npm install --prefix web"
@@ -18,7 +21,46 @@
   },
   "devDependencies": {
     "electron": "^37.2.6",
+    "electron-builder": "^26.15.3",
     "esbuild": "^0.25.9",
     "typescript": "^5.9.2"
+  },
+  "build": {
+    "appId": "com.poe.crafting",
+    "directories": {
+      "output": "release"
+    },
+    "npmRebuild": false,
+    "asar": true,
+    "asarUnpack": [
+      "node_modules/koffi/**",
+      "node_modules/opencv-wasm/**"
+    ],
+    "files": [
+      "package.json",
+      "electron/dist/**/*",
+      "web/dist/**/*",
+      "config/*.json",
+      "assets/templates/*.png",
+      "assets/templates/README.txt",
+      "!node_modules/koffi/build/koffi/!(win32_x64)/**",
+      "!node_modules/koffi/build/koffi/win32_x64/*.{exp,lib}",
+      "!node_modules/koffi/{doc,lib,src,vendor}/**",
+      "!node_modules/opencv-wasm/{opencv-bin.js,opencv-deno.js,mod.ts}",
+      "!node_modules/opencv-wasm/types/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "PoeCrafting-${version}-portable.${ext}"
+    }
   }
 }
