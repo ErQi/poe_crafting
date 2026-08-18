@@ -1,4 +1,8 @@
 .venv/
+node_modules/
+web/node_modules/
+electron/dist/
+web/dist/
 __pycache__/
 *.py[cod]
 *.egg-info/

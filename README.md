@@ -1,6 +1,6 @@
 # PoE1 自动工艺
 
-Python 桌面工具：通过 **Ctrl+C 剪贴板** 读取简体中文装备词缀，用 **OpenCV 模板匹配** 执行园艺台单工艺或多步骤通货流程。
+Electron 桌面工具：通过 **Ctrl+C 剪贴板** 读取简体中文装备词缀，用 **OpenCV 模板匹配** 执行园艺台单工艺或多步骤通货流程。
 
 > 警告：自动化可能违反《流放之路》用户协议，存在封号等风险，请自行承担。本项目仅供学习交流。
 
@@ -18,28 +18,27 @@ Python 桌面工具：通过 **Ctrl+C 剪贴板** 读取简体中文装备词缀
   - 可拖成循环，例如“改造命中 → 富豪检查 → 失败重铸 → 回到蜕变”
 - 热键：默认 **F7** 开始、**F8** 停止；最大次数、连续解析失败、模板找不到、生命力不足模板、词缀连续无变化亦可停止
 - 通货防空点：定位时通过 `Ctrl+C` 核对名称和堆叠数量，本地递减；耗尽时在点击前自动停止
-- CustomTkinter GUI
+- Electron + Vue 界面（花园 / 普通 / 模板）
 
-## 环境
+## 启动
 
-- Windows（依赖 `pywin32` 找窗口 / 前台）
-- [uv](https://github.com/astral-sh/uv) + Python 3.11+ 推荐
-- 游戏建议：**窗口 / 无边框窗口**，不要用互斥全屏
-- 部分环境模拟键鼠或全局热键需要**以管理员身份**运行
+需要 **Node.js 18+** 与 Windows。游戏建议 **窗口 / 无边框**，不要用互斥全屏。部分环境模拟键鼠需要**以管理员身份**运行。
 
 ```powershell
 cd e:\projects\poe_crafting
-uv sync
-uv run python main.py
+npm install
+npm start
 ```
 
-测试：
+开发（Vite 热更新 + Electron）：
 
 ```powershell
-uv run python -m unittest tests/test_parser_matcher.py -v
+npm run dev
 ```
 
-（仍保留 `requirements.txt`，也可用 `uv pip install -r requirements.txt`。）
+`npm start` 会构建 `web/` 并用 `file://` 加载；`npm run dev` 加载 `http://127.0.0.1:5173`。
+
+旧的 `uv run python main.py` / pywebview 不再是正式入口。
 
 ## 自定义匹配图片
 
@@ -54,10 +53,8 @@ uv run python -m unittest tests/test_parser_matcher.py -v
 |------|------|
 | `craft_button.png` | **必需** 执行工艺按钮 |
 | `item_slot.png` | **必需** 目标装备本身（工艺槽或背包内，悬停后 Ctrl+C） |
-| `reforge.png` 等 | 预设模式：对应工艺条目（须在可见区域） |
-| `not_enough_lifeforce.png` | 可选：生命力/材料不足提示 |
 
-多步骤模式使用的常用通货图标已根据 [PoE 官方静态数据](https://www.pathofexile.com/api/trade/data/static) 内置，包括蜕变石、改造石、增幅石、富豪石、重铸石、崇高石和剥离石；无需自行截图。
+多步骤模式使用的基础通货图标已根据 [PoE 官方静态数据](https://www.pathofexile.com/api/trade/data/static) 内置（石头/卷轴，不含油、催化剂、精华、化石、碎片、命运卡）；无需自行截图。
 
 截取建议：
 
@@ -101,20 +98,17 @@ uv run python -m unittest tests/test_parser_matcher.py -v
 
 - `config/settings.json` — 延迟、次数、热键、窗口标题关键字、阈值等  
 - `config/rules.json` — 目标规则  
-- `config/workflow.json` — 多步骤通货流程
+- `config/workflows.json` — 多套通货流程（兼容旧的 `config/workflow.json`）
 
 ## 项目结构
 
 ```
-main.py
-config/
+package.json          npm start / npm run dev
+electron/             主进程、IPC、热键、浮窗
+  engine/             从 Python 迁来的工艺引擎
+web/                  Vue 界面（花园 / 普通 / 模板）
+config/               settings.json / rules.json / workflows.json
 assets/templates/
-src/
-  models.py item_parser.py matcher.py
-  vision.py input_control.py clipboard_util.py
-  automation.py hotkeys.py config_store.py
-  gui/app.py gui/widgets.py
-tests/
 ```
 
 ## 限制

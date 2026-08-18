@@ -1,0 +1,24 @@
+{
+  "name": "poe-crafting",
+  "private": true,
+  "version": "0.2.0",
+  "description": "PoE1 自动工艺 — Electron",
+  "main": "electron/dist/main.js",
+  "scripts": {
+    "build:electron": "node scripts/build-electron.cjs",
+    "build:web": "npm run build --prefix web",
+    "build": "npm run build:web && npm run build:electron",
+    "dev": "node scripts/dev.cjs",
+    "start": "npm run build && electron .",
+    "postinstall": "npm install --prefix web"
+  },
+  "dependencies": {
+    "koffi": "^2.11.0",
+    "opencv-wasm": "^4.3.0-10"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "esbuild": "^0.25.9",
+    "typescript": "^5.9.2"
+  }
+}

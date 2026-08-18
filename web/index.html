@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PoE1 自动工艺</title>
+    <style>
+      html, body, #app {
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        border-radius: 10px;
+        background: #12141a;
+        color: #e6e8ed;
+      }
+      .boot-splash {
+        height: 100%;
+        display: grid;
+        place-items: center;
+        font: 13px/1.45 "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+      }
+      .boot-splash b { font-size: 18px; letter-spacing: 0.06em; }
+      .boot-splash p { margin: 10px 0 0; color: #8d95a3; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div class="boot-splash">
+        <div>
+          <b>初始化中…</b>
+          <p>正在读取配置、加载识别库</p>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

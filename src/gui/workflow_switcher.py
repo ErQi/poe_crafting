@@ -3,27 +3,15 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 import customtkinter as ctk
-import tkinter as tk
 
 from ..models import WorkflowLibrary
-from .widgets import hide_while_rebuild
-
-BELT_RECIPE_HINT = (
-    "86+ 腰带：① 生命+抗性蓝 与 攻击元素+抗性蓝，两边点布琳霍克神力后去王城永火重组，双抗必留。"
-    "抗性不限火/冰/闪，T1 即可，之后再转换。"
-    "② 缺的前缀再做蓝装补，约 1/3 出 2前2后。"
-    "③ 督军底做 火伤%+已有前缀，约 1/2 出 3前2后。"
-    "④ 工台补空后缀。不要用腐母。"
-)
-
-CHIP_ON = "#1f6aa5"
-CHIP_OFF = "#2b2d30"
-CHIP_HOVER_ON = "#285f85"
-CHIP_HOVER_OFF = "#3d4043"
+from . import theme
+from .fonts import ui_font
+from .widgets import CompactMenu, HScroll
 
 
 class WorkflowSwitcher(ctk.CTkFrame):
-    """按分组展示流程芯片，点击即可切换。"""
+    """组下拉 + 当前组芯片单行，超出横向滚。"""
 
     def __init__(
         self,
@@ -34,81 +22,82 @@ class WorkflowSwitcher(ctk.CTkFrame):
         on_delete: Optional[Callable[[], None]] = None,
         **kwargs,
     ) -> None:
+        kwargs.setdefault("fg_color", theme.CARD)
+        kwargs.setdefault("corner_radius", theme.RADIUS)
+        kwargs.setdefault("border_width", 1)
+        kwargs.setdefault("border_color", theme.BORDER)
         super().__init__(master, **kwargs)
         self.on_select = on_select
         self.on_new = on_new
         self.on_duplicate = on_duplicate
         self.on_delete = on_delete
         self._library = WorkflowLibrary()
-        self._chips: dict[str, tk.Button] = {}
-        self._chip_ids: tuple[str, ...] = ()
+        self._chips: dict[str, ctk.CTkButton] = {}
+        self._chip_ids: tuple = ()
+        self._group_name = ""
         self._enabled = True
 
-        self.grid_columnconfigure(0, weight=1)
-        head = ctk.CTkFrame(self, fg_color="transparent")
-        head.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
+        self.grid_columnconfigure(2, weight=1)
         ctk.CTkLabel(
-            head,
-            text="快速切换流程",
-            font=ctk.CTkFont(size=14, weight="bold"),
-        ).pack(side="left")
-        ops = ctk.CTkFrame(head, fg_color="transparent")
-        ops.pack(side="right")
+            self, text="快速切换", font=ui_font(14, "bold"), text_color=theme.TEXT
+        ).grid(row=0, column=0, sticky="w", padx=(10, 8), pady=6)
+        self.group_menu = CompactMenu(self, values=["自定义"], command=self._on_group)
+        self.group_menu.configure(width=120)
+        self.group_menu.grid(row=0, column=1, sticky="w", padx=(0, 8), pady=6)
+        self.chip_scroll = HScroll(self, canvas_bg=theme.CARD)
+        self.chip_scroll.grid(row=0, column=2, sticky="ew", padx=(0, 8), pady=6)
+        self.chip_host = self.chip_scroll.inner
+
+        btns = ctk.CTkFrame(self, fg_color="transparent")
+        btns.grid(row=0, column=3, sticky="e", padx=(0, 10), pady=6)
         self.btn_new = ctk.CTkButton(
-            ops, text="新建", width=56, command=self._emit_new
+            btns, text="新建", width=52, height=28, command=self._emit_new
         )
-        self.btn_new.pack(side="left", padx=2)
+        self.btn_new.pack(side="left", padx=(0, 4))
         self.btn_dup = ctk.CTkButton(
-            ops, text="复制", width=56, command=self._emit_duplicate
+            btns, text="复制", width=52, height=28, command=self._emit_duplicate
         )
-        self.btn_dup.pack(side="left", padx=2)
+        self.btn_dup.pack(side="left", padx=4)
         self.btn_del = ctk.CTkButton(
-            ops,
+            btns,
             text="删除",
-            width=56,
-            fg_color="#8B3A3A",
+            width=52,
+            height=28,
             command=self._emit_delete,
+            **theme.BTN_DANGER,
         )
-        self.btn_del.pack(side="left", padx=2)
-
-        self.chip_host = ctk.CTkFrame(self, fg_color="transparent")
-        self.chip_host.grid(row=1, column=0, sticky="ew", padx=8, pady=2)
-        self.chip_host.grid_columnconfigure(0, weight=1)
-
-        self.desc_label = ctk.CTkLabel(
-            self,
-            text="",
-            text_color="#c5cdd8",
-            font=ctk.CTkFont(size=12),
-            anchor="w",
-            justify="left",
-            wraplength=980,
-        )
-        self.desc_label.grid(row=2, column=0, sticky="ew", padx=10, pady=(2, 0))
-
-        self.hint_label = ctk.CTkLabel(
-            self,
-            text=BELT_RECIPE_HINT,
-            text_color="gray",
-            font=ctk.CTkFont(size=11),
-            anchor="w",
-            justify="left",
-            wraplength=980,
-        )
-        self.hint_label.grid(row=3, column=0, sticky="ew", padx=10, pady=(0, 8))
+        self.btn_del.pack(side="left", padx=(4, 0))
 
     def set_library(self, library: WorkflowLibrary) -> None:
         self._library = library
-        ids = tuple(item.id for item in library.workflows)
-        if ids == self._chip_ids and self._chips:
+        ids = tuple((item.id, item.name, item.group) for item in library.workflows)
+        want = self._active_group()
+        if ids == self._chip_ids and self._chips and want == self._group_name:
             self._update_chips()
             return
         self._chip_ids = ids
+        self._group_name = want
         self._rebuild()
 
     def set_enabled(self, enabled: bool) -> None:
         self._enabled = enabled
         self._apply_enabled()
+
+    def _groups(self) -> list[str]:
+        return [name for name, _items in self._library.grouped()] or ["自定义"]
+
+    def _active_group(self) -> str:
+        workflow = self._library.get(self._library.active_id)
+        if workflow is not None:
+            return workflow.group.strip() or "自定义"
+        groups = self._groups()
+        return groups[0]
+
+    def _group_workflows(self):
+        for name, items in self._library.grouped():
+            if name == self._group_name:
+                return items
+        return []
 
     def _apply_enabled(self) -> None:
         state = "normal" if self._enabled else "disabled"
@@ -121,64 +110,42 @@ class WorkflowSwitcher(ctk.CTkFrame):
             workflow = self._library.get(workflow_id)
             if workflow is None:
                 continue
-            selected = workflow_id == active_id
-            button.configure(
-                text=workflow.name,
-                bg=CHIP_ON if selected else CHIP_OFF,
-                activebackground=CHIP_HOVER_ON if selected else CHIP_HOVER_OFF,
-            )
-        self._refresh_copy()
+            button.configure(text=workflow.name, width=theme.chip_width(workflow.name))
+            theme.style_chip(button, workflow_id == active_id)
         self._apply_enabled()
-
-    def _refresh_copy(self) -> None:
-        current = self._library.active()
-        self.desc_label.configure(text=current.description or current.name)
-        if current.group == "腰带重组":
-            self.hint_label.grid()
-        else:
-            self.hint_label.grid_remove()
+        self.after_idle(self.chip_scroll.sync)
 
     def _rebuild(self) -> None:
-        with hide_while_rebuild(self.chip_host):
-            for child in self.chip_host.winfo_children():
-                child.destroy()
-            self._chips.clear()
-            active_id = self._library.active_id
-            for row, (group, workflows) in enumerate(self._library.grouped()):
-                line = tk.Frame(self.chip_host, bg="#212121")
-                line.grid(row=row, column=0, sticky="ew", pady=2)
-                tk.Label(
-                    line,
-                    text=group,
-                    width=8,
-                    anchor="w",
-                    fg="#8a93a3",
-                    bg="#212121",
-                    font=("Microsoft YaHei UI", 9),
-                ).pack(side="left", padx=(0, 6))
-                for workflow in workflows:
-                    selected = workflow.id == active_id
-                    button = tk.Button(
-                        line,
-                        text=workflow.name,
-                        bg=CHIP_ON if selected else CHIP_OFF,
-                        fg="#f0f0f0",
-                        activebackground=(
-                            CHIP_HOVER_ON if selected else CHIP_HOVER_OFF
-                        ),
-                        activeforeground="#f0f0f0",
-                        relief="flat",
-                        bd=0,
-                        padx=8,
-                        pady=3,
-                        cursor="hand2",
-                        font=("Microsoft YaHei UI", 9),
-                        command=lambda wid=workflow.id: self._emit_select(wid),
-                    )
-                    button.pack(side="left", padx=3, pady=1)
-                    self._chips[workflow.id] = button
-        self._refresh_copy()
+        groups = self._groups()
+        if self._group_name not in groups:
+            self._group_name = groups[0]
+        self.group_menu.configure(values=groups)
+        self.group_menu.set(self._group_name)
+        self._rebuild_chips()
+
+    def _rebuild_chips(self) -> None:
+        for child in self.chip_host.winfo_children():
+            child.destroy()
+        self._chips.clear()
+        active_id = self._library.active_id
+        for workflow in self._group_workflows():
+            button = theme.make_chip(
+                self.chip_host,
+                workflow.name,
+                command=lambda wid=workflow.id: self._emit_select(wid),
+                selected=workflow.id == active_id,
+            )
+            button.pack(side="left", padx=(0, 6), pady=2)
+            self._chips[workflow.id] = button
         self._apply_enabled()
+        self.after_idle(self.chip_scroll.bind_wheel_tree, self.chip_host)
+        self.after_idle(self.chip_scroll.sync)
+
+    def _on_group(self, name: str) -> None:
+        if name == self._group_name:
+            return
+        self._group_name = name
+        self._rebuild_chips()
 
     def _emit_select(self, workflow_id: str) -> None:
         if not self._enabled or self.on_select is None:

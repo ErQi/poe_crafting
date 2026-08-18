@@ -1,0 +1,206 @@
+:root {
+  --page: #12141a;
+  --card: #1c1f26;
+  --raised: #252a33;
+  --input: #0e1014;
+  --row: #222730;
+  --row-sel: #2a3344;
+  --header: #1a1d24;
+  --border: #3a4150;
+  --border-lit: #5c6678;
+  --text: #e6e8ed;
+  --muted: #8d95a3;
+  --dim: #6b7380;
+  --accent: #1f6aa5;
+  --accent-hover: #2878b5;
+  --accent-border: #5eb0e0;
+  --ok: #2d6a4f;
+  --ok-hover: #1b4332;
+  --danger: #8b3a3a;
+  --danger-hover: #6a2828;
+  --ctrl-h: 32px;
+  --chip-h: 30px;
+  --radius: 8px;
+}
+
+* { box-sizing: border-box; }
+
+html, body, #app {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  border-radius: 10px;
+  background: var(--page);
+}
+
+html {
+  border: 1px solid var(--border);
+}
+
+html.is-max,
+html.is-max body,
+html.is-max #app {
+  border-radius: 0;
+}
+
+html.is-max {
+  border: 0;
+}
+
+body {
+  color: var(--text);
+  font: 13px/1.45 "Microsoft YaHei", "微软雅黑", "PingFang SC", sans-serif;
+}
+
+body::before {
+  content: "";
+  pointer-events: none;
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  opacity: 0.045;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button { cursor: pointer; }
+
+.card {
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.025), transparent 18px),
+    var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.raised {
+  background: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.ctrl, .select-face {
+  height: var(--ctrl-h);
+  background: var(--input);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 0 8px;
+  width: 100%;
+  box-shadow: inset 0 1px 0 rgba(0,0,0,0.35);
+}
+
+.ctrl:focus, .select-face:focus-within {
+  outline: none;
+  border-color: var(--border-lit);
+}
+
+.ctrl:disabled, .select.is-off .select-face {
+  opacity: 0.45;
+  cursor: default;
+}
+
+label.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+label.field > span,
+.field-name {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.btn {
+  height: var(--ctrl-h);
+  padding: 0 12px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #343b48;
+  color: var(--text);
+}
+
+.btn:hover:not(:disabled) { background: #3e4656; }
+.btn:disabled { opacity: 0.4; cursor: default; }
+
+.btn.ok {
+  background: var(--ok);
+  border-color: #3d8b68;
+}
+.btn.ok:hover:not(:disabled) { background: var(--ok-hover); }
+
+.btn.danger {
+  background: var(--danger);
+  border-color: #a34a4a;
+}
+.btn.danger:hover:not(:disabled) { background: var(--danger-hover); }
+
+.btn.ghost { background: #3a3a3a; }
+.btn.sq { width: 40px; padding: 0; }
+
+.chip {
+  height: var(--chip-h);
+  padding: 0 12px;
+  border-radius: 15px;
+  border: 1px solid var(--border-lit);
+  background: var(--raised);
+  color: var(--text);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.chip.on {
+  background: var(--accent);
+  border-color: var(--accent-border);
+  color: #fff;
+}
+
+.h {
+  font-weight: 700;
+  font-size: 14px;
+}
+
+.muted { color: var(--muted); }
+.tiny { font-size: 12px; color: var(--muted); }
+
+.check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text);
+  user-select: none;
+}
+.check input { accent-color: var(--accent); }
+
+.scroll {
+  overflow: auto;
+  min-height: 0;
+}
+.scroll::-webkit-scrollbar { width: 10px; height: 10px; }
+.scroll::-webkit-scrollbar-thumb {
+  background: #3a4150;
+  border-radius: 8px;
+}
+
+.hscroll {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  min-width: 0;
+  padding: 2px 0;
+}
+.hscroll::-webkit-scrollbar { height: 8px; }
+
+.log {
+  white-space: pre-wrap;
+  font-family: Consolas, "Cascadia Mono", "Microsoft YaHei", monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: #c8ccd4;
+}

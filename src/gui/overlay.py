@@ -7,6 +7,7 @@ import customtkinter as ctk  # type: ignore[import-untyped]
 
 from ..matcher import format_threshold_text
 from ..models import MatchMode, MatchResult, RunStatus, StopReason
+from .fonts import ui_font
 
 
 def _ignore_destroyed_widget(action: Callable[[], object]) -> None:
@@ -238,7 +239,7 @@ class FloatingMatchOverlay:
 
     def _line_font_cached(self) -> ctk.CTkFont:
         if self._line_font is None:
-            self._line_font = ctk.CTkFont(family="Microsoft YaHei UI", size=13)
+            self._line_font = ui_font()
         return self._line_font
 
     def _acquire_line(self, text: str, fg: str) -> dict | None:
@@ -320,7 +321,7 @@ class FloatingMatchOverlay:
             outer,
             text="匹配进度",
             anchor="e",
-            font=ctk.CTkFont(size=11),
+            font=ui_font(11),
             text_color="#7a8494",
         )
         head.pack(fill="x", padx=10, pady=(6, 0))

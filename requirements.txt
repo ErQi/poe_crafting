@@ -7,3 +7,4 @@ pydirectinput>=1.0.4
 pyperclip>=1.8.2
 pynput>=1.7.6
 pywin32>=306
+pywebview>=5.0.0

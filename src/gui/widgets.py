@@ -6,14 +6,12 @@ from typing import Callable, Iterator, Optional
 
 import customtkinter as ctk
 import tkinter as tk
-import tkinter.ttk as ttk
 from PIL import Image
 from tkinter import messagebox, simpledialog
 
 from ..config_store import resolve_path
 from ..matcher import format_threshold_text, normalize_operator, parse_threshold_text
 from ..models import (
-    CRAFT_PRESET_LABELS,
     MatchMode,
     MatchRule,
     RuleGroup,
@@ -26,14 +24,10 @@ from ..template_io import (
     save_template_image,
     thumbnail_fit,
 )
-
+from .fonts import tk_ui_font, ui_font
+from . import theme
 
 OPS = ["", ">=", ">", "<=", "<", "="]
-_ROW_BG = "#2b2b2b"
-_ROW_SEL = "#3a4556"
-_ENTRY_BG = "#1e1e1e"
-_ENTRY_FG = "#e8e8e8"
-_TTK_READY = False
 
 
 @contextmanager
@@ -48,7 +42,7 @@ def hide_while_rebuild(widget) -> Iterator[None]:
     if (
         not info
         or widget is toplevel
-        or widget.__class__.__name__ == "CTkScrollableFrame"
+        or widget.__class__.__name__ in {"CTkScrollableFrame", "VScroll"}
     ):
         yield
         return
@@ -66,47 +60,423 @@ def hide_while_rebuild(widget) -> Iterator[None]:
                 pass
 
 
-def _ensure_ttk_style(root) -> None:
-    global _TTK_READY
-    if _TTK_READY:
-        return
-    style = ttk.Style(root)
-    try:
-        style.theme_use("clam")
-    except tk.TclError:
-        pass
-    style.configure(
-        "Craft.TCombobox",
-        fieldbackground=_ENTRY_BG,
-        background=_ROW_BG,
-        foreground=_ENTRY_FG,
-        arrowcolor=_ENTRY_FG,
-    )
-    _TTK_READY = True
+class CompactMenu(tk.Frame):
+    """与 padded_entry 同高同边的紧凑下拉，替代窄条 CTkOptionMenu / ttk.Combobox。"""
+
+    def __init__(self, master, values=(), command=None, **kwargs):
+        super().__init__(
+            master,
+            bg=theme.INPUT,
+            highlightbackground=theme.BORDER,
+            highlightcolor=theme.BORDER_LIT,
+            highlightthickness=1,
+            height=theme.CONTROL_H,
+        )
+        self.pack_propagate(False)
+        self._values = [str(v) for v in values]
+        self._command = command
+        self._value = self._values[0] if self._values else ""
+        self._label = tk.Label(
+            self,
+            text=self._value,
+            bg=theme.INPUT,
+            fg=theme.TEXT,
+            font=tk_ui_font(12),
+            anchor="w",
+        )
+        self._arrow = tk.Label(
+            self,
+            text="▾",
+            bg=theme.INPUT,
+            fg=theme.MUTED,
+            font=tk_ui_font(13),
+            width=2,
+        )
+        self._arrow.pack(side="right", fill="y", padx=(2, 6))
+        self._label.pack(side="left", fill="both", expand=True, padx=(8, 4))
+        for widget in (self, self._label, self._arrow):
+            widget.bind("<Button-1>", self._open)
+            widget.bind("<Enter>", lambda _e: self._glow(True))
+            widget.bind("<Leave>", lambda _e: self._glow(False))
+
+    def _glow(self, on: bool) -> None:
+        super().configure(highlightbackground=theme.BORDER_LIT if on else theme.BORDER)
+
+    def _open(self, _event=None) -> str:
+        menu = tk.Menu(
+            self,
+            tearoff=0,
+            bg=theme.RAISED,
+            fg=theme.TEXT,
+            activebackground=theme.ACCENT,
+            activeforeground="#ffffff",
+            font=tk_ui_font(12),
+            relief="flat",
+            bd=1,
+        )
+        for value in self._values:
+            menu.add_command(label=value or " ", command=lambda v=value: self._pick(v))
+        try:
+            menu.tk_popup(self.winfo_rootx(), self.winfo_rooty() + self.winfo_height())
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _pick(self, value: str) -> None:
+        self.set(value)
+        if self._command:
+            self._command(value)
+
+    def set(self, value: str) -> None:
+        self._value = "" if value is None else str(value)
+        self._label.configure(text=self._value)
+
+    def get(self) -> str:
+        return self._value
+
+    def configure(self, cnf=None, **kwargs):
+        if isinstance(cnf, dict):
+            kwargs = {**cnf, **kwargs}
+        elif cnf:
+            return super().configure(cnf)
+        values = kwargs.pop("values", None)
+        command = kwargs.pop("command", None)
+        if values is not None:
+            self._values = [str(v) for v in values]
+        if command is not None:
+            self._command = command
+        if kwargs:
+            super().configure(**kwargs)
+
+    config = configure
 
 
-def _tk_entry(parent, width: int, value: str = "") -> tk.Entry:
-    entry = tk.Entry(
-        parent,
-        width=width,
-        bg=_ENTRY_BG,
-        fg=_ENTRY_FG,
-        insertbackground=_ENTRY_FG,
-        relief="flat",
-        highlightthickness=1,
-        highlightbackground="#3a3a3a",
-    )
-    if value:
-        entry.insert(0, value)
-    return entry
+class WrapFlow(ctk.CTkFrame):
+    """按容器宽度换行；子控件自带宽高，reflow 只改坐标。"""
+
+    def __init__(self, master, gap: int = 6, **kwargs):
+        kwargs.setdefault("fg_color", "transparent")
+        super().__init__(master, **kwargs)
+        self._gap = gap
+        self._items: list[tuple] = []
+        self._last_w = 0
+        self._after = None
+        self._busy = False
+        self.configure(height=theme.CHIP_H)
+        self.grid_propagate(False)
+        self.bind("<Configure>", self._on_cfg)
+
+    def add(self, widget, width: int, height: int | None = None) -> None:
+        h = height or theme.CHIP_H
+        widget.configure(width=width, height=h)
+        self._items.append((widget, width, h))
+
+    def reflow(self) -> None:
+        self._last_w = 0
+        self._reflow(self.winfo_width())
+
+    def _on_cfg(self, _event=None) -> None:
+        if self._busy:
+            return
+        if self._after is not None:
+            self.after_cancel(self._after)
+        self._after = self.after(40, self._reflow_now)
+
+    def _reflow_now(self) -> None:
+        self._after = None
+        self._reflow(self.winfo_width())
+
+    def _item_size(self, widget, req_w: int, req_h: int) -> tuple[int, int]:
+        try:
+            w, h = widget.cget("width"), widget.cget("height")
+            return int(w or req_w), int(h or req_h)
+        except (tk.TclError, TypeError, ValueError):
+            return req_w, req_h
+
+    def _reflow(self, width: int) -> None:
+        if width < 8:
+            return
+        if self._last_w and abs(width - self._last_w) < 2:
+            return
+        self._last_w = width
+        x = y = row_h = 0
+        gap = self._gap
+        for widget, req_w, req_h in self._items:
+            req_w, req_h = self._item_size(widget, req_w, req_h)
+            if x and x + req_w > width:
+                x = 0
+                y += row_h + gap
+                row_h = 0
+            widget.place(x=x, y=y)
+            x += req_w + gap
+            row_h = max(row_h, req_h)
+        self._set_h(y + row_h if self._items else 1)
+
+    def _set_h(self, height: int) -> None:
+        self._busy = True
+        try:
+            self.configure(height=max(int(height), 1))
+        finally:
+            self._busy = False
+
+
+class VScroll(ctk.CTkFrame):
+    """内部垂直滚动。max_height 有值则高度随内容封顶，否则填满父级。"""
+
+    def __init__(
+        self,
+        master,
+        max_height: int | None = None,
+        canvas_bg: str | None = None,
+        **kwargs,
+    ):
+        kwargs.setdefault("fg_color", "transparent")
+        super().__init__(master, **kwargs)
+        self._max_h = max_height
+        self._busy = False
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+        if max_height is None:
+            self.grid_propagate(False)
+        bg = canvas_bg or theme.PAGE
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=bg)
+        if max_height is not None:
+            self._canvas.configure(height=1)
+        self._vsb = ctk.CTkScrollbar(
+            self, orientation="vertical", command=self._canvas.yview, width=12
+        )
+        self._canvas.configure(yscrollcommand=self._vsb.set)
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        self.inner = ctk.CTkFrame(self._canvas, fg_color="transparent")
+        self._win = self._canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner)
+        self._canvas.bind("<Configure>", self._on_canvas)
+        self.bind_wheel(self._canvas)
+        self.bind_wheel(self.inner)
+
+    def bind_wheel(self, widget) -> None:
+        widget.bind("<MouseWheel>", self._on_wheel)
+
+    def bind_wheel_tree(self, widget) -> None:
+        self.bind_wheel(widget)
+        for child in widget.winfo_children():
+            self.bind_wheel_tree(child)
+
+    def sync(self) -> None:
+        self._sync()
+
+    def _on_wheel(self, event) -> str:
+        self._canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_inner(self, _event=None) -> None:
+        if not self._busy:
+            self._sync()
+
+    def _on_canvas(self, event) -> None:
+        if not self._busy and event.widget is self._canvas:
+            self._sync()
+
+    def _sync(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            cw = max(self._canvas.winfo_width(), 1)
+            ch = max(self._canvas.winfo_height(), 1)
+            self.inner.update_idletasks()
+            req_h = max(self.inner.winfo_reqheight(), 1)
+            if self._max_h is not None:
+                view_h = min(req_h, self._max_h)
+                if int(self._canvas.cget("height") or 0) != view_h:
+                    self._canvas.configure(height=view_h)
+                self._canvas.itemconfigure(self._win, width=cw)
+                self._canvas.configure(scrollregion=(0, 0, cw, req_h))
+                self._toggle_bar(req_h > self._max_h + 1)
+            else:
+                h = max(ch, req_h)
+                self._canvas.itemconfigure(self._win, width=cw, height=h)
+                self._canvas.configure(scrollregion=(0, 0, cw, h))
+                self._toggle_bar(req_h > ch + 1)
+        finally:
+            self._busy = False
+
+    def _toggle_bar(self, need: bool) -> None:
+        if need:
+            self._vsb.grid(row=0, column=1, sticky="ns")
+        else:
+            self._vsb.grid_remove()
+
+
+class HScroll(ctk.CTkFrame):
+    """单行横向滚动。高度随芯片，超出用滚轮或右侧 ›。"""
+
+    def __init__(self, master, canvas_bg: str | None = None, **kwargs):
+        kwargs.setdefault("fg_color", "transparent")
+        super().__init__(master, **kwargs)
+        self._busy = False
+        bg = canvas_bg or theme.CARD
+        h = theme.CHIP_H + 4
+        self.grid_columnconfigure(0, weight=1)
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=bg, height=h)
+        self._canvas.grid(row=0, column=0, sticky="ew")
+        self._more = tk.Label(
+            self, text="›", bg=bg, fg=theme.MUTED, font=tk_ui_font(16), cursor="hand2"
+        )
+        self._more.bind("<Button-1>", lambda _e: self._canvas.xview_scroll(3, "units"))
+        self.inner = ctk.CTkFrame(self._canvas, fg_color="transparent")
+        self._win = self._canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind("<Configure>", self._on_inner)
+        self._canvas.bind("<Configure>", self._on_canvas)
+        self.bind_wheel(self._canvas)
+        self.bind_wheel(self.inner)
+
+    def bind_wheel(self, widget) -> None:
+        widget.bind("<MouseWheel>", self._on_wheel)
+
+    def bind_wheel_tree(self, widget) -> None:
+        self.bind_wheel(widget)
+        for child in widget.winfo_children():
+            self.bind_wheel_tree(child)
+
+    def sync(self) -> None:
+        self._sync()
+
+    def _on_wheel(self, event) -> str:
+        self._canvas.xview_scroll(int(-1 * (event.delta / 120)), "units")
+        return "break"
+
+    def _on_inner(self, _event=None) -> None:
+        if not self._busy:
+            self._sync()
+
+    def _on_canvas(self, event) -> None:
+        if not self._busy and event.widget is self._canvas:
+            self._sync()
+
+    def _sync(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            self.inner.update_idletasks()
+            req_w = max(self.inner.winfo_reqwidth(), 1)
+            req_h = max(self.inner.winfo_reqheight(), theme.CHIP_H)
+            cw = max(self._canvas.winfo_width(), 1)
+            self._canvas.itemconfigure(self._win, height=req_h)
+            self._canvas.configure(scrollregion=(0, 0, req_w, req_h))
+            if req_w > cw + 2:
+                self._more.grid(row=0, column=1, padx=(4, 0))
+            else:
+                self._more.grid_remove()
+        finally:
+            self._busy = False
+
+
+class RuleTable(ctk.CTkFrame):
+    """表头与行同一套 grid 列；窄窗可横向滚。"""
+
+    def __init__(self, master, **kwargs):
+        kwargs.setdefault("fg_color", theme.CARD)
+        kwargs.setdefault("corner_radius", 6)
+        super().__init__(master, **kwargs)
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(0, weight=1)
+
+        self._canvas = tk.Canvas(self, highlightthickness=0, bd=0, bg=theme.CARD)
+        self._vsb = ctk.CTkScrollbar(
+            self, orientation="vertical", command=self._canvas.yview, width=12
+        )
+        self._hsb = ctk.CTkScrollbar(
+            self, orientation="horizontal", command=self._canvas.xview, height=12
+        )
+        self._canvas.configure(
+            yscrollcommand=self._vsb.set, xscrollcommand=self._hsb.set
+        )
+        self._canvas.grid(row=0, column=0, sticky="nsew")
+        self._vsb.grid(row=0, column=1, sticky="ns")
+
+        self.inner = tk.Frame(self._canvas, bg=theme.CARD)
+        theme.apply_rule_cols(self.inner)
+        self._win = self._canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self._inner_w = 0
+        self.inner.bind("<Configure>", self._on_inner)
+        self._canvas.bind("<Configure>", self._on_canvas)
+        self._bind_wheel(self._canvas)
+        self._bind_wheel(self.inner)
+
+    def reset(self) -> None:
+        for child in self.inner.winfo_children():
+            child.destroy()
+        theme.apply_rule_cols(self.inner)
+        for i, text in enumerate(("启用", "包含文本", "算子", "阈值", "备注")):
+            cell = tk.Frame(self.inner, bg=theme.HEADER)
+            cell.grid(
+                row=0, column=i, sticky="nsew", padx=theme.RULE_PADS[i], pady=(4, 6)
+            )
+            tk.Label(
+                cell,
+                text=text,
+                bg=theme.HEADER,
+                fg=theme.MUTED,
+                font=tk_ui_font(12),
+                anchor="center" if i == 0 else "w",
+            ).pack(fill="both", expand=True, padx=2, pady=7)
+            self._bind_wheel(cell)
+
+    def cell(self, row: int, col: int, bg: str) -> tk.Frame:
+        box = tk.Frame(self.inner, bg=bg)
+        box.grid(
+            row=row, column=col, sticky="nsew", padx=theme.RULE_PADS[col], pady=(0, 5)
+        )
+        self._bind_wheel(box)
+        return box
+
+    def empty(self, text: str) -> None:
+        tk.Label(
+            self.inner,
+            text=text,
+            fg=theme.MUTED,
+            bg=theme.CARD,
+            justify="center",
+            font=tk_ui_font(12),
+        ).grid(row=1, column=0, columnspan=5, sticky="ew", pady=24)
+
+    def _on_inner(self, _event=None) -> None:
+        self._canvas.configure(scrollregion=self._canvas.bbox("all"))
+        self._sync_hscroll()
+
+    def _on_canvas(self, event) -> None:
+        inner_w = max(event.width, theme.RULE_MIN_W)
+        if inner_w != self._inner_w:
+            self._inner_w = inner_w
+            self._canvas.itemconfigure(self._win, width=inner_w)
+        self._sync_hscroll()
+
+    def _sync_hscroll(self) -> None:
+        bbox = self._canvas.bbox("all")
+        canvas_w = self._canvas.winfo_width()
+        need_x = bool(bbox and bbox[2] > canvas_w + 2)
+        if need_x:
+            self._hsb.grid(row=1, column=0, sticky="ew")
+        else:
+            self._hsb.grid_remove()
+
+    def _bind_wheel(self, widget) -> None:
+        widget.bind("<MouseWheel>", self._on_wheel)
+
+    def _on_wheel(self, event) -> str:
+        steps = int(-1 * (event.delta / 120))
+        if event.state & 0x1:
+            self._canvas.xview_scroll(steps, "units")
+        else:
+            self._canvas.yview_scroll(steps, "units")
+        return "break"
 
 TEMPLATE_SLOT_DEFS: list[tuple[str, str, bool]] = [
     ("craft_button", "执行工艺按钮", True),
     ("item_slot", "目标装备位置（工艺槽/背包）", True),
-    ("not_enough_lifeforce", "生命力不足提示", False),
 ]
-for _k, _label in CRAFT_PRESET_LABELS.items():
-    TEMPLATE_SLOT_DEFS.append((_k, f"预设 · {_label}", False))
 
 
 def _mode_label(mode: str) -> str:
@@ -128,139 +498,116 @@ class RuleSetEditor(ctk.CTkFrame):
         on_change: Optional[Callable[[RuleSet], None]] = None,
         **kwargs,
     ) -> None:
+        kwargs.setdefault("fg_color", "transparent")
         super().__init__(master, **kwargs)
         self.on_change = on_change
         self._ruleset = RuleSet(groups=[RuleGroup(name="规则组 1")])
         self._selected_group = 0
         self._selected_rule: Optional[int] = None
         self._rule_rows: list[dict] = []
+        self._group_chips: list[ctk.CTkButton] = []
+        self._tools_wide: bool | None = None
 
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
-        # 组间逻辑
         top = ctk.CTkFrame(self, fg_color="transparent")
-        top.grid(row=0, column=0, sticky="ew", padx=4, pady=(4, 2))
-        ctk.CTkLabel(top, text="组间逻辑:").pack(side="left")
-        self.group_combine_menu = ctk.CTkSegmentedButton(
+        top.grid(row=0, column=0, sticky="ew", padx=2, pady=(2, 4))
+        ctk.CTkLabel(top, text="组间", font=ui_font(12), text_color=theme.MUTED).pack(
+            side="left"
+        )
+        self.group_combine_menu = CompactMenu(
             top,
             values=["AND (全部)", "OR (任一)"],
             command=self._on_group_combine,
         )
+        self.group_combine_menu.configure(width=118)
         self.group_combine_menu.pack(side="left", padx=8)
         self.group_combine_menu.set("AND (全部)")
-        ctk.CTkLabel(
-            top,
-            text="组间 AND=每组都要满足；OR=任一组满足即可",
-            text_color="gray",
-            font=ctk.CTkFont(size=11),
-        ).pack(side="left", padx=8)
-
-        # 组列表 + 操作
-        mid = ctk.CTkFrame(self, fg_color="transparent")
-        mid.grid(row=1, column=0, sticky="ew", padx=4, pady=4)
-        mid.grid_columnconfigure(0, weight=1)
-
-        self.group_list = ctk.CTkSegmentedButton(
-            mid, values=["规则组 1"], command=self._on_select_group_label
-        )
-        self.group_list.grid(row=0, column=0, sticky="ew", padx=(0, 8))
-
-        gbtns = ctk.CTkFrame(mid, fg_color="transparent")
-        gbtns.grid(row=0, column=1, sticky="e")
-        ctk.CTkButton(gbtns, text="加组", width=56, command=self._add_group).pack(
-            side="left", padx=2
+        gbtns = ctk.CTkFrame(top, fg_color="transparent")
+        gbtns.pack(side="right")
+        ctk.CTkButton(gbtns, text="加组", width=52, height=28, command=self._add_group).pack(
+            side="left", padx=(0, 4)
         )
         ctk.CTkButton(
-            gbtns, text="删组", width=56, fg_color="#8B3A3A", command=self._del_group
-        ).pack(side="left", padx=2)
+            gbtns, text="删组", width=52, height=28, command=self._del_group, **theme.BTN_DANGER
+        ).pack(side="left", padx=(0, 4))
         ctk.CTkButton(
-            gbtns, text="改名", width=56, fg_color="#3a3a3a", command=self._rename_group
-        ).pack(side="left", padx=2)
+            gbtns, text="改名", width=52, height=28, command=self._rename_group, **theme.BTN_MUTED
+        ).pack(side="left")
+        self.group_chip_scroll = HScroll(top)
+        self.group_chip_scroll.pack(side="left", fill="x", expand=True, padx=8)
+        self.chip_host = self.group_chip_scroll.inner
 
-        # 当前组详情
-        body = ctk.CTkFrame(self)
-        body.grid(row=2, column=0, sticky="nsew", padx=4, pady=4)
+        body = theme.surface(self)
+        body.grid(row=1, column=0, sticky="nsew", padx=2, pady=2)
         body.grid_columnconfigure(0, weight=1)
-        body.grid_rowconfigure(2, weight=1)
+        body.grid_rowconfigure(1, weight=1)
 
-        ghead = ctk.CTkFrame(body, fg_color="transparent")
-        ghead.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        self.group_title = ctk.CTkLabel(
-            ghead, text="规则组 1", font=ctk.CTkFont(weight="bold")
-        )
-        self.group_title.pack(side="left")
+        tools = ctk.CTkFrame(body, fg_color="transparent")
+        tools.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
+        self._tools = tools
         self.group_enabled = tk.BooleanVar(value=True)
-        ctk.CTkCheckBox(
-            ghead,
+        self._en_box = ctk.CTkCheckBox(
+            tools,
             text="启用本组",
             variable=self.group_enabled,
             command=self._on_group_enabled,
-        ).pack(side="left", padx=12)
-        ctk.CTkLabel(ghead, text="组内逻辑:").pack(side="left", padx=(12, 4))
-        self.inner_combine_menu = ctk.CTkSegmentedButton(
-            ghead,
+            font=ui_font(12),
+        )
+        self._inner_lbl = ctk.CTkLabel(
+            tools, text="组内", font=ui_font(12), text_color=theme.MUTED
+        )
+        self.inner_combine_menu = CompactMenu(
+            tools,
             values=["AND (全部)", "OR (任一)"],
             command=self._on_inner_combine,
         )
-        self.inner_combine_menu.pack(side="left")
+        self.inner_combine_menu.configure(width=118)
         self.inner_combine_menu.set("AND (全部)")
-        ctk.CTkLabel(ghead, text="至少匹配").pack(side="left", padx=(12, 4))
-        self.min_matches_entry = ctk.CTkEntry(
-            ghead, width=44, placeholder_text="空=逻辑"
+        self._min_lbl = ctk.CTkLabel(
+            tools, text="至少匹配", font=ui_font(12), text_color=theme.MUTED
         )
-        self.min_matches_entry.pack(side="left")
+        self.min_matches_entry = ctk.CTkEntry(tools, width=44, placeholder_text="空")
         self.min_matches_entry.bind(
             "<FocusOut>", lambda _e: self._on_min_matches_change()
         )
-        ctk.CTkLabel(
-            ghead, text="条", text_color="gray", font=ctk.CTkFont(size=11)
-        ).pack(side="left", padx=(2, 0))
+        self._min_unit = ctk.CTkLabel(
+            tools, text="条", font=ui_font(12), text_color=theme.MUTED
+        )
+        self._layout_tools(wide=True)
+        tools.bind("<Configure>", self._on_tools_cfg)
 
-        header = ctk.CTkFrame(body, fg_color="transparent")
-        header.grid(row=1, column=0, sticky="ew", padx=8, pady=2)
-        for text, w in (
-            ("启用", 40),
-            ("包含文本(可多词)", 170),
-            ("算子", 60),
-            ("阈值(可6-12)", 90),
-            ("备注", 100),
-        ):
-            ctk.CTkLabel(header, text=text, width=w, anchor="w").pack(
-                side="left", padx=2
-            )
+        self.table = RuleTable(body)
+        self.table.grid(row=1, column=0, sticky="nsew", padx=8, pady=2)
 
-        self.list_host = ctk.CTkScrollableFrame(body, height=160)
-        self.list_host.grid(row=2, column=0, sticky="nsew", padx=6, pady=4)
-
-        # 组内条件操作（放在列表下方，避免找不到）
         rule_ops = ctk.CTkFrame(body, fg_color="transparent")
-        rule_ops.grid(row=3, column=0, sticky="ew", padx=8, pady=(4, 2))
+        rule_ops.grid(row=2, column=0, sticky="ew", padx=8, pady=(6, 2))
         ctk.CTkButton(
             rule_ops,
-            text="+ 添加词缀条件",
-            width=130,
+            text="+ 添加条件",
+            width=100,
+            height=30,
             command=self.add_rule,
-            fg_color="#2d6a4f",
-            hover_color="#1b4332",
-        ).pack(side="left", padx=(0, 8))
+            **theme.BTN_OK,
+        ).pack(side="left", padx=(0, 6))
         ctk.CTkButton(
             rule_ops,
-            text="删除选中条件",
-            width=110,
+            text="删除选中",
+            width=88,
+            height=30,
             command=self.delete_selected,
-            fg_color="#8B3A3A",
-            hover_color="#6a2828",
+            **theme.BTN_DANGER,
         ).pack(side="left")
 
-        tip = ctk.CTkLabel(
+        tip = theme.muted(
             body,
-            text="至少匹配填数字则本组命中N条即可；包含文本可用空格/逗号写多关键字，如：攻击附加 冰霜伤害",
-            text_color="gray",
-            font=ctk.CTkFont(size=11),
-            anchor="w",
+            "数字=本组命中 N 条即可。文本可用空格/逗号写多关键字。",
+            wraplength=400,
         )
-        tip.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 6))
+        tip.grid(row=3, column=0, sticky="ew", padx=8, pady=(0, 8))
+        theme.bind_wrap(tip, body, pad=24)
+        self._refresh_group_tabs()
 
     # ---- public ----
     def set_ruleset(self, ruleset: RuleSet) -> None:
@@ -336,32 +683,69 @@ class RuleSetEditor(ctk.CTkFrame):
             labels.append(f"{mark}{g.name}[{logic}]"[:18])
         if not labels:
             labels = ["规则组 1"]
-        # SegmentedButton 需要重建 values
-        try:
-            self.group_list.configure(values=labels)
-        except Exception:
-            pass
-        sel = labels[min(self._selected_group, len(labels) - 1)]
-        try:
-            self.group_list.set(sel)
-        except Exception:
-            pass
+        for child in self.chip_host.winfo_children():
+            child.destroy()
+        self._group_chips.clear()
+        for i, label in enumerate(labels):
+            button = theme.make_chip(
+                self.chip_host,
+                label,
+                command=lambda idx=i: self._on_select_group_index(idx),
+                selected=i == self._selected_group,
+            )
+            button.pack(side="left", padx=(0, 6), pady=2)
+            self._group_chips.append(button)
         self.group_combine_menu.set(_mode_label(self._ruleset.group_combine))
+        self.after_idle(self.group_chip_scroll.bind_wheel_tree, self.chip_host)
+        self.after_idle(self.group_chip_scroll.sync)
 
-    def _on_select_group_label(self, label: str) -> None:
+    def _on_select_group_index(self, idx: int) -> None:
+        if idx == self._selected_group:
+            return
         self._sync_current_group_from_ui()
-        labels = list(self.group_list.cget("values"))
-        try:
-            idx = labels.index(label)
-        except ValueError:
-            idx = 0
         self._selected_group = idx
         self._selected_rule = None
         self._load_current_group_to_ui()
+        for i, button in enumerate(self._group_chips):
+            theme.style_chip(button, i == idx)
+
+    def _on_tools_cfg(self, event) -> None:
+        if event.widget is not self._tools:
+            return
+        self._layout_tools(wide=event.width >= 560)
+
+    def _layout_tools(self, wide: bool) -> None:
+        if wide == self._tools_wide:
+            return
+        self._tools_wide = wide
+        for widget in (
+            self._en_box,
+            self._inner_lbl,
+            self.inner_combine_menu,
+            self._min_lbl,
+            self.min_matches_entry,
+            self._min_unit,
+        ):
+            widget.grid_forget()
+        tools = self._tools
+        if wide:
+            tools.grid_columnconfigure(2, weight=0)
+            self._en_box.grid(row=0, column=0, sticky="w", padx=(0, 10))
+            self._inner_lbl.grid(row=0, column=1, sticky="w", padx=(0, 6))
+            self.inner_combine_menu.grid(row=0, column=2, sticky="w", padx=(0, 12))
+            self._min_lbl.grid(row=0, column=3, sticky="w", padx=(0, 6))
+            self.min_matches_entry.grid(row=0, column=4, sticky="w")
+            self._min_unit.grid(row=0, column=5, sticky="w", padx=(4, 0))
+        else:
+            self._en_box.grid(row=0, column=0, sticky="w")
+            self._inner_lbl.grid(row=0, column=1, sticky="w", padx=(8, 6))
+            self.inner_combine_menu.grid(row=0, column=2, sticky="w")
+            self._min_lbl.grid(row=1, column=0, sticky="w", pady=(6, 0))
+            self.min_matches_entry.grid(row=1, column=1, sticky="w", pady=(6, 0))
+            self._min_unit.grid(row=1, column=2, sticky="w", padx=(4, 0), pady=(6, 0))
 
     def _load_current_group_to_ui(self) -> None:
         g = self._current_group()
-        self.group_title.configure(text=g.name)
         self.group_enabled.set(g.enabled)
         self.inner_combine_menu.set(_mode_label(g.combine))
         self.min_matches_entry.delete(0, "end")
@@ -456,92 +840,94 @@ class RuleSetEditor(ctk.CTkFrame):
         name = name.strip() or g.name
         g.name = name
         self._refresh_group_tabs()
-        self.group_title.configure(text=g.name)
         self._emit()
+
+    def _paint_row(self, row: dict, selected: bool) -> None:
+        bg = theme.ROW_SEL if selected else theme.ROW
+        for widget in row.get("bg", []):
+            try:
+                widget.configure(bg=bg)
+                if isinstance(widget, tk.Checkbutton):
+                    widget.configure(activebackground=bg, selectcolor=theme.INPUT)
+            except tk.TclError:
+                pass
 
     def _select_rule(self, idx: int) -> None:
         self._selected_rule = idx
         for i, row in enumerate(self._rule_rows):
-            try:
-                row["frame"].configure(bg=_ROW_SEL if i == idx else _ROW_BG)
-            except Exception:
-                pass
+            self._paint_row(row, i == idx)
 
     def _rebuild_rules(self) -> None:
-        _ensure_ttk_style(self)
-        with hide_while_rebuild(self.list_host):
-            for child in self.list_host.winfo_children():
-                child.destroy()
+        with hide_while_rebuild(self.table):
+            self.table.reset()
             self._rule_rows.clear()
             g = self._current_group()
             if not g.rules:
-                tk.Label(
-                    self.list_host,
-                    text="本组还没有词缀条件\n点击下方「+ 添加词缀条件」",
-                    fg="#8a8a8a",
-                    bg=_ROW_BG,
-                    justify="center",
-                ).pack(expand=True, pady=24)
-                return
-            op_values = ["(无)"] + [o for o in OPS if o]
-            for idx, rule in enumerate(g.rules):
-                frame = tk.Frame(self.list_host, bg=_ROW_BG)
-                frame.pack(fill="x", pady=2)
-                frame.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
+                self.table.empty("本组还没有词缀条件\n点击下方「+ 添加条件」")
+            else:
+                self._fill_rule_rows(g)
 
-                en_var = tk.BooleanVar(value=rule.enabled)
-                tk.Checkbutton(
-                    frame,
-                    text="",
-                    variable=en_var,
-                    command=self._emit,
-                    bg=_ROW_BG,
-                    activebackground=_ROW_BG,
-                    selectcolor=_ENTRY_BG,
-                    fg=_ENTRY_FG,
-                    activeforeground=_ENTRY_FG,
-                    highlightthickness=0,
-                    bd=0,
-                ).pack(side="left", padx=2)
+        self.after_idle(self.table._on_inner)
 
-                pattern = _tk_entry(frame, 22, rule.pattern)
-                pattern.pack(side="left", padx=2)
-                pattern.bind("<FocusOut>", lambda _e: self._emit())
-                pattern.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
+    def _fill_rule_rows(self, g: RuleGroup) -> None:
+        op_values = ["(无)"] + [o for o in OPS if o]
+        for idx, rule in enumerate(g.rules):
+            r = idx + 1
+            selected = idx == self._selected_rule
+            bg = theme.ROW_SEL if selected else theme.ROW
+            cells = [self.table.cell(r, col, bg) for col in range(5)]
+            for cell in cells:
+                cell.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
 
-                op_menu = ttk.Combobox(
-                    frame,
-                    values=op_values,
-                    width=5,
-                    state="readonly",
-                    style="Craft.TCombobox",
-                )
-                cur_op = (
-                    rule.operator if rule.operator in OPS and rule.operator else "(无)"
-                )
-                op_menu.set(cur_op)
-                op_menu.pack(side="left", padx=2)
-                op_menu.bind("<<ComboboxSelected>>", lambda _e: self._emit())
+            en_var = tk.BooleanVar(value=rule.enabled)
+            check = tk.Checkbutton(
+                cells[0],
+                text="",
+                variable=en_var,
+                command=self._emit,
+                bg=bg,
+                activebackground=bg,
+                selectcolor=theme.INPUT,
+                fg=theme.TEXT,
+                activeforeground=theme.TEXT,
+                highlightthickness=0,
+                bd=0,
+                width=1,
+            )
+            check.pack(anchor="center", pady=8)
+            self.table._bind_wheel(check)
 
-                formatted = format_threshold_text(rule.threshold, rule.threshold2)
-                thr = _tk_entry(frame, 12, formatted)
-                thr.pack(side="left", padx=2)
-                thr.bind("<FocusOut>", lambda _e: self._emit())
+            pat_box, pattern = theme.padded_entry(cells[1], rule.pattern)
+            pat_box.pack(fill="x", expand=True, padx=0, pady=5)
+            pattern.bind("<FocusOut>", lambda _e: self._emit())
+            pattern.bind("<Button-1>", lambda _e, i=idx: self._select_rule(i))
 
-                note = _tk_entry(frame, 16, rule.note)
-                note.pack(side="left", padx=2, fill="x", expand=True)
-                note.bind("<FocusOut>", lambda _e: self._emit())
+            op_menu = CompactMenu(
+                cells[2], values=op_values, command=lambda _v: self._emit()
+            )
+            cur_op = rule.operator if rule.operator in OPS and rule.operator else "(无)"
+            op_menu.set(cur_op)
+            op_menu.pack(fill="x", expand=True, pady=5)
 
-                self._rule_rows.append(
-                    {
-                        "frame": frame,
-                        "enabled": en_var,
-                        "pattern": pattern,
-                        "op": op_menu,
-                        "threshold": thr,
-                        "note": note,
-                    }
-                )
+            formatted = format_threshold_text(rule.threshold, rule.threshold2)
+            thr_box, thr = theme.padded_entry(cells[3], formatted)
+            thr_box.pack(fill="x", expand=True, pady=5)
+            thr.bind("<FocusOut>", lambda _e: self._emit())
+
+            note_box, note = theme.padded_entry(cells[4], rule.note)
+            note_box.pack(fill="x", expand=True, pady=5)
+            note.bind("<FocusOut>", lambda _e: self._emit())
+
+            self._rule_rows.append(
+                {
+                    "enabled": en_var,
+                    "pattern": pattern,
+                    "op": op_menu,
+                    "threshold": thr,
+                    "note": note,
+                    "bg": [*cells, check],
+                }
+            )
 
 
 # 兼容旧名称
@@ -601,7 +987,7 @@ class TemplatePastePanel(ctk.CTkFrame):
         ctk.CTkLabel(
             head,
             text="模板配置",
-            font=ctk.CTkFont(size=16, weight="bold"),
+            font=ui_font(16, "bold"),
         ).pack(side="left")
         ctk.CTkLabel(
             head,
@@ -615,7 +1001,7 @@ class TemplatePastePanel(ctk.CTkFrame):
         left.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            left, text="剪贴板预览", anchor="w", font=ctk.CTkFont(weight="bold")
+            left, text="剪贴板预览", anchor="w", font=ui_font(13, "bold")
         ).grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
 
         self.pending_label = ctk.CTkLabel(
@@ -666,7 +1052,7 @@ class TemplatePastePanel(ctk.CTkFrame):
             left,
             text="输入框内 Ctrl+V 仍粘贴文字。\n保存会覆盖同名 png。\n单击右侧卡片可选中保存目标。",
             text_color="gray",
-            font=ctk.CTkFont(size=11),
+            font=ui_font(12),
             anchor="w",
             justify="left",
         )
@@ -679,7 +1065,7 @@ class TemplatePastePanel(ctk.CTkFrame):
         right.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(
-            right, text="已保存模板", anchor="w", font=ctk.CTkFont(weight="bold")
+            right, text="已保存模板", anchor="w", font=ui_font(13, "bold")
         ).grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         self.slots_host = ctk.CTkScrollableFrame(right)
         self.slots_host.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 12))
@@ -848,7 +1234,7 @@ class TemplatePastePanel(ctk.CTkFrame):
                 card,
                 text=title,
                 anchor="w",
-                font=ctk.CTkFont(size=13, weight="bold"),
+                font=ui_font(13, "bold"),
             )
             title_lbl.grid(row=0, column=1, sticky="ew", padx=(0, 10), pady=(10, 0))
 
@@ -857,7 +1243,7 @@ class TemplatePastePanel(ctk.CTkFrame):
                 text=status_text,
                 anchor="w",
                 text_color=status_color,
-                font=ctk.CTkFont(size=12),
+                font=ui_font(12),
             )
             st.grid(row=1, column=1, sticky="ew", padx=(0, 10), pady=(2, 10))
 

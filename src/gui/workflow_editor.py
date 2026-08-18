@@ -15,7 +15,9 @@ from ..workflow import (
     TRANSITION_REPEAT,
     TRANSITION_STOP,
 )
-from .widgets import RuleSetEditor, hide_while_rebuild
+from . import theme
+from .fonts import ui_font
+from .widgets import CompactMenu, RuleSetEditor, VScroll, hide_while_rebuild
 
 RARITY_LABEL_TO_VALUE = {
     "不校验": "",
@@ -28,6 +30,50 @@ RARITY_VALUE_TO_LABEL = {value: label for label, value in RARITY_LABEL_TO_VALUE.
 CURRENCY_LABELS = [currency.label for currency in CURRENCIES]
 
 
+def _clip(text: str, limit: int = 18) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+class _StepCard(ctk.CTkFrame):
+    def __init__(self, master, **kwargs):
+        super().__init__(
+            master,
+            corner_radius=8,
+            border_width=1,
+            height=theme.STEP_CARD_H,
+            **kwargs,
+        )
+        self.grid_propagate(False)
+        self.grid_columnconfigure(2, weight=1)
+        self._bar = ctk.CTkFrame(self, width=4, corner_radius=2, fg_color=theme.BORDER)
+        self._bar.grid(row=0, column=0, sticky="ns", padx=(10, 8), pady=12)
+        self._idx = ctk.CTkLabel(
+            self, width=22, text_color=theme.MUTED, font=ui_font(12)
+        )
+        self._idx.grid(row=0, column=1, padx=(0, 8), pady=12)
+        self._name = ctk.CTkLabel(self, anchor="w", font=ui_font(13), text_color=theme.TEXT)
+        self._name.grid(row=0, column=2, sticky="ew", padx=(0, 12), pady=12)
+        self._command = None
+        for widget in (self, self._bar, self._idx, self._name):
+            widget.bind("<Button-1>", self._click)
+
+    def set(self, index: int, name: str, enabled: bool, selected: bool, command) -> None:
+        self._command = command
+        self._idx.configure(text=str(index + 1))
+        label = _clip(name) + ("" if enabled else "  停用")
+        self._name.configure(text=label, text_color=theme.TEXT if enabled else theme.MUTED)
+        if selected:
+            self.configure(fg_color=theme.ROW_SEL, border_color=theme.ACCENT_BORDER)
+            self._bar.configure(fg_color=theme.ACCENT)
+        else:
+            self.configure(fg_color=theme.RAISED, border_color=theme.BORDER)
+            self._bar.configure(fg_color=theme.BORDER)
+
+    def _click(self, _event=None) -> None:
+        if self._command:
+            self._command()
+
+
 class WorkflowEditor(ctk.CTkFrame):
     """多步骤流程编辑器：动作、后置条件和两个分支去向。"""
 
@@ -37,12 +83,17 @@ class WorkflowEditor(ctk.CTkFrame):
         on_change: Optional[Callable[[CraftWorkflow], None]] = None,
         **kwargs,
     ) -> None:
+        kwargs.setdefault("fg_color", "transparent")
         super().__init__(master, **kwargs)
         self.on_change = on_change
         self._workflow = CraftWorkflow()
         self._selected_index = 0
         self._loading = False
-        self._step_buttons: list[tk.Button] = []
+        self._step_cards: list[_StepCard] = []
+        self._info_stack: bool | None = None
+        self._fields_stack: bool | None = None
+        self._info_after = None
+        self._fields_after = None
         self._transition_label_to_value: dict[str, str] = {}
         self._transition_value_to_label: dict[str, str] = {}
         self._start_label_to_id: dict[str, str] = {}
@@ -53,193 +104,218 @@ class WorkflowEditor(ctk.CTkFrame):
         self._build()
 
     def _build(self) -> None:
-        top = ctk.CTkFrame(self)
-        top.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        top.grid_columnconfigure(1, weight=1)
-        top.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(
-            top,
-            text="流程名称",
-            font=ctk.CTkFont(weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=(10, 6), pady=8)
-        self.workflow_name_entry = ctk.CTkEntry(top)
-        self.workflow_name_entry.grid(
-            row=0, column=1, sticky="ew", padx=(0, 14), pady=8
+        self._info = theme.surface(self)
+        self._info.grid(row=0, column=0, sticky="ew", padx=0, pady=(0, 6))
+        self._info.grid_columnconfigure(0, weight=2, minsize=160)
+        self._info.grid_columnconfigure(1, weight=2, minsize=200)
+        self._info.grid_columnconfigure(2, weight=3, minsize=160)
+        self._i_name = theme.field_block(self._info, "流程名")
+        self.workflow_name_entry = ctk.CTkEntry(
+            self._i_name, height=theme.CONTROL_H, fg_color=theme.INPUT
         )
+        self.workflow_name_entry.pack(fill="x")
         self.workflow_name_entry.bind("<FocusOut>", self._on_header_changed)
         self.workflow_name_entry.bind("<Return>", self._on_header_changed)
 
-        ctk.CTkLabel(top, text="说明").grid(
-            row=1, column=0, sticky="w", padx=(10, 6), pady=(0, 8)
+        self._i_start = theme.field_block(self._info, "起始步骤")
+        self.start_step_menu = CompactMenu(
+            self._i_start, values=["(无步骤)"], command=self._on_start_changed
         )
-        self.workflow_desc_entry = ctk.CTkEntry(top)
-        self.workflow_desc_entry.grid(
-            row=1, column=1, columnspan=3, sticky="ew", padx=(0, 10), pady=(0, 8)
+        self.start_step_menu.pack(fill="x")
+
+        self._i_desc = theme.field_block(self._info, "说明")
+        self.workflow_desc_entry = ctk.CTkEntry(
+            self._i_desc, height=theme.CONTROL_H, fg_color=theme.INPUT
         )
+        self.workflow_desc_entry.pack(fill="x")
         self.workflow_desc_entry.bind("<FocusOut>", self._on_header_changed)
         self.workflow_desc_entry.bind("<Return>", self._on_header_changed)
+        self._layout_info(False)
+        self._info.bind("<Configure>", self._on_info_cfg)
 
-        ctk.CTkLabel(top, text="起始步骤").grid(
-            row=0, column=2, sticky="w", padx=(0, 6), pady=8
+        self._exec = ctk.CTkFrame(self, fg_color="transparent")
+        self._exec.grid(row=1, column=0, sticky="nsew")
+        self._exec.grid_columnconfigure(0, minsize=220, weight=0)
+        self._exec.grid_columnconfigure(1, weight=1)
+        self._exec.grid_rowconfigure(0, weight=1)
+
+        self.left = theme.surface(self._exec)
+        self.left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        self.left.grid_columnconfigure(0, weight=1)
+        self.left.grid_rowconfigure(1, weight=1, minsize=160)
+        theme.heading(self.left, "执行步骤", 14).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 4)
         )
-        self.start_step_menu = ctk.CTkOptionMenu(
-            top,
-            values=["(无步骤)"],
-            command=self._on_start_changed,
-            dynamic_resizing=False,
-        )
-        self.start_step_menu.grid(row=0, column=3, sticky="ew", padx=(0, 10), pady=8)
-
-        body = ctk.CTkFrame(self, fg_color="transparent")
-        body.grid(row=1, column=0, sticky="nsew", padx=8, pady=(4, 8))
-        body.grid_columnconfigure(0, weight=0, minsize=260)
-        body.grid_columnconfigure(1, weight=1)
-        body.grid_rowconfigure(0, weight=1)
-
-        left = ctk.CTkFrame(body)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
-        left.grid_columnconfigure(0, weight=1)
-        left.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(
-            left,
-            text="执行步骤",
-            font=ctk.CTkFont(size=15, weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=10, pady=(10, 4))
-        self.step_list = ctk.CTkScrollableFrame(left, width=236)
-        self.step_list.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self.step_scroll = VScroll(self.left, canvas_bg=theme.PAGE)
+        self.step_scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=4)
+        self.step_list = self.step_scroll.inner
         self.step_list.grid_columnconfigure(0, weight=1)
 
-        step_ops = ctk.CTkFrame(left, fg_color="transparent")
+        step_ops = ctk.CTkFrame(self.left, fg_color="transparent")
         step_ops.grid(row=2, column=0, sticky="ew", padx=8, pady=(4, 8))
         for column in range(4):
             step_ops.grid_columnconfigure(column, weight=1)
+        ctk.CTkButton(step_ops, text="+", width=40, height=30, command=self._add_step, **theme.BTN_OK).grid(
+            row=0, column=0, sticky="ew", padx=2
+        )
         ctk.CTkButton(
-            step_ops,
-            text="+",
-            width=48,
-            command=self._add_step,
-            fg_color="#2d6a4f",
-        ).grid(row=0, column=0, sticky="ew", padx=2)
-        ctk.CTkButton(
-            step_ops,
-            text="−",
-            width=48,
-            command=self._delete_step,
-            fg_color="#8B3A3A",
+            step_ops, text="−", width=40, height=30, command=self._delete_step, **theme.BTN_DANGER
         ).grid(row=0, column=1, sticky="ew", padx=2)
-        ctk.CTkButton(step_ops, text="↑", width=48, command=self._move_up).grid(
+        ctk.CTkButton(step_ops, text="↑", width=40, height=30, command=self._move_up).grid(
             row=0, column=2, sticky="ew", padx=2
         )
-        ctk.CTkButton(step_ops, text="↓", width=48, command=self._move_down).grid(
+        ctk.CTkButton(step_ops, text="↓", width=40, height=30, command=self._move_down).grid(
             row=0, column=3, sticky="ew", padx=2
         )
 
-        self.detail = ctk.CTkFrame(body)
-        self.detail.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
-        self.detail.grid_columnconfigure(1, weight=1)
-        self.detail.grid_rowconfigure(5, weight=1)
+        self.detail = theme.surface(self._exec)
+        self.detail.grid(row=0, column=1, sticky="nsew")
+        self.detail.grid_columnconfigure(0, weight=1)
+        self.detail.grid_rowconfigure(1, weight=1, minsize=200)
 
-        self.step_enabled = tk.BooleanVar(value=True)
-        self.enabled_check = ctk.CTkCheckBox(
-            self.detail,
-            text="启用本步骤",
-            variable=self.step_enabled,
-            command=self._on_step_field_changed,
-        )
-        self.enabled_check.grid(
-            row=0, column=0, columnspan=2, sticky="w", padx=12, pady=(12, 6)
-        )
+        self._fields = ctk.CTkFrame(self.detail, fg_color="transparent")
+        self._fields.grid(row=0, column=0, sticky="ew", padx=12, pady=(10, 4))
 
-        ctk.CTkLabel(self.detail, text="步骤名称").grid(
-            row=1, column=0, sticky="w", padx=12, pady=4
+        self._f_name = theme.field_block(self._fields, "步骤名称")
+        self.step_name_entry = ctk.CTkEntry(
+            self._f_name, height=theme.CONTROL_H, fg_color=theme.INPUT
         )
-        self.step_name_entry = ctk.CTkEntry(self.detail)
-        self.step_name_entry.grid(row=1, column=1, sticky="ew", padx=12, pady=4)
+        self.step_name_entry.pack(fill="x")
         self.step_name_entry.bind("<FocusOut>", self._on_step_field_changed)
         self.step_name_entry.bind("<Return>", self._on_step_field_changed)
 
-        ctk.CTkLabel(self.detail, text="使用通货").grid(
-            row=2, column=0, sticky="w", padx=12, pady=4
+        self.step_enabled = tk.BooleanVar(value=True)
+        self._f_en = ctk.CTkFrame(self._fields, fg_color="transparent")
+        self.enabled_check = ctk.CTkCheckBox(
+            self._f_en,
+            text="启用本步骤",
+            variable=self.step_enabled,
+            command=self._on_step_field_changed,
+            font=ui_font(12),
         )
-        self.currency_menu = ctk.CTkOptionMenu(
-            self.detail,
+        self.enabled_check.pack(anchor="w", pady=(18, 0))
+
+        self._f_cur = theme.field_block(self._fields, "使用通货")
+        self.currency_menu = CompactMenu(
+            self._f_cur,
             values=CURRENCY_LABELS,
             command=lambda _value: self._on_step_field_changed(),
-            dynamic_resizing=False,
         )
-        self.currency_menu.grid(row=2, column=1, sticky="ew", padx=12, pady=4)
+        self.currency_menu.pack(fill="x")
 
-        ctk.CTkLabel(self.detail, text="动作后稀有度").grid(
-            row=3, column=0, sticky="w", padx=12, pady=4
-        )
-        self.rarity_menu = ctk.CTkOptionMenu(
-            self.detail,
+        self._f_rar = theme.field_block(self._fields, "动作后稀有度")
+        self.rarity_menu = CompactMenu(
+            self._f_rar,
             values=list(RARITY_LABEL_TO_VALUE),
             command=lambda _value: self._on_step_field_changed(),
-            dynamic_resizing=False,
         )
-        self.rarity_menu.grid(row=3, column=1, sticky="ew", padx=12, pady=4)
+        self.rarity_menu.pack(fill="x")
 
-        branch = ctk.CTkFrame(self.detail, fg_color="transparent")
-        branch.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=6)
-        branch.grid_columnconfigure(1, weight=1)
-        branch.grid_columnconfigure(3, weight=1)
-        ctk.CTkLabel(branch, text="命中后").grid(
-            row=0, column=0, sticky="w", padx=(0, 6)
-        )
-        self.success_menu = ctk.CTkOptionMenu(
-            branch,
+        self._f_ok = theme.field_block(self._fields, "命中后")
+        self.success_menu = CompactMenu(
+            self._f_ok,
             values=["下一启用步骤"],
             command=lambda _value: self._on_step_field_changed(),
-            dynamic_resizing=False,
         )
-        self.success_menu.grid(row=0, column=1, sticky="ew", padx=(0, 14))
-        ctk.CTkLabel(branch, text="未命中后").grid(
-            row=0, column=2, sticky="w", padx=(0, 6)
-        )
-        self.failure_menu = ctk.CTkOptionMenu(
-            branch,
+        self.success_menu.pack(fill="x")
+
+        self._f_fail = theme.field_block(self._fields, "未命中后")
+        self.failure_menu = CompactMenu(
+            self._f_fail,
             values=["重复本步骤"],
             command=lambda _value: self._on_step_field_changed(),
-            dynamic_resizing=False,
         )
-        self.failure_menu.grid(row=0, column=3, sticky="ew")
+        self.failure_menu.pack(fill="x")
+        self._layout_fields(False)
+        self.detail.bind("<Configure>", self._on_detail_cfg)
 
-        rules_wrap = ctk.CTkFrame(self.detail)
-        rules_wrap.grid(
-            row=5,
-            column=0,
-            columnspan=2,
-            sticky="nsew",
-            padx=12,
-            pady=(4, 8),
-        )
+        rules_wrap = theme.surface(self.detail, "raised")
+        rules_wrap.grid(row=1, column=0, sticky="nsew", padx=12, pady=(4, 6))
         rules_wrap.grid_columnconfigure(0, weight=1)
         rules_wrap.grid_rowconfigure(1, weight=1)
-        ctk.CTkLabel(
-            rules_wrap,
-            text="动作后的命中条件（留空表示只校验稀有度）",
-            font=ctk.CTkFont(weight="bold"),
-        ).grid(row=0, column=0, sticky="w", padx=8, pady=(8, 2))
-        self.rules_editor = RuleSetEditor(
-            rules_wrap,
-            on_change=self._on_rules_changed,
+        theme.heading(rules_wrap, "命中条件", 13).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 2)
         )
-        self.rules_editor.grid(row=1, column=0, sticky="nsew", padx=4, pady=4)
+        self.rules_editor = RuleSetEditor(rules_wrap, on_change=self._on_rules_changed)
+        self.rules_editor.grid(row=1, column=0, sticky="nsew", padx=6, pady=(0, 6))
 
-        ctk.CTkLabel(
+        tip = theme.muted(
             self.detail,
-            text=(
-                "启动时先悬停装备并 Ctrl+C（不点击）。之后每步执行："
-                "右键所选通货 → 左键目标装备 → Ctrl+C 读取装备 → "
-                "按稀有度和词缀条件选择去向。通货图标已内置，"
-                "右键前会 Ctrl+C 核对通货中文名称。"
-            ),
-            text_color="gray",
-            font=ctk.CTkFont(size=11),
-            anchor="w",
-            justify="left",
-        ).grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 10))
+            "每步：右键通货 → 左键装备 → Ctrl+C。命中/未命中决定去向。",
+            wraplength=360,
+        )
+        tip.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 10))
+        theme.bind_wrap(tip, self.detail, pad=28)
+
+    def _on_info_cfg(self, event) -> None:
+        if event.widget is not self._info or event.width < 80:
+            return
+        if self._info_after is not None:
+            self.after_cancel(self._info_after)
+        self._info_after = self.after(
+            40, lambda w=event.width: self._layout_info(w < theme.HEAD_NARROW)
+        )
+
+    def _layout_info(self, stack: bool) -> None:
+        self._info_after = None
+        if stack == self._info_stack:
+            return
+        self._info_stack = stack
+        for widget in (self._i_name, self._i_start, self._i_desc):
+            widget.grid_forget()
+        if stack:
+            self._info.grid_columnconfigure(2, weight=0, minsize=0)
+            self._i_name.grid(row=0, column=0, sticky="ew", padx=(10, 6), pady=(6, 4))
+            self._i_start.grid(row=0, column=1, sticky="ew", padx=(6, 10), pady=(6, 4))
+            self._i_desc.grid(
+                row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=(0, 6)
+            )
+        else:
+            self._info.grid_columnconfigure(2, weight=3, minsize=160)
+            self._i_name.grid(row=0, column=0, sticky="ew", padx=(10, 6), pady=6)
+            self._i_start.grid(row=0, column=1, sticky="ew", padx=6, pady=6)
+            self._i_desc.grid(row=0, column=2, sticky="ew", padx=(6, 10), pady=6)
+
+    def _on_detail_cfg(self, event) -> None:
+        if event.widget is not self.detail or event.width < 80:
+            return
+        if self._fields_after is not None:
+            self.after_cancel(self._fields_after)
+        self._fields_after = self.after(
+            40, lambda w=event.width: self._layout_fields(w < theme.DETAIL_NARROW)
+        )
+
+    def _layout_fields(self, stack: bool) -> None:
+        self._fields_after = None
+        if stack == self._fields_stack:
+            return
+        self._fields_stack = stack
+        for widget in (
+            self._f_name,
+            self._f_en,
+            self._f_cur,
+            self._f_rar,
+            self._f_ok,
+            self._f_fail,
+        ):
+            widget.grid_forget()
+        pairs = (
+            (self._f_name, self._f_en),
+            (self._f_cur, self._f_rar),
+            (self._f_ok, self._f_fail),
+        )
+        if stack:
+            self._fields.grid_columnconfigure(0, weight=1)
+            self._fields.grid_columnconfigure(1, weight=0)
+            for i, (left, right) in enumerate(pairs):
+                left.grid(row=i * 2, column=0, sticky="ew", pady=(0, 6))
+                right.grid(row=i * 2 + 1, column=0, sticky="ew", pady=(0, 6))
+        else:
+            self._fields.grid_columnconfigure(0, weight=3)
+            self._fields.grid_columnconfigure(1, weight=2)
+            for i, (left, right) in enumerate(pairs):
+                left.grid(row=i, column=0, sticky="ew", padx=(0, 8), pady=(0, 6))
+                right.grid(row=i, column=1, sticky="ew", pady=(0, 6))
 
     # ---------- public ----------
     def set_workflow(self, workflow: CraftWorkflow) -> None:
@@ -328,55 +404,35 @@ class WorkflowEditor(ctk.CTkFrame):
         steps = self._workflow.steps
         with hide_while_rebuild(self.step_list):
             if not steps:
-                for button in self._step_buttons:
-                    button.destroy()
-                self._step_buttons.clear()
+                for card in self._step_cards:
+                    card.destroy()
+                self._step_cards.clear()
                 for child in self.step_list.winfo_children():
                     child.destroy()
-                tk.Label(
-                    self.step_list,
-                    text="还没有步骤\n点击下方 + 添加",
-                    fg="#8a8a8a",
-                    bg="#2b2b2b",
-                    justify="center",
-                ).grid(row=0, column=0, sticky="ew", pady=30)
-                return
-            if not self._step_buttons:
-                for child in self.step_list.winfo_children():
-                    child.destroy()
-            while len(self._step_buttons) > len(steps):
-                self._step_buttons.pop().destroy()
-            for index, step in enumerate(steps):
-                prefix = "" if step.enabled else "[停用] "
-                text = f"{index + 1}. {prefix}{step.name}"
-                selected = index == self._selected_index
-                fg = "#1f6aa5" if selected else "#343638"
-                hover = "#285f85" if selected else "#4a4d50"
-                if index < len(self._step_buttons):
-                    self._step_buttons[index].configure(
-                        text=text,
-                        bg=fg,
-                        activebackground=hover,
-                        command=lambda i=index: self._select_step(i),
-                    )
-                    continue
-                button = tk.Button(
-                    self.step_list,
-                    text=text,
-                    anchor="w",
-                    bg=fg,
-                    fg="#f0f0f0",
-                    activebackground=hover,
-                    activeforeground="#f0f0f0",
-                    relief="flat",
-                    bd=0,
-                    padx=8,
-                    pady=4,
-                    font=("Microsoft YaHei UI", 9),
-                    command=lambda i=index: self._select_step(i),
+                theme.muted(self.step_list, "还没有步骤\n点击下方 + 添加", justify="center").grid(
+                    row=0, column=0, sticky="ew", pady=28
                 )
-                button.grid(row=index, column=0, sticky="ew", pady=3)
-                self._step_buttons.append(button)
+            elif not self._step_cards:
+                for child in self.step_list.winfo_children():
+                    child.destroy()
+            while len(self._step_cards) > len(steps):
+                self._step_cards.pop().destroy()
+            for index, step in enumerate(steps):
+                if index < len(self._step_cards):
+                    card = self._step_cards[index]
+                else:
+                    card = _StepCard(self.step_list)
+                    card.grid(row=index, column=0, sticky="ew", pady=4)
+                    self._step_cards.append(card)
+                card.set(
+                    index,
+                    step.name,
+                    step.enabled,
+                    index == self._selected_index,
+                    lambda i=index: self._select_step(i),
+                )
+        self.after_idle(self.step_scroll.bind_wheel_tree, self.step_list)
+        self.after_idle(self.step_scroll.sync)
 
     def _refresh_start_menu(self) -> None:
         self._start_label_to_id.clear()
