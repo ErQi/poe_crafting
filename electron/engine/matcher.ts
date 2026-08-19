@@ -175,9 +175,3 @@ export function normalizeOperator(op: string): string {
   const key = (op || "").trim();
   return key in mapping ? mapping[key] : key;
 }
-
-export function normalizeCombine(mode: string): string {
-  const m = (mode || "").trim().toLowerCase();
-  if (["any", "or", "任一", "或者"].includes(m)) return MatchMode.ANY;
-  return MatchMode.ALL;
-}

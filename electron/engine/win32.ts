@@ -1,11 +1,12 @@
 import koffi from "koffi";
+import { sleepMs, waitUntil } from "./timing";
 
 const user32 = koffi.load("user32.dll");
 const kernel32 = koffi.load("kernel32.dll");
 const gdi32 = koffi.load("gdi32.dll");
 
-export const POINT = koffi.struct("POINT", { x: "int32", y: "int32" });
-export const RECT = koffi.struct("RECT", {
+const POINT = koffi.struct("POINT", { x: "int32", y: "int32" });
+koffi.struct("RECT", {
   left: "int32",
   top: "int32",
   right: "int32",
@@ -58,7 +59,7 @@ const EnumWindows = user32.func("int __stdcall EnumWindows(EnumWindowsProc *lpEn
 const AttachThreadInput = user32.func("int __stdcall AttachThreadInput(uint32 idAttach, uint32 idAttachTo, int fAttach)");
 const GetCurrentThreadId = kernel32.func("uint32 __stdcall GetCurrentThreadId()");
 const GetClientRect = user32.func("int __stdcall GetClientRect(HWND hWnd, _Out_ RECT *lpRect)");
-const ClientToScreen = user32.func("int __stdcall ClientToScreen(HWND hWnd, POINT *lpPoint)");
+const ClientToScreen = user32.func("int __stdcall ClientToScreen(HWND hWnd, _Inout_ POINT *lpPoint)");
 const GetCursorPos = user32.func("int __stdcall GetCursorPos(_Out_ POINT *lpPoint)");
 const SetCursorPos = user32.func("int __stdcall SetCursorPos(int X, int Y)");
 const GetCursorInfo = user32.func("int __stdcall GetCursorInfo(_Inout_ CURSORINFO *pci)");
@@ -128,13 +129,6 @@ export type Hwnd = object | bigint | number;
 export function hwndPtr(hwnd: Hwnd | null | undefined): bigint | null {
   const addr = hwndAddr(hwnd);
   return addr === 0n ? null : addr;
-}
-
-export function ptrToNum(ptr: unknown): number {
-  const addr = hwndAddr(ptr);
-  if (!addr) return 0;
-  const n = Number(addr);
-  return Number.isSafeInteger(n) ? n : 0;
 }
 
 function hwndAddr(ptr: unknown): bigint {
@@ -268,25 +262,20 @@ export function isForegroundWindow(hwnd: Hwnd | null | undefined): boolean {
   }
 }
 
-function altUnlock(): void {
+const ALT_HOLD_MS = 20;
+
+async function altUnlock(): Promise<void> {
   try {
     keybd_event(VK_MENU, 0, 0, 0);
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    await sleepMs(ALT_HOLD_MS);
     keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0);
   } catch {
     /* ignore */
   }
 }
 
-function busySleep(ms: number): void {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    /* SharedArrayBuffer 不可用时跳过 */
-  }
-}
-
-export function focusWindow(hwnd: Hwnd | null | undefined, retries = 5, settleMs = 120): boolean {
+/** settleMs 只作置前的等待上限：一旦目标窗口成为前台就立即返回，不冻结主进程。 */
+export async function focusWindow(hwnd: Hwnd | null | undefined, retries = 5, settleMs = 120): Promise<boolean> {
   const h = hwndPtr(hwnd);
   if (!h) return false;
   try {
@@ -298,7 +287,7 @@ export function focusWindow(hwnd: Hwnd | null | undefined, retries = 5, settleMs
     try {
       if (IsIconic(h)) {
         ShowWindow(h, SW_RESTORE);
-        busySleep(50);
+        await waitUntil(() => !IsIconic(h), settleMs, 10);
       } else ShowWindow(h, SW_SHOW);
       const foreground = hwndPtr(GetForegroundWindow());
       const curTid = foreground ? GetWindowThreadProcessId(foreground, null) : 0;
@@ -314,7 +303,7 @@ export function focusWindow(hwnd: Hwnd | null | undefined, retries = 5, settleMs
         } catch {
           /* ignore */
         }
-        if (attempt > 0) altUnlock();
+        if (attempt > 0) await altUnlock();
         try {
           BringWindowToTop(h);
         } catch {
@@ -351,20 +340,19 @@ export function focusWindow(hwnd: Hwnd | null | undefined, retries = 5, settleMs
           }
         }
       }
-      busySleep(settleMs);
-      if (isForegroundWindow(h)) return true;
+      if (await waitUntil(() => isForegroundWindow(h), settleMs, 10)) return true;
     } catch {
-      busySleep(50);
+      await sleepMs(settleMs);
     }
   }
   return isForegroundWindow(h);
 }
 
-export function focusGameWindow(keywords: string[], retries = 6): [WindowInfo | null, boolean] {
+export async function focusGameWindow(keywords: string[], retries = 6): Promise<[WindowInfo | null, boolean]> {
   try {
     const win = findGameWindow(keywords);
     if (!win) return [null, false];
-    return [win, focusWindow(win.hwnd, retries)];
+    return [win, await focusWindow(win.hwnd, retries)];
   } catch {
     return [null, false];
   }

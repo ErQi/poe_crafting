@@ -12,16 +12,15 @@ import {
   saveLibrary,
   saveRuleset,
   saveSettings,
+  takeLoadErrors,
 } from "./configStore";
 import { CURRENCIES, CURRENCY_BY_TEMPLATE, currencyLabel } from "./currencies";
-import { ensureCurrencyIcons } from "./currencyIcons";
 import { focusGameWindow } from "./input";
 import { formatItemPreview, ItemParseError, parseItemText } from "./itemParser";
 import { matchRuleset, normalizeOperator, parseThresholdText } from "./matcher";
 import {
   AppSettings,
-  CRAFT_PRESET_LABELS,
-  CRAFT_PRESETS,
+  applyNumericSettings,
   CraftMode,
   CraftStep,
   CraftWorkflow,
@@ -44,7 +43,12 @@ export const UI_NORMAL = "normal";
 export const UI_TEMPLATES = "templates";
 export const UI_SETTINGS = "settings";
 const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_SETTINGS];
-const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS];
+const UI_PAGE_LABELS: Record<string, string> = {
+  [UI_HELP]: "使用说明",
+  [UI_SETTINGS]: "设置",
+  [UI_TEMPLATES]: "模板",
+};
+const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES];
 
 const TEMPLATE_SLOTS: [string, string, boolean][] = [
   ["craft_button", "执行工艺按钮", true],
@@ -148,11 +152,13 @@ export class AppHost {
   private lastCraftPage = UI_NORMAL;
   private pushFn: ((rt: Record<string, unknown>) => void) | null = null;
   private overlay: OverlayBridge | null = null;
-  private hotkeyStart: (() => void) | null = null;
-  private hotkeyStop: (() => void) | null = null;
+  private hotkeysChanged: (() => void) | null = null;
   private templateRowCache: { key: string; rows: ReturnType<AppHost["buildTemplateRows"]> } | null = null;
   private pendingPreviewUrl: string | null = null;
-  initError = "";
+  private configError = "";
+  private runtimeError = "";
+  /** 实际注册成功的热键，可能与 settings 里期望的值不同 */
+  private activeHotkeys = { start: "", stop: "" };
   private launchQueued = false;
 
   constructor() {
@@ -163,21 +169,25 @@ export class AppHost {
     this.automation = new CraftAutomation((m) => this.onLog(m), (s) => this.onStatus(s));
     this.uiPage = UI_HELP;
     this.lastCraftPage = this.settings.craftMode === CraftMode.WORKFLOW ? UI_NORMAL : UI_GARDEN;
+    const configErrors = takeLoadErrors();
+    if (configErrors.length) {
+      this.configError = configErrors.join("；");
+      this.logs.push(...configErrors);
+    }
+  }
+
+  get initError(): string {
+    return [this.configError, this.runtimeError].filter(Boolean).join("\n");
   }
 
   async boot(): Promise<void> {
     this.log("正在读取配置、加载识别库…");
     try {
-      await ensureCurrencyIcons(resolvePath(this.settings.templatesDir), (m) => this.log(m));
-    } catch (e) {
-      console.error("[main] 通货图标下载失败:", e);
-      this.log(`内置通货图标下载失败（可稍后手动放入 templates）: ${e}`);
-    }
-    try {
       console.log("[main] opencv 开始加载");
       await new Promise<void>((r) => setImmediate(r));
       await initVision();
       console.log("[main] opencv 已就绪");
+      this.clearRuntimeError();
     } catch (e) {
       console.error("[main] opencv 加载失败:", e);
       this.log(`识别库加载失败: ${e}`);
@@ -187,12 +197,19 @@ export class AppHost {
     this.log(`当前流程: ${this.workflow.name}`);
     this.log(`用户数据目录: ${dataRoot()}`);
     this.log(`模板目录: ${resolvePath(this.settings.templatesDir)}`);
-    this.log(`开始热键: ${this.settings.hotkeyStart.toUpperCase()}  停止热键: ${this.settings.hotkeyStop.toUpperCase()}`);
+    this.log(`开始热键: ${this.hotkeyLabel("start")}  停止热键: ${this.hotkeyLabel("stop")}`);
   }
 
   noteInitError(message: string): void {
-    this.initError = message;
+    this.runtimeError = message;
     this.log(message);
+  }
+
+  /** 识别库最终加载成功后撤掉「可能不可用」横幅；配置损坏的提示不受影响 */
+  clearRuntimeError(): void {
+    if (!this.runtimeError) return;
+    this.runtimeError = "";
+    this.push();
   }
 
   notifyError(title: string, message: string): void {
@@ -213,20 +230,31 @@ export class AppHost {
     this.automation.requestStop(StopReason.USER_STOP);
   }
 
-  bindHotkeys(start: () => void, stop: () => void): void {
-    this.hotkeyStart = start;
-    this.hotkeyStop = stop;
+  /** 热键值变化时重新注册；注册入口只有这一个，避免同一件事两个触发点 */
+  onHotkeysChanged(fn: () => void): void {
+    this.hotkeysChanged = fn;
+  }
+
+  /** 由 main 回填真正注册成功的加速键 */
+  setActiveHotkeys(start: string, stop: string): void {
+    this.activeHotkeys = { start, stop };
+    this.push();
+  }
+
+  private hotkeyLabel(kind: "start" | "stop"): string {
+    const wanted = (kind === "start" ? this.settings.hotkeyStart : this.settings.hotkeyStop) || "";
+    return this.activeHotkeys[kind] || `${wanted.toUpperCase()}（未生效）`;
   }
 
   async onHotkeyStart(): Promise<{ ok: boolean; error?: string }> {
     try {
       if (this.busy()) return ok();
       if (IDLE_START_PAGES.includes(this.uiPage)) {
-        this.log(`热键 ${this.settings.hotkeyStart.toUpperCase()}：${this.uiPage === UI_HELP ? "使用说明" : "设置"}页不启动工艺`);
+        this.log(`热键 ${this.hotkeyLabel("start")}：${UI_PAGE_LABELS[this.uiPage] || this.uiPage}页不启动工艺`);
         return ok();
       }
       const kind = this.resolveKind("");
-      this.log(`热键 ${this.settings.hotkeyStart.toUpperCase()}：开始（${kind === UI_GARDEN ? "花园工艺" : "普通工艺"}）`);
+      this.log(`热键 ${this.hotkeyLabel("start")}：开始（${kind === UI_GARDEN ? "花园工艺" : "普通工艺"}）`);
       const result = await this.start(kind);
       if (result && result.ok === false) {
         this.notifyError("启动失败", String(result.error || "启动失败"));
@@ -243,7 +271,7 @@ export class AppHost {
     try {
       if (this.automation.isRunning()) {
         this.automation.requestStop(StopReason.USER_STOP);
-        this.log(`热键 ${this.settings.hotkeyStop.toUpperCase()}：请求停止`);
+        this.log(`热键 ${this.hotkeyLabel("stop")}：请求停止`);
       }
     } catch (e) {
       console.error("[hotkey] stop fail:", e);
@@ -284,7 +312,6 @@ export class AppHost {
       item_preview: this.itemPreview,
       alert: this.alert,
       template_test: { ...this.templateTest },
-      pending_preview: this.pendingPreviewUrl,
       pending_info: this.pendingInfo(),
       init_error: this.initError,
     };
@@ -293,7 +320,6 @@ export class AppHost {
   private meta() {
     return {
       currencies: CURRENCIES.map((c) => ({ label: c.label, template: c.templateName })),
-      presets: Object.keys(CRAFT_PRESETS).map((k) => ({ key: k, label: CRAFT_PRESET_LABELS[k] })),
       rarities: [
         { value: "", label: "不校验" },
         { value: "普通", label: "普通" },
@@ -302,8 +328,8 @@ export class AppHost {
       ],
       ops: ["", ">=", ">", "<=", "<", "="],
       template_slots: TEMPLATE_SLOTS.map(([key, title, required]) => ({ key, title, required })),
-      hotkey_start: (this.settings.hotkeyStart || "f7").toUpperCase(),
-      hotkey_stop: (this.settings.hotkeyStop || "f8").toUpperCase(),
+      hotkey_start: this.hotkeyLabel("start"),
+      hotkey_stop: this.hotkeyLabel("stop"),
     };
   }
 
@@ -372,11 +398,8 @@ export class AppHost {
       get_runtime: () => this.runtime(),
       select_workflow: (id) => this.selectWorkflow(String(id || "")),
       new: (g) => this.newWorkflow(String(g || "自定义")),
-      new_workflow: (g) => this.newWorkflow(String(g || "自定义")),
       duplicate: () => this.duplicateWorkflow(),
-      duplicate_workflow: () => this.duplicateWorkflow(),
       delete: () => this.deleteWorkflow(),
-      delete_workflow: () => this.deleteWorkflow(),
       save_workflow: () => this.saveWorkflow(),
       update_workflow_fields: (f) => this.updateWorkflowFields((f as Record<string, unknown>) || {}),
       update_step: (id, f) => this.updateStep(String(id || ""), (f as Record<string, unknown>) || {}),
@@ -393,10 +416,11 @@ export class AppHost {
       save_rules: () => this.saveRulesNow(),
       refresh_item: () => this.refreshItem(),
       parse_clipboard: () => this.parseClipboard(),
-      list_templates: () => this.listTemplates(),
       paste_template: () => this.pasteTemplate(),
+      get_pending_preview: () => ok({ pending_preview: this.pendingPreviewUrl }),
       save_template: (key, overwrite) => this.saveTemplate(String(key || ""), Boolean(overwrite)),
       open_templates_dir: () => this.openTemplatesDir(),
+      open_data_dir: () => this.openDataDir(),
       refresh_templates: () => this.refreshTemplates(),
       test_templates: () => this.testTemplates(),
     };
@@ -554,22 +578,7 @@ export class AppHost {
 
   updateSettings(patch: Record<string, unknown>) {
     const s = this.settings;
-    if ("max_attempts" in patch) {
-      const n = parseInt(String(patch.max_attempts), 10);
-      if (Number.isFinite(n)) s.maxAttempts = Math.max(1, n);
-    }
-    if ("action_delay_ms" in patch) {
-      const n = parseInt(String(patch.action_delay_ms), 10);
-      if (Number.isFinite(n)) s.actionDelayMs = Math.max(0, n);
-    }
-    if ("craft_wait_ms" in patch) {
-      const n = parseInt(String(patch.craft_wait_ms), 10);
-      if (Number.isFinite(n)) s.craftWaitMs = Math.max(0, n);
-    }
-    if ("template_threshold" in patch) {
-      const n = Number(patch.template_threshold);
-      if (Number.isFinite(n)) s.templateThreshold = n;
-    }
+    applyNumericSettings(s, patch);
     const hotkeyChanged = "hotkey_start" in patch || "hotkey_stop" in patch;
     if ("hotkey_start" in patch) s.hotkeyStart = String(patch.hotkey_start || "f7").trim().toLowerCase();
     if ("hotkey_stop" in patch) s.hotkeyStop = String(patch.hotkey_stop || "f8").trim().toLowerCase();
@@ -579,13 +588,12 @@ export class AppHost {
       else s.craftMode = CraftMode.GENERIC;
     }
     s.matchMode = this.ruleset.groupCombine;
-    if (hotkeyChanged) this.hotkeyStart?.();
+    if (hotkeyChanged) this.hotkeysChanged?.();
     return { ok: true, settings: s.toDict(), meta: this.meta() };
   }
 
   saveSettingsNow() {
     saveSettings(this.settings);
-    this.hotkeyStart?.();
     this.log("设置已保存");
     return { ok: true, message: "设置已写入 config/settings.json", settings: this.settings.toDict(), meta: this.meta() };
   }
@@ -645,9 +653,9 @@ export class AppHost {
     }
   }
 
-  private beginLaunch(): void {
+  private async beginLaunch(): Promise<void> {
     try {
-      const result = this.launch();
+      const result = await this.launch();
       if (result && result.ok === false) this.notifyError("启动失败", String(result.error || "启动失败"));
     } catch (e) {
       this.notifyError("启动失败", startErrorText(e));
@@ -680,7 +688,7 @@ export class AppHost {
           "3. item_slot.png 截取的是目标装备本身",
           `4. 流程使用通货: ${currencies}（按仓库格坐标悬停后 Ctrl+C 核名）`,
           `5. 当前流程: ${workflow.name}  起始步骤: ${start.name}`,
-          `6. 紧急停止热键: ${s.hotkeyStop.toUpperCase()}`,
+          `6. 紧急停止热键: ${this.hotkeyLabel("stop")}`,
           "\n第三方自动化可能违反游戏条款，风险自负。是否开始？",
         ].join("\n"),
       ];
@@ -697,13 +705,13 @@ export class AppHost {
         "2. 物品已放入工艺槽",
         "3. 已准备 craft_button.png 与 item_slot.png 模板",
         "4. 请先在游戏里选好花园工艺再开始（开始后只点执行按钮）",
-        `5. 紧急停止热键: ${s.hotkeyStop.toUpperCase()}`,
+        `5. 紧急停止热键: ${this.hotkeyLabel("stop")}`,
         "\n第三方自动化可能违反游戏条款，风险自负。是否开始？",
       ].join("\n"),
     ];
   }
 
-  private launch() {
+  private async launch() {
     try {
       console.log("[craft] launch began");
       const s = this.settings;
@@ -718,7 +726,7 @@ export class AppHost {
       let win = null;
       let focused = false;
       try {
-        [win, focused] = focusGameWindow(s.windowTitleKeywords, 8);
+        [win, focused] = await focusGameWindow(s.windowTitleKeywords, 8);
       } catch (e) {
         return err(startErrorText(e));
       }
@@ -731,7 +739,7 @@ export class AppHost {
       else {
         this.log(`已找到窗口但未能置前: ${win.title}，将继续启动并重试`);
         try {
-          const retry = focusGameWindow(s.windowTitleKeywords, 6);
+          const retry = await focusGameWindow(s.windowTitleKeywords, 6);
           if (retry[0]) win = retry[0];
           if (retry[1]) this.log("重试后已切换到游戏窗口");
           else {
@@ -747,7 +755,6 @@ export class AppHost {
         settings: s,
         ruleset: this.ruleset,
         craftMode: s.craftMode,
-        craftPreset: s.craftPreset,
         workflow,
       };
       this.wasRunning = true;
@@ -852,10 +859,6 @@ export class AppHost {
     this.pendingPreviewUrl = imageUrl(png, 280, 150);
   }
 
-  listTemplates() {
-    return { ok: true, templates: this.templateRows(), runtime: this.runtime() };
-  }
-
   pasteTemplate() {
     const img = clipboard.readImage();
     if (img.isEmpty()) {
@@ -866,7 +869,7 @@ export class AppHost {
     this.setPendingPng(img.toPNG());
     const { width, height } = img.getSize();
     this.log(`已从剪贴板粘贴图片 ${width}×${height}`);
-    return { ok: true, runtime: this.runtime() };
+    return { ok: true, pending_preview: this.pendingPreviewUrl, runtime: this.runtime() };
   }
 
   saveTemplate(key: string, overwrite = false) {
@@ -887,11 +890,18 @@ export class AppHost {
     return { ok: true, message: `已写入\n${file}`, templates: this.templateRows() };
   }
 
-  openTemplatesDir() {
-    const dir = resolvePath(this.settings.templatesDir);
+  private openDir(dir: string) {
     fs.mkdirSync(dir, { recursive: true });
     shell.openPath(dir);
-    return ok();
+    return ok({ path: dir });
+  }
+
+  openTemplatesDir() {
+    return this.openDir(resolvePath(this.settings.templatesDir));
+  }
+
+  openDataDir() {
+    return this.openDir(dataRoot());
   }
 
   refreshTemplates() {

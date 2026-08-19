@@ -2,7 +2,6 @@ import { randomUUID } from "crypto";
 
 export const CraftMode = {
   GENERIC: "generic",
-  PRESET: "preset",
   WORKFLOW: "workflow",
 } as const;
 
@@ -27,7 +26,6 @@ export const StopReason = {
   PARSE_FAILURES: "parse_failures",
   TEMPLATE_NOT_FOUND: "template_not_found",
   CURRENCY_UNAVAILABLE: "currency_unavailable",
-  LIFEFORCE_INSUFFICIENT: "lifeforce_insufficient",
   UNCHANGED: "unchanged",
   WINDOW_NOT_FOUND: "window_not_found",
   WORKFLOW_STOP: "workflow_stop",
@@ -36,22 +34,6 @@ export const StopReason = {
 } as const;
 
 export type StopReasonValue = (typeof StopReason)[keyof typeof StopReason];
-
-export const CRAFT_PRESETS: Record<string, string> = {
-  reforge: "reforge",
-  augment: "augment",
-  remove: "remove",
-  randomise: "randomise",
-  sacrifice: "sacrifice",
-};
-
-export const CRAFT_PRESET_LABELS: Record<string, string> = {
-  reforge: "重铸 (Reforge)",
-  augment: "增幅 (Augment)",
-  remove: "移除 (Remove)",
-  randomise: "随机 (Randomise)",
-  sacrifice: "献祭 (Sacrifice)",
-};
 
 function optionalFloat(value: unknown): number | null {
   if (value == null || value === "") return null;
@@ -231,14 +213,6 @@ export class RuleSet {
       groupCombine: MatchMode.ALL,
       groups: [new RuleGroup({ name: "规则组 1", combine: mode, enabled: true, rules })],
     });
-  }
-
-  enabledGroups(): RuleGroup[] {
-    return this.groups.filter((g) => g.enabled);
-  }
-
-  allRulesFlat(): MatchRule[] {
-    return this.groups.flatMap((g) => g.rules);
   }
 }
 
@@ -523,6 +497,38 @@ export class MatchResult {
   }
 }
 
+/** 数值设置的取值区间：手改 settings.json 与界面改设置都必须过这一关 */
+const NUMERIC_SETTINGS = {
+  maxAttempts: { json: "max_attempts", min: 1, max: 100000, int: true },
+  maxParseFailures: { json: "max_parse_failures", min: 1, max: 1000, int: true },
+  maxUnchanged: { json: "max_unchanged", min: 1, max: 1000, int: true },
+  actionDelayMs: { json: "action_delay_ms", min: 0, max: 60000, int: true },
+  craftWaitMs: { json: "craft_wait_ms", min: 0, max: 60000, int: true },
+  clipboardTimeoutMs: { json: "clipboard_timeout_ms", min: 100, max: 60000, int: true },
+  clipboardPollMs: { json: "clipboard_poll_ms", min: 1, max: 5000, int: true },
+  templateThreshold: { json: "template_threshold", min: 0, max: 1, int: false },
+} as const;
+
+type NumericSettingKey = keyof typeof NUMERIC_SETTINGS;
+
+/** 解析 + 校验 + clamp；无法解析成有限数时返回 null，由调用方保留原值 */
+export function clampSetting(key: NumericSettingKey, value: unknown): number | null {
+  const spec = NUMERIC_SETTINGS[key];
+  const n = spec.int ? parseInt(String(value), 10) : Number(value);
+  if (!Number.isFinite(n)) return null;
+  return Math.min(spec.max, Math.max(spec.min, n));
+}
+
+/** 把 data 里出现的数值字段写入 settings；NaN / 越界不会落进配置 */
+export function applyNumericSettings(target: AppSettings, data: Record<string, unknown>): void {
+  const bag = target as unknown as Record<string, unknown>;
+  for (const [key, spec] of Object.entries(NUMERIC_SETTINGS)) {
+    if (!(spec.json in data)) continue;
+    const n = clampSetting(key as NumericSettingKey, data[spec.json]);
+    if (n != null) bag[key] = n;
+  }
+}
+
 export class AppSettings {
   windowTitleKeywords = ["Path of Exile", "流放之路"];
   hotkeyStop = "f8";
@@ -532,12 +538,11 @@ export class AppSettings {
   maxUnchanged = 8;
   actionDelayMs = 350;
   craftWaitMs = 600;
-  clipboardTimeoutMs = 1500;
-  clipboardPollMs = 50;
+  clipboardTimeoutMs = 300;
+  clipboardPollMs = 2;
   templateThreshold = 0.82;
   matchMode: string = MatchMode.ALL;
   craftMode: string = CraftMode.GENERIC;
-  craftPreset = "reforge";
   templatesDir = "assets/templates";
   rulesFile = "config/rules.json";
   workflowFile = "config/workflows.json";
@@ -557,7 +562,6 @@ export class AppSettings {
       template_threshold: this.templateThreshold,
       match_mode: this.matchMode,
       craft_mode: this.craftMode,
-      craft_preset: this.craftPreset,
       templates_dir: this.templatesDir,
       rules_file: this.rulesFile,
       workflow_file: this.workflowFile,
@@ -566,28 +570,21 @@ export class AppSettings {
 
   static fromDict(data: Record<string, unknown>): AppSettings {
     const s = new AppSettings();
-    const map: [keyof AppSettings, string, (v: unknown) => unknown][] = [
-      ["windowTitleKeywords", "window_title_keywords", (v) => (Array.isArray(v) ? v.map(String) : s.windowTitleKeywords)],
-      ["hotkeyStop", "hotkey_stop", String],
-      ["hotkeyStart", "hotkey_start", String],
-      ["maxAttempts", "max_attempts", (v) => Number(v)],
-      ["maxParseFailures", "max_parse_failures", (v) => Number(v)],
-      ["maxUnchanged", "max_unchanged", (v) => Number(v)],
-      ["actionDelayMs", "action_delay_ms", (v) => Number(v)],
-      ["craftWaitMs", "craft_wait_ms", (v) => Number(v)],
-      ["clipboardTimeoutMs", "clipboard_timeout_ms", (v) => Number(v)],
-      ["clipboardPollMs", "clipboard_poll_ms", (v) => Number(v)],
-      ["templateThreshold", "template_threshold", (v) => Number(v)],
-      ["matchMode", "match_mode", String],
-      ["craftMode", "craft_mode", String],
-      ["craftPreset", "craft_preset", String],
-      ["templatesDir", "templates_dir", String],
-      ["rulesFile", "rules_file", String],
-      ["workflowFile", "workflow_file", String],
+    const strings: [keyof AppSettings, string][] = [
+      ["hotkeyStop", "hotkey_stop"],
+      ["hotkeyStart", "hotkey_start"],
+      ["matchMode", "match_mode"],
+      ["craftMode", "craft_mode"],
+      ["templatesDir", "templates_dir"],
+      ["rulesFile", "rules_file"],
+      ["workflowFile", "workflow_file"],
     ];
-    for (const [key, jsonKey, conv] of map) {
-      if (jsonKey in data) (s as unknown as Record<string, unknown>)[key] = conv(data[jsonKey]);
+    const bag = s as unknown as Record<string, unknown>;
+    if (Array.isArray(data.window_title_keywords)) s.windowTitleKeywords = data.window_title_keywords.map(String);
+    for (const [key, jsonKey] of strings) {
+      if (jsonKey in data) bag[key] = String(data[jsonKey]);
     }
+    applyNumericSettings(s, data);
     return s;
   }
 }

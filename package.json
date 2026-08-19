@@ -28,7 +28,8 @@
   "build": {
     "appId": "com.poe.crafting",
     "directories": {
-      "output": "release"
+      "output": "release",
+      "buildResources": "assets/build"
     },
     "npmRebuild": false,
     "asar": true,
@@ -39,12 +40,12 @@
     "files": [
       "package.json",
       "electron/dist/**/*",
+      "!electron/dist/*.map",
       "web/dist/**/*",
-      "config/*.json",
-      "assets/templates/*.png",
+      "config/defaults/*.json",
       "assets/templates/README.txt",
-      "!node_modules/koffi/build/koffi/!(win32_x64)/**",
-      "!node_modules/koffi/build/koffi/win32_x64/*.{exp,lib}",
+      "!node_modules/koffi/build/koffi/!(win32_${arch})/**",
+      "!node_modules/koffi/build/koffi/*/*.{exp,lib}",
       "!node_modules/koffi/{doc,lib,src,vendor}/**",
       "!node_modules/opencv-wasm/{opencv-bin.js,opencv-deno.js,mod.ts}",
       "!node_modules/opencv-wasm/types/**"

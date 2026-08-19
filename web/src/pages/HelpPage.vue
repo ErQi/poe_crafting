@@ -42,7 +42,7 @@ defineProps({
 
     <section class="card">
       <div class="h">模板</div>
-      <p>需要自截两张：<b>装备格</b>（<code>item_slot</code>）和<b>执行按钮</b>（<code>craft_button</code>）。基础通货图标已内置，普通工艺不必再截通货。</p>
+      <p>需要自截两张：<b>装备格</b>（<code>item_slot</code>）和<b>执行按钮</b>（<code>craft_button</code>）。普通工艺不需要通货图片，靠仓库格坐标加 <code>Ctrl+C</code> 核对通货名。</p>
       <p>游戏里 <code>Win+Shift+S</code> 截图 → 模板页 <code>Ctrl+V</code> → 选好目标后保存。可用「测试模板匹配」核对分数。</p>
     </section>
 

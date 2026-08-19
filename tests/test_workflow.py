@@ -737,7 +737,6 @@ class TestWorkflow(unittest.TestCase):
             settings=AppSettings(max_parse_failures=1, action_delay_ms=1),
             ruleset=RuleSet(),
             craft_mode=CraftMode.WORKFLOW.value,
-            craft_preset="",
             workflow=self.workflow,
         )
         with (
@@ -789,7 +788,6 @@ class TestWorkflow(unittest.TestCase):
             settings=AppSettings(max_parse_failures=1, action_delay_ms=1),
             ruleset=RuleSet(),
             craft_mode=CraftMode.WORKFLOW.value,
-            craft_preset="",
             workflow=self.workflow,
         )
 
@@ -850,7 +848,6 @@ class TestWorkflow(unittest.TestCase):
             settings=AppSettings(max_parse_failures=1, action_delay_ms=1),
             ruleset=RuleSet(),
             craft_mode=CraftMode.WORKFLOW.value,
-            craft_preset="",
             workflow=self.workflow,
         )
         with (

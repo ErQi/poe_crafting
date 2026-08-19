@@ -261,13 +261,11 @@ class AutomationConfig:
     settings: AppSettings
     ruleset: RuleSet
     craft_mode: str
-    craft_preset: str
     workflow: Optional[CraftWorkflow] = None
 
 
 class CraftAutomation:
     REQUIRED_TEMPLATES = ("craft_button", "item_slot")
-    OPTIONAL_STOP_TEMPLATES = ("not_enough_lifeforce",)
 
     def __init__(
         self,
@@ -365,7 +363,7 @@ class CraftAutomation:
             return "窗口移动后无法确认所需通货名称与数量"
         return ""
 
-    def _relocate_required_if_moved(self, vision, win, s: AppSettings, config: AutomationConfig):
+    def _relocate_required_if_moved(self, vision, win, s: AppSettings):
         """连续读失败时才查窗口；没移动立刻返回原窗口。"""
         win2, moved, lost = self._sync_game_window(win)
         if win2 is None:
@@ -374,7 +372,7 @@ class CraftAutomation:
             return win, ""
         self._log("连续读取失败且窗口已移动，重新匹配模板")
         vision.clear_position_cache()
-        if not self._locate_required(vision, win2, s, config):
+        if not self._locate_required(vision, win2, s):
             return None, "窗口移动后模板重定位失败"
         focus_window(win2.hwnd, retries=1, settle_ms=20)
         return win2, ""
@@ -820,10 +818,6 @@ class CraftAutomation:
         for name in self.REQUIRED_TEMPLATES:
             if not vision.template_path(name).exists():
                 missing.append(f"{name}.png")
-        if config.craft_mode == CraftMode.PRESET.value:
-            preset_tpl = config.craft_preset
-            if not vision.template_path(preset_tpl).exists():
-                missing.append(f"{preset_tpl}.png")
         if missing:
             msg = f"缺少模板文件: {', '.join(missing)}"
             self._log(msg)
@@ -848,14 +842,7 @@ class CraftAutomation:
 
         # 首次定位模板，后续直接点缓存坐标
         self._log("首次定位模板坐标…")
-        if not self._locate_required(vision, win, s, config):
-            return
-
-        stop_hit = self._check_lifeforce(vision, win, s)
-        if stop_hit is not None:
-            message = f"检测到生命力不足 (score={stop_hit.score:.3f})"
-            self._log(message)
-            self._finish(StopReason.LIFEFORCE_INSUFFICIENT, message, 0, 0, 0)
+        if not self._locate_required(vision, win, s):
             return
 
         parse_failures = 0
@@ -887,26 +874,6 @@ class CraftAutomation:
 
             self._update(notify=False, attempt=attempt, message=f"第 {attempt} 次工艺")
             t0 = time.perf_counter()
-
-            # 预设：仅首次/重定位后点选；通用模式跳过
-            if config.craft_mode == CraftMode.PRESET.value:
-                # 每轮都要点一次工艺项（工艺列表可能取消选中）——优先缓存
-                ok = self._click_cached_or_match(
-                    vision, win, config.craft_preset, s, force_rematch=False
-                )
-                if not ok:
-                    if self._should_stop():
-                        reason = StopReason.USER_STOP
-                        message = "用户停止"
-                        break
-                    reason = StopReason.TEMPLATE_NOT_FOUND
-                    message = f"未找到预设工艺模板: {config.craft_preset}.png"
-                    self._log(message)
-                    break
-                if sleep_ms(max(30, s.action_delay_ms // 2), self._should_stop):
-                    reason = StopReason.USER_STOP
-                    message = "用户停止"
-                    break
 
             # 执行工艺按钮（缓存坐标，极快）
             ok = self._click_cached_or_match(
@@ -944,7 +911,7 @@ class CraftAutomation:
                 self._update(parse_failures=parse_failures)
                 if parse_failures >= 2:
                     win2, relocate_error = self._relocate_required_if_moved(
-                        vision, win, s, config
+                        vision, win, s
                     )
                     if relocate_error:
                         reason = (
@@ -967,7 +934,7 @@ class CraftAutomation:
                 self._update(parse_failures=parse_failures)
                 if parse_failures >= 2:
                     win2, relocate_error = self._relocate_required_if_moved(
-                        vision, win, s, config
+                        vision, win, s
                     )
                     if relocate_error:
                         reason = (
@@ -1039,11 +1006,8 @@ class CraftAutomation:
         vision: VisionService,
         win,
         s: AppSettings,
-        config: AutomationConfig,
     ) -> bool:
         names = ["craft_button", "item_slot"]
-        if config.craft_mode == CraftMode.PRESET.value:
-            names.append(config.craft_preset)
         frame = vision.grab_window(win)
         import cv2
 
@@ -2049,17 +2013,6 @@ class CraftAutomation:
             return "like_pointer"
         self._click_item_slot_left(item_hit)
         return "ok"
-
-    def _check_lifeforce(
-        self, vision: VisionService, win, s: AppSettings
-    ) -> Optional[MatchHit]:
-        for stop_tpl in self.OPTIONAL_STOP_TEMPLATES:
-            if not vision.template_path(stop_tpl).exists():
-                continue
-            hit = vision.find_in_window(win, stop_tpl, threshold=s.template_threshold)
-            if hit is not None:
-                return hit
-        return None
 
     def _click_cached_or_match(
         self,

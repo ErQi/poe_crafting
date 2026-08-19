@@ -5,6 +5,7 @@ import UiSelect from "../components/UiSelect.vue";
 const props = defineProps({
   state: { type: Object, required: true },
   runtime: { type: Object, required: true },
+  preview: { type: String, default: "" },
   disabled: { type: Boolean, default: false },
 });
 const emit = defineEmits(["paste", "save", "open", "test", "refresh"]);
@@ -27,7 +28,7 @@ const test = () => props.runtime.template_test || {};
       <section class="card col">
         <div class="h">剪贴板预览</div>
         <div class="preview">
-          <img v-if="runtime.pending_preview" :src="runtime.pending_preview" alt="预览" />
+          <img v-if="preview" :src="preview" alt="预览" />
           <span v-else>截图后按 Ctrl+V<br />或点下方「从剪贴板粘贴」</span>
         </div>
         <p class="tiny">{{ runtime.pending_info || "未粘贴" }}</p>

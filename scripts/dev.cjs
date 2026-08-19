@@ -1,4 +1,4 @@
-const { spawn, execSync } = require("child_process");
+const { spawn, spawnSync, execSync } = require("child_process");
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -73,11 +73,6 @@ function readPidFile() {
   }
 }
 
-function livePidFile() {
-  const pid = readPidFile();
-  return pidAlive(pid) ? pid : 0;
-}
-
 function listAppMainElectrons() {
   if (process.platform !== "win32") {
     return electron && electron.exitCode == null && electron.pid ? [electron.pid] : [];
@@ -103,18 +98,25 @@ function listAppMainElectrons() {
 }
 
 function appElectronPids() {
-  const pids = new Set();
-  const filePid = livePidFile();
-  if (filePid) pids.add(filePid);
-  for (const pid of listAppMainElectrons()) pids.add(pid);
+  // Windows 回收 PID 很快，上次崩溃留下的 pid 文件可能指向别的进程。
+  // listAppMainElectrons 校验了进程名与命令行，只有它确认过的 pid 才允许强杀。
+  const verified = listAppMainElectrons();
+  const pids = new Set(verified);
+  const filePid = readPidFile();
+  if (filePid && (process.platform === "win32" ? verified.includes(filePid) : pidAlive(filePid))) {
+    pids.add(filePid);
+  }
   if (electron && electron.pid && electron.exitCode == null) pids.add(electron.pid);
   return [...pids];
 }
 
-function killPid(pid) {
+function killPid(pid, sync = false) {
   if (!pid) return;
   if (process.platform === "win32") {
-    spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+    const args = ["/pid", String(pid), "/t", "/f"];
+    const opts = { stdio: "ignore", windowsHide: true };
+    if (sync) spawnSync("taskkill", args, { ...opts, timeout: 5000 });
+    else spawn("taskkill", args, opts);
   } else {
     try {
       process.kill(pid, "SIGTERM");
@@ -143,7 +145,7 @@ async function waitPidsGone(pids, timeoutMs = 0) {
 }
 
 function buildElectron() {
-  execSync("node scripts/build-electron.cjs", { cwd: root, stdio: "inherit" });
+  execSync("node scripts/build-electron.cjs --sourcemap", { cwd: root, stdio: "inherit" });
 }
 
 function isElectronSource(filename) {
@@ -183,11 +185,21 @@ async function main() {
 
   let generation = 0;
   let restarting = false;
+  let stopping = false;
 
-  const stop = (code = 0) => {
+  // 关终端 / Ctrl+C 都要等 taskkill 真正做完，否则 electron.exe 变孤儿
+  async function stopAsync(code = 0) {
+    if (stopping) return;
+    stopping = true;
+    generation += 1;
+    const pids = appElectronPids();
+    killTree(electron);
     killTree(vite);
+    await waitPidsGone(pids, 3000);
     process.exit(code ?? 0);
-  };
+  }
+
+  const stop = (code = 0) => void stopAsync(code);
 
   function startElectron() {
     const gen = generation;
@@ -274,10 +286,13 @@ async function main() {
     console.error("[dev] 无法监视 electron/:", err);
   }
 
-  process.on("SIGINT", () => {
-    generation += 1;
-    killTree(electron);
-    stop(0);
+  for (const signal of ["SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"]) {
+    process.on(signal, () => stop(0));
+  }
+  process.on("exit", () => {
+    if (stopping) return;
+    killPid(electron && electron.pid, true);
+    killPid(vite && vite.pid, true);
   });
 }
 

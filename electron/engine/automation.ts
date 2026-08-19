@@ -45,7 +45,6 @@ export interface AutomationConfig {
   settings: AppSettings;
   ruleset: RuleSet;
   craftMode: string;
-  craftPreset: string;
   workflow?: CraftWorkflow | null;
 }
 
@@ -60,6 +59,23 @@ const HOLD_CHECK_MS = 80;
 const WINDOW_MOVE_PX = 12;
 const CURSOR_ON_CURRENCY_RMSE = 18;
 const CURSOR_CONFIRM_TIMEOUT_MS = 280;
+/** 没有真正应用通货的轮次（跳过增幅、通货未确认）单独限量，避免空转吃掉 maxAttempts。 */
+const IDLE_ROUND_LIMIT = 12;
+const HARVEST_TEMPLATES = ["craft_button", "item_slot"];
+
+/** 左键装备格前的光标核实结果；除 ok 外都不许点。 */
+const CURSOR_CHECK_LOG: Record<string, string> = {
+  no_baseline: "没有装备格指针基线，不左键",
+  hit_on_currency: "装备格坐标落在通货区域，不左键",
+  not_parked: "未能停在装备格内，不左键",
+  cursor_on_currency: "光标仍在通货堆叠上，不左键",
+  like_pointer: "装备格光标仍像普通指针（光标上没有东西），不左键",
+};
+
+function clampMs(v: unknown, min: number, max: number, fallback: number): number {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
+}
 
 function workflowAssetLabel(name: string): string {
   if (name === "item_slot") return "目标装备";
@@ -148,8 +164,13 @@ export class CraftAutomation {
   private lastHoverHit: MatchHit | null = null;
   private currencyUseArmed = false;
   private itemUseClicked = false;
+  /** 右键过通货但还没确认落到装备上：停止时要提示用户光标上可能挂着通货。disarmCurrency 不清它。 */
+  private currencyOnCursor = false;
   private itemPointerPatch: Mat | null = null;
   private itemPointerHandle: bigint | null = null;
+  private parseFailures = 0;
+  private copyTimeoutMs = COPY_TIMEOUT_MS;
+  private copyPollMs = COPY_POLL_MS;
 
   constructor(onLog?: (m: string) => void, onStatus?: (s: RunStatus) => void) {
     this.onLog = onLog ?? (() => undefined);
@@ -189,6 +210,8 @@ export class CraftAutomation {
     this.status = new RunStatus();
     this.status.running = true;
     this.active = true;
+    this.parseFailures = 0;
+    this.currencyOnCursor = false;
     this.update({ running: true, message: "启动中" });
     void this.runSafe(config);
   }
@@ -200,14 +223,26 @@ export class CraftAutomation {
       this.log(`异常退出: ${e}`);
       this.update({ running: false, stopReason: StopReason.ERROR, message: String(e) });
     } finally {
+      if (this.currencyOnCursor) {
+        this.log("注意：最后一次右键的通货未确认落到装备上，可能还挂在光标上，请在游戏里右键取消或放回仓库");
+      }
+      this.disarmCurrency();
+      this.resetPointerBaselines();
       this.active = false;
     }
+  }
+
+  /** clipboard_timeout_ms / clipboard_poll_ms：设置项直接决定每次 Ctrl+C 的等待上限与轮询间隔。 */
+  private applyClipboardTiming(s: AppSettings): void {
+    this.copyTimeoutMs = clampMs(s.clipboardTimeoutMs, 50, 10000, COPY_TIMEOUT_MS);
+    this.copyPollMs = clampMs(s.clipboardPollMs, 1, 100, COPY_POLL_MS);
   }
 
   private async run(config: AutomationConfig): Promise<void> {
     console.log("[craft] run began", config.craftMode);
     await initVision();
     const s = config.settings;
+    this.applyClipboardTiming(s);
     const scales = config.craftMode === CraftMode.WORKFLOW ? [1, 0.9, 1.1, 0.8, 1.2] : [1];
     const vision = new VisionService(s.templatesDir, s.templateThreshold, 0.7, scales);
     try {
@@ -218,7 +253,8 @@ export class CraftAutomation {
     }
   }
 
-  private finish(reason: StopReasonValue, message: string, attempt: number, parseFailures: number, unchanged: number): void {
+  /** 所有结束路径唯一出口：日志、running、停止原因、计数器都在这里收口。 */
+  private finish(reason: StopReasonValue, message: string, attempt = 0, unchanged = 0): void {
     this.log(`结束: ${reason} — ${message}`);
     this.active = false;
     this.update({
@@ -226,9 +262,21 @@ export class CraftAutomation {
       stopReason: reason,
       message,
       attempt,
-      parseFailures,
+      parseFailures: this.parseFailures,
       unchangedStreak: unchanged,
     });
+  }
+
+  private bumpParseFailures(): number {
+    this.parseFailures += 1;
+    this.update({ parseFailures: this.parseFailures });
+    return this.parseFailures;
+  }
+
+  private clearParseFailures(): void {
+    if (!this.parseFailures) return;
+    this.parseFailures = 0;
+    this.update({ parseFailures: 0 });
   }
 
   private resetPointerBaselines(): void {
@@ -267,7 +315,8 @@ export class CraftAutomation {
     this.lastHoverHit = null;
     this.disarmCurrency();
     this.resetPointerBaselines();
-    if (!(await this.locateWorkflowRequired(vision, win, s, ["item_slot"]))) return "窗口移动后目标装备重定位失败";
+    const failure = this.locateTemplates(vision, win, s, ["item_slot"]);
+    if (failure) return `窗口移动后目标装备重定位失败：${failure.message}`;
     const itemHit = vision.getCachedPosition("item_slot");
     if (itemHit) {
       await this.moveToHit(itemHit);
@@ -287,54 +336,56 @@ export class CraftAutomation {
     this.disarmCurrency();
     this.resetPointerBaselines();
     if (!config.workflow) {
-      this.finish(StopReason.ERROR, "未提供多步骤流程配置", 0, 0, 0);
+      this.finish(StopReason.ERROR, "未提供多步骤流程配置");
       return;
     }
     const workflow = CraftWorkflow.fromDict(config.workflow.toDict());
     this.update({ workflowName: workflow.name });
     const errors = validateWorkflow(workflow);
     if (errors.length) {
-      this.finish(StopReason.ERROR, `流程配置无效：${errors.join("；")}`, 0, 0, 0);
+      this.finish(StopReason.ERROR, `流程配置无效：${errors.join("；")}`);
+      return;
+    }
+    // 通货只靠仓库格坐标 + 悬停 Ctrl+C 核名，没有图标模板要校验；装备格仍需用户自截。
+    if (!fs.existsSync(vision.templatePath("item_slot"))) {
+      const msg = `缺少模板文件: item_slot.png（${workflowAssetLabel("item_slot")}），请在「模板」页截取保存`;
+      this.log(msg);
+      this.finish(StopReason.TEMPLATE_NOT_FOUND, msg);
       return;
     }
     const currencyNames = workflow.enabledSteps().map((st) => st.currencyTemplate).filter((n, i, a) => a.indexOf(n) === i);
-    if (!fs.existsSync(vision.templatePath("item_slot"))) {
-      const msg = `多步骤流程缺少内置资源: ${workflowAssetLabel("item_slot")}`;
-      this.log(msg);
-      this.finish(StopReason.TEMPLATE_NOT_FOUND, msg, 0, 0, 0);
-      return;
-    }
-    const [found, focused] = focusGameWindow(s.windowTitleKeywords, 4);
+    const [found, focused] = await focusGameWindow(s.windowTitleKeywords, 4);
     if (!found) {
-      this.finish(StopReason.WINDOW_NOT_FOUND, "未找到流放之路窗口", 0, 0, 0);
+      this.finish(StopReason.WINDOW_NOT_FOUND, "未找到流放之路窗口");
       return;
     }
-    let win = found;
+    const win = found;
     this.log(focused ? `已切换到游戏: ${win.title} (${windowMetrics(win).width}x${windowMetrics(win).height})` : `已定位窗口: ${win.title}（未完全置前，继续运行）`);
     this.log(`开始多步骤流程「${workflow.name}」 | 启用步骤=${workflow.enabledSteps().length} | 最大动作数=${s.maxAttempts}`);
     this.log("首次定位目标装备…");
-    if (!(await this.locateWorkflowRequired(vision, win, s, ["item_slot"]))) return;
+    const located = this.locateTemplates(vision, win, s, ["item_slot"]);
+    if (located) {
+      this.finish(located.reason, located.message);
+      return;
+    }
     console.log("[craft] after first: locate done");
 
     let current = firstEnabledStep(workflow);
     if (!current) {
-      this.finish(StopReason.ERROR, "流程没有可执行步骤", 0, 0, 0);
+      this.finish(StopReason.ERROR, "流程没有可执行步骤");
       return;
     }
 
-    let parseFailures = 0;
     this.log("启动检查：正在悬停目标装备并按 Ctrl+C（不点击）…");
     console.log("[craft] after first: read begin");
     let initialItem: Item | null = null;
     for (let readTry = 1; readTry <= s.maxParseFailures; readTry++) {
       try {
         initialItem = await this.readItemFast(vision, win, s);
-        parseFailures = 0;
+        this.clearParseFailures();
         break;
       } catch (e) {
-        parseFailures = readTry;
-        this.update({ parseFailures });
-        this.log(`启动读取失败 (${readTry}/${s.maxParseFailures})：${e}`);
+        this.log(`启动读取失败 (${this.bumpParseFailures()}/${s.maxParseFailures})：${e}`);
         if (e instanceof VisionError) vision.clearPositionCache("item_slot");
         if (this.shouldStop()) break;
         await sleepMs(Math.max(40, s.actionDelayMs), () => this.shouldStop());
@@ -344,13 +395,10 @@ export class CraftAutomation {
       this.finish(
         this.shouldStop() ? StopReason.USER_STOP : StopReason.PARSE_FAILURES,
         this.shouldStop() ? "用户停止" : "启动时未能读取目标装备，未执行任何鼠标点击",
-        0,
-        parseFailures,
-        0,
       );
       return;
     }
-    this.update({ lastItem: initialItem, parseFailures: 0 });
+    this.update({ lastItem: initialItem });
     this.log(this.captureItemPointerBaseline(vision) ? "已采集装备格普通指针基线" : "未能采集装备格指针基线，未确认通货前不会左键");
     this.log(`启动读取成功：稀有度=${initialItem.rarity || "-"} | 显式词缀=${initialItem.craftAffixCount}`);
 
@@ -364,20 +412,20 @@ export class CraftAutomation {
       try {
         route = resolveTransition(workflow, inspected.id, evaluation.success ? inspected.onSuccess : inspected.onFailure);
       } catch (e) {
-        this.finish(StopReason.ERROR, String(e), 0, 0, 0);
+        this.finish(StopReason.ERROR, String(e));
         return;
       }
       if (route.kind === ROUTE_FINISH) {
-        this.finish(StopReason.SUCCESS, "当前装备已满足流程目标", 0, 0, 0);
+        this.finish(StopReason.SUCCESS, "当前装备已满足流程目标");
         return;
       }
       if (route.kind === ROUTE_STOP) {
-        this.finish(StopReason.WORKFLOW_STOP, `当前装备按步骤「${inspected.name}」的配置停止`, 0, 0, 0);
+        this.finish(StopReason.WORKFLOW_STOP, `当前装备按步骤「${inspected.name}」的配置停止`);
         return;
       }
       const resumed = workflow.getStep(route.nextStepId);
       if (!resumed) {
-        this.finish(StopReason.ERROR, `找不到下一步骤: ${route.nextStepId}`, 0, 0, 0);
+        this.finish(StopReason.ERROR, `找不到下一步骤: ${route.nextStepId}`);
         return;
       }
       current = resumed;
@@ -387,7 +435,7 @@ export class CraftAutomation {
     this.log("正在按仓库通货格坐标定位，并逐个悬停 Ctrl+C 核对中文名称…");
     console.log("[craft] after first: currency locate");
     if (!(await this.locateAndVerifyCurrencies(vision, win, s, currencyNames))) {
-      this.finish(StopReason.CURRENCY_UNAVAILABLE, "未找到数量可确认的流程通货，未执行任何通货点击", 0, 0, 0);
+      this.finish(StopReason.CURRENCY_UNAVAILABLE, "未找到数量可确认的流程通货，未执行任何通货点击");
       return;
     }
     const itemHit = vision.getCachedPosition("item_slot");
@@ -412,14 +460,25 @@ export class CraftAutomation {
     let lastRaw = `${currentItem.rarity}|${currentItem.affixTexts().join("|")}`;
     let lastActionStepId = "";
     let unchanged = 0;
-    let parseFailures = 0;
+    let applied = 0;
+    let idle = 0;
     let item = currentItem;
     let step = current;
     let game = win;
-    for (let attempt = 1; attempt <= s.maxAttempts; attempt++) {
+    for (;;) {
       if (this.shouldStop()) {
         reason = StopReason.USER_STOP;
         message = "用户停止";
+        break;
+      }
+      if (applied >= s.maxAttempts) {
+        reason = StopReason.MAX_ATTEMPTS;
+        message = `已达最大动作数 ${s.maxAttempts}`;
+        break;
+      }
+      if (idle >= IDLE_ROUND_LIMIT) {
+        reason = StopReason.UNCHANGED;
+        message = `连续 ${idle} 轮没有成功应用通货（跳过增幅或通货未确认），已停止`;
         break;
       }
       const live = workflow.getStep(step.id);
@@ -430,6 +489,7 @@ export class CraftAutomation {
       }
       step = live;
       const stepIndex = workflow.steps.indexOf(step) + 1;
+      const attempt = applied + 1;
       console.log("[craft] after first: step", stepIndex, step.name);
       this.update({ attempt, workflowStepName: step.name, workflowStepIndex: stepIndex, message: `步骤 ${stepIndex}: ${step.name}` }, false);
       const t0 = Date.now();
@@ -437,15 +497,16 @@ export class CraftAutomation {
       let nextItem: Item | null = null;
       if (!actionPerformed) {
         nextItem = item;
+        idle += 1;
         this.log(`显式词缀=${item.craftAffixCount}，跳过增幅`);
       } else {
-        const applied = await this.applyUntilNewItem(vision, game, step, s, item, currencyNames);
-        nextItem = applied.item;
-        game = applied.win;
-        if (applied.reason) {
-          reason = applied.reason;
-          message = applied.message;
-          if (applied.message && applied.reason !== StopReason.USER_STOP) this.log(applied.message);
+        const result = await this.applyUntilNewItem(vision, game, step, s, item, currencyNames);
+        nextItem = result.item;
+        game = result.win;
+        if (result.reason) {
+          reason = result.reason;
+          message = result.message;
+          if (result.message && result.reason !== StopReason.USER_STOP) this.log(result.message);
           break;
         }
         if (!nextItem) {
@@ -454,15 +515,17 @@ export class CraftAutomation {
             message = "用户停止";
             break;
           }
+          idle += 1;
           this.log("通货未确认，本轮不判定，继续");
-          await this.waitAfterFailedUse();
+          await this.settleAfterAction(vision, CURSOR_CONFIRM_TIMEOUT_MS);
           continue;
         }
-        parseFailures = 0;
+        applied += 1;
+        idle = 0;
       }
       item = nextItem;
       const evaluation = evaluateStep(item, step);
-      this.update({ lastItem: item, lastMatch: evaluation.match, parseFailures: 0 });
+      this.update({ lastItem: item, lastMatch: evaluation.match });
       this.log(`#${attempt} ${Date.now() - t0}ms | ${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
       if (actionPerformed) {
         const rawKey = `${item.rarity}|${item.affixTexts().join("|")}`;
@@ -511,44 +574,41 @@ export class CraftAutomation {
       }
       if (nextStep.id !== step.id) this.log(`转到步骤 ${workflow.steps.indexOf(nextStep) + 1}: ${nextStep.name}`);
       step = nextStep;
-      if (await sleepMs(s.actionDelayMs, () => this.shouldStop())) {
+      if (await this.settleAfterAction(vision, s.actionDelayMs)) {
         reason = StopReason.USER_STOP;
         message = "用户停止";
         break;
       }
     }
-    this.finish(reason, message, this.status.attempt, parseFailures, unchanged);
+    this.finish(reason, message, this.status.attempt, unchanged);
   }
 
   private async runHarvest(config: AutomationConfig, vision: VisionService): Promise<void> {
     const s = config.settings;
     const logic = config.ruleset.groupCombine === "any" ? "OR" : "AND";
     this.log(`开始自动化 | 模式=${config.craftMode} | 组间=${logic} | 组数=${config.ruleset.groups.length} | 最大次数=${s.maxAttempts}`);
-    const names = ["craft_button", "item_slot"];
-    const missing = names.filter((n) => !fs.existsSync(vision.templatePath(n))).map((n) => `${n}.png`);
+    const missing = HARVEST_TEMPLATES.filter((n) => !fs.existsSync(vision.templatePath(n))).map((n) => `${n}.png`);
     if (missing.length) {
-      const msg = `缺少模板文件: ${missing.join(", ")}`;
-      this.log(msg);
-      this.update({ running: false, stopReason: StopReason.TEMPLATE_NOT_FOUND, message: msg });
-      this.active = false;
+      this.finish(StopReason.TEMPLATE_NOT_FOUND, `缺少模板文件: ${missing.join(", ")}`);
       return;
     }
-    const [found, focused] = focusGameWindow(s.windowTitleKeywords, 4);
+    const [found, focused] = await focusGameWindow(s.windowTitleKeywords, 4);
     if (!found) {
-      const msg = "未找到流放之路窗口";
-      this.log(msg);
-      this.update({ running: false, stopReason: StopReason.WINDOW_NOT_FOUND, message: msg });
-      this.active = false;
+      this.finish(StopReason.WINDOW_NOT_FOUND, "未找到流放之路窗口");
       return;
     }
     let win = found;
     this.log(focused ? `已切换到游戏: ${win.title}` : `已定位窗口: ${win.title}（未完全置前，继续运行）`);
     this.log("首次定位模板坐标…");
-    if (!(await this.locateRequired(vision, win, s))) return;
+    const located = this.locateTemplates(vision, win, s, HARVEST_TEMPLATES);
+    if (located) {
+      this.finish(located.reason, located.message);
+      return;
+    }
     console.log("[craft] after first: locate done");
-    let parseFailures = 0;
     let unchanged = 0;
     let lastRaw = "";
+    let lastText = "";
     let reason: StopReasonValue = StopReason.MAX_ATTEMPTS;
     let message = "达到最大尝试次数";
     for (let attempt = 1; attempt <= s.maxAttempts; attempt++) {
@@ -576,20 +636,14 @@ export class CraftAutomation {
         this.log(message);
         break;
       }
-      if (await sleepMs(s.craftWaitMs, () => this.shouldStop())) {
-        reason = StopReason.USER_STOP;
-        message = "用户停止";
-        break;
-      }
       let parsed: Item;
       try {
-        parsed = await this.readItemFast(vision, win, s);
+        parsed = await this.readAfterCraft(vision, win, s, lastText);
       } catch (e) {
-        parseFailures += 1;
-        this.log(`解析失败 (${parseFailures}/${s.maxParseFailures}): ${e}`);
-        this.update({ parseFailures });
+        const failures = this.bumpParseFailures();
+        this.log(`解析失败 (${failures}/${s.maxParseFailures}): ${e}`);
         if (e instanceof VisionError) vision.clearPositionCache("item_slot");
-        if (parseFailures >= 2) {
+        if (failures >= 2) {
           const [next, relocateError] = await this.relocateHarvestIfMoved(vision, win, s);
           if (relocateError) {
             reason = next ? StopReason.TEMPLATE_NOT_FOUND : StopReason.WINDOW_NOT_FOUND;
@@ -598,16 +652,17 @@ export class CraftAutomation {
           }
           win = next!;
         }
-        if (parseFailures >= s.maxParseFailures) {
+        if (failures >= s.maxParseFailures) {
           reason = StopReason.PARSE_FAILURES;
           message = e instanceof VisionError ? String(e) : "连续解析失败次数过多";
           break;
         }
         continue;
       }
-      parseFailures = 0;
+      this.clearParseFailures();
+      lastText = parsed.rawText;
       const result = matchRuleset(parsed, config.ruleset);
-      this.update({ lastItem: parsed, lastMatch: result, parseFailures: 0 });
+      this.update({ lastItem: parsed, lastMatch: result });
       this.log(`#${attempt} ${Date.now() - t0}ms | 词缀=${parsed.affixes.length} | ${result.summary}`);
       if (result.success) {
         reason = StopReason.SUCCESS;
@@ -637,7 +692,21 @@ export class CraftAutomation {
         break;
       }
     }
-    this.finish(reason, message, this.status.attempt, parseFailures, unchanged);
+    this.finish(reason, message, this.status.attempt, unchanged);
+  }
+
+  /** 工艺按钮点完不做固定等待：先等装备文本与上一轮不同，craftWaitMs 只作上限；超时再按原文读一次交给未变化计数。 */
+  private async readAfterCraft(vision: VisionService, win: WindowInfo, s: AppSettings, staleText: string): Promise<Item> {
+    const waitMs = Math.max(this.copyTimeoutMs, s.craftWaitMs);
+    if (staleText) {
+      try {
+        return await this.readItemFast(vision, win, s, false, staleText, waitMs);
+      } catch (e) {
+        if (!(e instanceof ItemParseError)) throw e;
+      }
+      return this.readItemFast(vision, win, s, true, "", waitMs);
+    }
+    return this.readItemFast(vision, win, s, false, "", waitMs);
   }
 
   private async relocateHarvestIfMoved(
@@ -650,18 +719,19 @@ export class CraftAutomation {
     if (!moved) return [win, ""];
     this.log("连续读取失败且窗口已移动，重新匹配模板");
     vision.clearPositionCache();
-    if (!(await this.locateRequired(vision, next, s))) {
-      return [null, "窗口移动后模板重定位失败"];
-    }
-    focusWindow(next.hwnd, 1, 20);
+    const located = this.locateTemplates(vision, next, s, HARVEST_TEMPLATES);
+    if (located) return [next, `窗口移动后模板重定位失败：${located.message}`];
+    await focusWindow(next.hwnd, 1, 20);
     return [next, ""];
   }
 
-  private async locateRequired(vision: VisionService, win: WindowInfo, s: AppSettings): Promise<boolean> {
-    return this.locateWorkflowRequired(vision, win, s, ["craft_button", "item_slot"]);
-  }
-
-  private async locateWorkflowRequired(vision: VisionService, win: WindowInfo, s: AppSettings, names: string[]): Promise<boolean> {
+  /** 只负责定位并返回失败原因，绝不改 running/active：运行中途调用时不能让停止按钮失效。 */
+  private locateTemplates(
+    vision: VisionService,
+    win: WindowInfo,
+    s: AppSettings,
+    names: string[],
+  ): { reason: StopReasonValue; message: string } | null {
     console.log("[craft] grab begin", windowMetrics(win).width, "x", windowMetrics(win).height);
     let frame: Mat | null = null;
     try {
@@ -670,23 +740,19 @@ export class CraftAutomation {
       for (const name of names) {
         const hit = vision.matchInFrame(win, frame, name, s.templateThreshold);
         if (!hit) {
-          const msg = `无法定位${workflowAssetLabel(name)}`;
-          this.log(msg);
-          this.update({ running: false, stopReason: StopReason.TEMPLATE_NOT_FOUND, message: msg });
-          this.active = false;
-          return false;
+          const message = `无法定位${workflowAssetLabel(name)}`;
+          this.log(message);
+          return { reason: StopReason.TEMPLATE_NOT_FOUND, message };
         }
         this.log(`定位${workflowAssetLabel(name)} @(${hit.screenX},${hit.screenY}) score=${hit.score.toFixed(3)}`);
       }
       console.log("[craft] first action ok");
-      return true;
+      return null;
     } catch (e) {
-      const msg = `截屏或识别失败: ${e instanceof Error ? e.message : String(e)}`;
-      console.error("[craft]", msg);
-      this.log(msg);
-      this.update({ running: false, stopReason: StopReason.ERROR, message: msg });
-      this.active = false;
-      return false;
+      const message = `截屏或识别失败: ${visionErrText(e)}`;
+      console.error("[craft]", message);
+      this.log(message);
+      return { reason: StopReason.ERROR, message };
     } finally {
       console.log("[craft] after first: frame delete", frame?.cols ?? 0, "x", frame?.rows ?? 0);
       try {
@@ -726,7 +792,6 @@ export class CraftAutomation {
     s: AppSettings,
     templateName: string,
     excluded: [number, number, number, number][],
-    _allowItemSlot = false,
   ): Promise<MatchHit | null> {
     const expected = currencyLabel(templateName);
     for (let attempt = 1; attempt <= LOCATE_CURRENCY_TRIES; attempt++) {
@@ -747,14 +812,17 @@ export class CraftAutomation {
     return null;
   }
 
+  /**
+   * 找一个可以安全停放光标的落脚点。allowOtherCurrency 必须由调用方显式给：
+   * 只悬停 + Ctrl+C 时可以停到别的通货格，任何会左键的路径都不许。
+   */
   private safeParkHit(
     vision: VisionService,
-    avoidHit?: MatchHit,
-    allowItemSlot = false,
-    allowOtherCurrency = true,
+    avoidHit: MatchHit | undefined,
+    allowItemSlot: boolean,
+    allowOtherCurrency: boolean,
   ): MatchHit | null {
     const avoid = avoidHit ?? this.lastHoverHit;
-    if (this.currencyUseArmed) allowOtherCurrency = false;
     if (allowOtherCurrency) {
       for (const name of this.verifiedCurrency) {
         const hit = vision.getCachedPosition(name);
@@ -809,7 +877,7 @@ export class CraftAutomation {
       this.log(
         `${expectedName}仓库格 ${verifyTry}/${hits.length} @(${hit.screenX},${hit.screenY})，正在 Ctrl+C 核对…`,
       );
-      const copied = await this.copyHoveredText(hit, s);
+      const copied = await this.copyHoveredText(hit);
       if (!copied) {
         this.log(`该格未能复制到${expectedName}文本，将尝试相邻格`);
         continue;
@@ -859,11 +927,15 @@ export class CraftAutomation {
     this.lastHoverHit = hit;
   }
 
-  private async putItemBack(vision: VisionService, itemHit?: MatchHit | null): Promise<void> {
+  /** 放回装备的左键与使用通货的左键走同一套确认，绝不空手点装备格。 */
+  private async putItemBack(vision: VisionService, itemHit: MatchHit | null | undefined, holdsProven: boolean): Promise<boolean> {
     const hit = itemHit ?? vision.getCachedPosition("item_slot");
-    if (!hit) return;
+    if (!hit) return false;
+    if ((await this.confirmCursorOnItem(vision, hit, holdsProven)) !== "ok") return false;
     this.disarmCurrency();
+    this.currencyOnCursor = false;
     await this.clickItemSlotLeft(hit);
+    return true;
   }
 
   private isWrongItem(before: Item, after: Item): boolean {
@@ -879,7 +951,7 @@ export class CraftAutomation {
     win: WindowInfo,
     s: AppSettings,
     alreadyOnItem = false,
-    timeoutMs = COPY_TIMEOUT_MS,
+    timeoutMs = 0,
   ): Promise<Item | null> {
     try {
       const item = await this.readItemFast(vision, win, s, alreadyOnItem, "", timeoutMs);
@@ -894,23 +966,15 @@ export class CraftAutomation {
     }
   }
 
-  private async holdingItem(vision: VisionService, itemHit: MatchHit, s: AppSettings): Promise<boolean> {
-    let park = this.safeParkHit(vision, itemHit, false, true);
-    if (!park) {
-      for (const name of this.verifiedCurrency) {
-        const hit = vision.getCachedPosition(name);
-        if (hit && !hitsClose(hit, itemHit)) {
-          park = hit;
-          break;
-        }
-      }
-    }
+  /** 把光标移开装备格再 Ctrl+C：还能读到装备文本说明装备挂在光标上。只悬停不点击，所以允许停到别的通货格。 */
+  private async holdingItem(vision: VisionService, itemHit: MatchHit): Promise<boolean> {
+    const park = this.safeParkHit(vision, itemHit, false, true);
     if (!park) return false;
     await this.moveToHit(park);
     clearClipboard();
     const leftover = normalizeClipboardText(getClipboard());
     if (leftover && isEquipmentClipboardText(leftover)) return false;
-    const text = await this.copyItemText(Math.max(HOLD_CHECK_MS, COPY_TIMEOUT_MS), leftover, true);
+    const text = await this.copyItemText(Math.max(HOLD_CHECK_MS, this.copyTimeoutMs), leftover, true);
     return Boolean(text);
   }
 
@@ -925,42 +989,38 @@ export class CraftAutomation {
       const item = await this.tryReadItem(vision, win, s, alreadyOnItem);
       if (!item || this.isWrongItem(before, item)) return null;
       const itemHit = vision.getCachedPosition("item_slot");
-      if (itemHit && (await this.holdingItem(vision, itemHit, s))) return null;
+      if (itemHit && (await this.holdingItem(vision, itemHit))) return null;
       return item;
     } catch {
       return null;
     }
   }
 
-  private async canPutItemBack(
-    vision: VisionService,
-    win: WindowInfo,
-    s: AppSettings,
-    itemHit?: MatchHit | null,
-  ): Promise<boolean> {
-    if (itemHit && (await this.holdingItem(vision, itemHit, s))) return true;
-    if (itemHit && cursorInHit(itemHit)) return false;
-    try {
-      return vision.findInWindow(win, "item_slot", s.templateThreshold) == null;
-    } catch {
-      return false;
-    }
+  /**
+   * 装备是否真的在光标上，返回证据来源；空字符串＝没有正面证据，不许左键装备格。
+   * text=移开装备格后仍能复制到装备文本；cursor=光标图案/句柄与普通指针基线不同。
+   */
+  private async pickedUpEvidence(vision: VisionService, itemHit?: MatchHit | null): Promise<string> {
+    if (!itemHit) return "";
+    if (await this.holdingItem(vision, itemHit)) return "text";
+    return (await this.confirmCursorOnItem(vision, itemHit)) === "ok" ? "cursor" : "";
   }
 
   private async recoverPickedItem(vision: VisionService, win: WindowInfo, s: AppSettings, before: Item): Promise<Item | null> {
     const itemHit = vision.getCachedPosition("item_slot");
     let slotted = await this.itemInSlot(vision, win, s, before, itemHit != null);
     if (slotted) return slotted;
-    if (!itemHit || !(await this.canPutItemBack(vision, win, s, itemHit))) return null;
-    for (let putTry = 1; putTry <= PUT_BACK_TRIES; putTry++) {
+    if (!itemHit) return null;
+    let evidence = await this.pickedUpEvidence(vision, itemHit);
+    for (let putTry = 1; evidence && putTry <= PUT_BACK_TRIES; putTry++) {
       if (this.shouldStop()) return null;
       this.log(`放回装备 (${putTry}/${PUT_BACK_TRIES})`);
-      await this.putItemBack(vision, itemHit);
+      if (!(await this.putItemBack(vision, itemHit, evidence === "text"))) return null;
       slotted = await this.itemInSlot(vision, win, s, before, true);
       if (slotted) return slotted;
       slotted = await this.itemInSlot(vision, win, s, before, false);
       if (slotted) return slotted;
-      if (!(await this.canPutItemBack(vision, win, s, itemHit))) return null;
+      evidence = await this.pickedUpEvidence(vision, itemHit);
     }
     return null;
   }
@@ -972,7 +1032,7 @@ export class CraftAutomation {
     before: Item,
   ): Promise<[string, Item | null]> {
     const itemHit = vision.getCachedPosition("item_slot");
-    const waitMs = Math.max(COPY_TIMEOUT_MS, s.craftWaitMs);
+    const waitMs = Math.max(this.copyTimeoutMs, s.craftWaitMs);
     try {
       const fresh = await this.readItemFast(vision, win, s, true, before.rawText, waitMs);
       if (!this.isWrongItem(before, fresh)) return ["new", fresh];
@@ -990,12 +1050,12 @@ export class CraftAutomation {
     }
     if (item && !this.isWrongItem(before, item)) {
       if (!this.sameItemText(before, item)) return ["new", item];
-      if (itemHit && (await this.holdingItem(vision, itemHit, s))) {
+      if (itemHit && (await this.holdingItem(vision, itemHit))) {
         return ["pickup", await this.recoverPickedItem(vision, win, s, before)];
       }
       return ["stale", item];
     }
-    if (await this.canPutItemBack(vision, win, s, itemHit)) {
+    if (await this.pickedUpEvidence(vision, itemHit)) {
       return ["pickup", await this.recoverPickedItem(vision, win, s, before)];
     }
     return ["pickup", null];
@@ -1010,7 +1070,6 @@ export class CraftAutomation {
     currencyNames: string[],
   ): Promise<{ item: Item | null; win: WindowInfo; reason: StopReasonValue | null; message: string }> {
     const templateName = step.currencyTemplate;
-    let parseFailures = 0;
     let needRecover = false;
     let game = win;
     for (let applyTry = 1; applyTry <= APPLY_CONFIRM_TRIES; applyTry++) {
@@ -1030,6 +1089,11 @@ export class CraftAutomation {
           this.disarmCurrency();
           return { item: null, win: game, reason: StopReason.CURRENCY_UNAVAILABLE, message: e.message };
         }
+        // 截屏/识别的瞬时失败只放弃本轮：不 disarm，下一轮不会重复右键通货。
+        if (e instanceof VisionError) {
+          this.log(`本轮截屏或识别失败，稍后重试：${visionErrText(e)}`);
+          continue;
+        }
         throw e;
       }
       if (this.shouldStop() || kind === "stop") {
@@ -1040,27 +1104,23 @@ export class CraftAutomation {
         this.log("堆叠名称未核对，回到本步通货再右键");
         continue;
       }
-      if (kind === "like_pointer") {
+      if (kind === "like_pointer" || kind === "no_click") {
         this.disarmCurrency();
-        this.log("装备格光标仍像普通指针，不左键，回到堆叠再右键");
-        continue;
-      }
-      if (kind === "no_click") {
-        this.disarmCurrency();
-        this.log("未停在装备格内，不左键，回到堆叠再右键");
+        this.log("光标状态未确认，不左键，回到本步通货再右键");
         continue;
       }
       if (kind === "new" && readItem) {
         this.disarmCurrency();
+        this.currencyOnCursor = false;
+        this.clearParseFailures();
         this.captureItemPointerBaseline(vision);
         this.confirmCurrencySpent(vision, templateName);
         return { item: readItem, win: game, reason: null, message: "" };
       }
       if (kind === "parse") {
-        parseFailures += 1;
-        this.update({ parseFailures });
-        this.log(`剪贴板无法解析为物品 (${parseFailures}/${s.maxParseFailures})`);
-        if (parseFailures >= s.maxParseFailures) {
+        const failures = this.bumpParseFailures();
+        this.log(`剪贴板无法解析为物品 (${failures}/${s.maxParseFailures})`);
+        if (failures >= s.maxParseFailures) {
           this.disarmCurrency();
           return { item: null, win: game, reason: StopReason.PARSE_FAILURES, message: "连续解析失败次数过多" };
         }
@@ -1088,10 +1148,10 @@ export class CraftAutomation {
     return { item: null, win: game, reason: null, message: "" };
   }
 
-  private async copyHoveredText(hit: MatchHit, s: AppSettings): Promise<string | null> {
+  private async copyHoveredText(hit: MatchHit): Promise<string | null> {
     console.log("[craft] copy: hover", hit.screenX, hit.screenY);
     await this.moveToHit(hit);
-    return this.copyItemText(COPY_TIMEOUT_MS, "", false, true);
+    return this.copyItemText(this.copyTimeoutMs, "", false, true);
   }
 
   private clearCurrencyHit(vision: VisionService, name: string): void {
@@ -1101,7 +1161,14 @@ export class CraftAutomation {
   }
 
   private resolveItemHit(vision: VisionService, win: WindowInfo, s: AppSettings): MatchHit | null {
-    return vision.getCachedPosition("item_slot") ?? vision.findInWindow(win, "item_slot", s.templateThreshold);
+    const cached = vision.getCachedPosition("item_slot");
+    if (cached) return cached;
+    try {
+      return vision.findInWindow(win, "item_slot", s.templateThreshold);
+    } catch (e) {
+      this.log(`定位目标装备失败：${visionErrText(e)}`);
+      return null;
+    }
   }
 
   private usableStepCurrencyHit(vision: VisionService, name: string, itemRegion: [number, number, number, number]): MatchHit | null {
@@ -1119,7 +1186,7 @@ export class CraftAutomation {
     const expectedName = currencyLabel(templateName);
     let excluded: [number, number, number, number][] = [itemRegion];
     let currencyHit = this.usableStepCurrencyHit(vision, templateName, itemRegion);
-    if (!currencyHit) currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded, false);
+    if (!currencyHit) currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded);
     if (currencyHit && (hitCenterInRegion(currencyHit, itemRegion) || this.conflictingCurrencyName(vision, currencyHit, templateName))) {
       const conflict = this.conflictingCurrencyName(vision, currencyHit, templateName);
       this.log(`已拒绝${expectedName}匹配结果：${conflict ? `与已核实${currencyLabel(conflict)}中心过近` : "坐标落在目标装备区域内"}`);
@@ -1129,23 +1196,23 @@ export class CraftAutomation {
         const other = vision.getCachedPosition(conflict);
         if (other) excluded.push(hitClientRegion(other));
       }
-      currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded, false);
+      currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded);
     }
     if (!currencyHit) {
       if (this.shouldStop()) return false;
       throw new CurrencyUnavailableError(`没有找到可用的${expectedName}：可能已用完或已移出可见区域`);
     }
-    let copied = await this.copyHoveredText(currencyHit, s);
+    let copied = await this.copyHoveredText(currencyHit);
     if (!copied || !copied.includes(expectedName)) {
       this.log(`堆叠上不是${expectedName}，不右键，重新查找`);
       excluded = [itemRegion, hitClientRegion(currencyHit)];
       this.clearCurrencyHit(vision, templateName);
-      currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded, false);
+      currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded);
       if (!currencyHit) {
         if (this.shouldStop()) return false;
         throw new CurrencyUnavailableError(`没有找到可用的${expectedName}：可能已用完或已移出可见区域`);
       }
-      copied = await this.copyHoveredText(currencyHit, s);
+      copied = await this.copyHoveredText(currencyHit);
       if (!copied || !copied.includes(expectedName)) {
         this.log(`再次核对仍不是${expectedName}，本轮不右键`);
         return false;
@@ -1156,13 +1223,13 @@ export class CraftAutomation {
       if (this.shouldStop()) return false;
       this.log(`${expectedName}原位置已空或数量无法确认，正在查找其他堆叠…`);
       excluded = [itemRegion, hitClientRegion(currencyHit)];
-      currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded, false);
+      currencyHit = await this.findVerifiedCurrency(vision, win, s, templateName, excluded);
       remaining = this.stackCounts.get(templateName) ?? null;
       if (!currencyHit || remaining == null || remaining <= 0) {
         if (this.shouldStop()) return false;
         throw new CurrencyUnavailableError(`${expectedName}已用完，或当前画面中没有数量可确认的堆叠`);
       }
-      copied = await this.copyHoveredText(currencyHit, s);
+      copied = await this.copyHoveredText(currencyHit);
       if (!copied || !copied.includes(expectedName)) {
         this.log(`新堆叠不是${expectedName}，本轮不右键`);
         return false;
@@ -1213,7 +1280,8 @@ export class CraftAutomation {
     return true;
   }
 
-  private itemCursorHoldsCurrency(vision: VisionService): boolean {
+  /** 光标句柄或图案与装备格普通指针基线不同 ⇒ 光标上确实挂着东西（通货或装备）。 */
+  private cursorHoldsSomething(vision: VisionService): boolean {
     const handle = getCursorHandle();
     const patch = vision.captureCursorPatch();
     try {
@@ -1225,8 +1293,55 @@ export class CraftAutomation {
     }
   }
 
-  private async waitAfterFailedUse(): Promise<void> {
-    await sleepMs(CURSOR_CONFIRM_TIMEOUT_MS, () => this.shouldStop());
+  /**
+   * 左键装备格前的唯一确认：使用通货和放回装备都必须走它。
+   * holdsProven=已用 Ctrl+C 证明光标上挂着装备，跳过光标图案比对，其余检查照做。
+   * 返回 ok 之外的任何值都不许左键；时间只作上限，条件满足立即返回。
+   */
+  private async confirmCursorOnItem(vision: VisionService, itemHit: MatchHit, holdsProven = false): Promise<string> {
+    let check = "ok";
+    if (!holdsProven && !this.itemPointerPatch && this.itemPointerHandle == null) check = "no_baseline";
+    else if (this.conflictingCurrencyName(vision, itemHit, "")) check = "hit_on_currency";
+    if (check === "ok") {
+      await this.moveToHit(itemHit);
+      if (!(await waitUntil(() => cursorInHit(itemHit), CURSOR_CONFIRM_TIMEOUT_MS, 20, () => this.shouldStop()))) {
+        check = "not_parked";
+      }
+    }
+    if (check === "ok") {
+      const [x, y] = getCursorPosition();
+      for (const name of this.verifiedCurrency) {
+        const other = vision.getCachedPosition(name);
+        if (other && pointInHit(x, y, other)) {
+          check = "cursor_on_currency";
+          break;
+        }
+      }
+    }
+    if (check === "ok" && !holdsProven) {
+      let stable = 0;
+      const holds = () => {
+        if (!cursorInHit(itemHit)) {
+          stable = 0;
+          return false;
+        }
+        if (this.cursorHoldsSomething(vision)) {
+          stable += 1;
+          return stable >= 2;
+        }
+        stable = 0;
+        return false;
+      };
+      if (!(await waitUntil(holds, CURSOR_CONFIRM_TIMEOUT_MS, 20, () => this.shouldStop()))) check = "like_pointer";
+    }
+    if (check !== "ok" && !this.shouldStop()) this.log(CURSOR_CHECK_LOG[check] ?? check);
+    return check;
+  }
+
+  /** 动作之间不睡固定时长：等到光标恢复成普通指针即可继续，capMs 只作上限/节流。返回是否被用户停止。 */
+  private async settleAfterAction(vision: VisionService, capMs: number): Promise<boolean> {
+    await waitUntil(() => !this.cursorHoldsSomething(vision), capMs, 20, () => this.shouldStop());
+    return this.shouldStop();
   }
 
   private async rightClickCurrencyStack(stackHit: MatchHit): Promise<boolean> {
@@ -1239,46 +1354,14 @@ export class CraftAutomation {
     await clickScreen(stackHit.screenX, stackHit.screenY, CURSOR_MS, "right");
     console.log("[craft] after first: click ok right currency");
     this.lastHoverHit = stackHit;
+    this.currencyOnCursor = true;
     return true;
   }
 
   private async leftClickItemUse(vision: VisionService, itemHit: MatchHit): Promise<string> {
     if (!this.currencyUseArmed) return "no_select";
-    if (!this.itemPointerPatch && this.itemPointerHandle == null) {
-      this.log("没有装备格指针基线，不左键");
-      return "like_pointer";
-    }
-    if (this.conflictingCurrencyName(vision, itemHit, "")) {
-      this.log("装备格坐标落在通货区域，不左键");
-      return "no_click";
-    }
-    await this.moveToHit(itemHit);
-    if (!(await waitUntil(() => cursorInHit(itemHit), CURSOR_CONFIRM_TIMEOUT_MS, 20, () => this.shouldStop()))) {
-      this.log("未能停在装备格内，本轮不左键");
-      return "no_click";
-    }
-    const [x, y] = getCursorPosition();
-    for (const name of this.verifiedCurrency) {
-      const other = vision.getCachedPosition(name);
-      if (other && pointInHit(x, y, other)) {
-        this.log("光标仍在通货堆叠上，不左键");
-        return "no_click";
-      }
-    }
-    let stable = 0;
-    const holds = () => {
-      if (!cursorInHit(itemHit)) {
-        stable = 0;
-        return false;
-      }
-      if (this.itemCursorHoldsCurrency(vision)) {
-        stable += 1;
-        return stable >= 2;
-      }
-      stable = 0;
-      return false;
-    };
-    if (!(await waitUntil(holds, CURSOR_CONFIRM_TIMEOUT_MS, 20, () => this.shouldStop()))) return "like_pointer";
+    const check = await this.confirmCursorOnItem(vision, itemHit);
+    if (check !== "ok") return check === "no_baseline" || check === "like_pointer" ? "like_pointer" : "no_click";
     console.log("[craft] after first: click begin item_slot left");
     await this.clickItemSlotLeft(itemHit);
     console.log("[craft] after first: click ok item_slot left");
@@ -1308,7 +1391,7 @@ export class CraftAutomation {
       return false;
     }
     console.log("[craft] after first: click begin", templateName, button);
-    await clickScreen(hit.screenX, hit.screenY, 15, button);
+    await clickScreen(hit.screenX, hit.screenY, CURSOR_MS, button);
     console.log("[craft] after first: click ok", templateName);
     return true;
   }
@@ -1349,7 +1432,7 @@ export class CraftAutomation {
           console.log("[craft] copy: read clipboard");
           logged = true;
         }
-        const text = await waitClipboardChange(previous, Math.min(COPY_SLICE_MS, remain), COPY_POLL_MS, true, rejectTexts);
+        const text = await waitClipboardChange(previous, Math.min(COPY_SLICE_MS, remain), this.copyPollMs, true, rejectTexts);
         if (!text) return false;
         if (requireCurrency) {
           if (!isCurrencyClipboardText(text)) {
@@ -1380,7 +1463,7 @@ export class CraftAutomation {
         return false;
       }
     };
-    if (await waitUntil(pred, timeoutMs, COPY_POLL_MS, () => this.shouldStop())) return found;
+    if (await waitUntil(pred, timeoutMs, this.copyPollMs, () => this.shouldStop())) return found;
     if (sendFailed) throw new ItemParseError("复制失败");
     return null;
   }
@@ -1391,7 +1474,7 @@ export class CraftAutomation {
     s: AppSettings,
     alreadyOnItem = false,
     staleText = "",
-    timeoutMs = COPY_TIMEOUT_MS,
+    timeoutMs = 0,
   ): Promise<Item> {
     let hit = vision.getCachedPosition("item_slot");
     if (!hit) {
@@ -1404,7 +1487,7 @@ export class CraftAutomation {
     if (!alreadyOnItem) await this.moveToHit(hit);
     else this.lastHoverHit = hit;
     console.log("[craft] after first: copy begin");
-    const text = await this.copyItemText(timeoutMs, staleText, true);
+    const text = await this.copyItemText(timeoutMs > 0 ? timeoutMs : this.copyTimeoutMs, staleText, true);
     if (!text) {
       throw new ItemParseError(
         staleText ? "未读到通货动作后的新物品文本" : "等待剪贴板超时，请确认鼠标悬停在物品上且复制键为 Ctrl+C",
@@ -1420,12 +1503,13 @@ export class CraftAutomation {
 
   async readItemOnce(settings: AppSettings): Promise<Item> {
     await initVision();
+    this.applyClipboardTiming(settings);
     const vision = new VisionService(settings.templatesDir, settings.templateThreshold, 0.7, [1]);
     try {
       if (!fs.existsSync(vision.templatePath("item_slot"))) throw new VisionError("缺少模板 item_slot.png");
       const win = findGameWindow(settings.windowTitleKeywords);
       if (!win) throw new VisionError("未找到流放之路窗口");
-      focusWindow(win.hwnd, 3, 50);
+      await focusWindow(win.hwnd, 3, 50);
       const hit = vision.findInWindow(win, "item_slot", settings.templateThreshold);
       if (!hit) throw new VisionError("未找到 item_slot.png");
       return this.readItemFast(vision, win, settings);

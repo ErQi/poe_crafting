@@ -8,7 +8,6 @@ from typing import Any, Optional
 
 class CraftMode(str, Enum):
     GENERIC = "generic"
-    PRESET = "preset"
     WORKFLOW = "workflow"
 
 
@@ -33,30 +32,11 @@ class StopReason(str, Enum):
     PARSE_FAILURES = "parse_failures"
     TEMPLATE_NOT_FOUND = "template_not_found"
     CURRENCY_UNAVAILABLE = "currency_unavailable"
-    LIFEFORCE_INSUFFICIENT = "lifeforce_insufficient"
     UNCHANGED = "unchanged"
     WINDOW_NOT_FOUND = "window_not_found"
     WORKFLOW_STOP = "workflow_stop"
     ERROR = "error"
     NOT_STARTED = "not_started"
-
-
-# 预设工艺：显示名 -> 模板文件名（不含扩展名）
-CRAFT_PRESETS: dict[str, str] = {
-    "reforge": "reforge",
-    "augment": "augment",
-    "remove": "remove",
-    "randomise": "randomise",
-    "sacrifice": "sacrifice",
-}
-
-CRAFT_PRESET_LABELS: dict[str, str] = {
-    "reforge": "重铸 (Reforge)",
-    "augment": "增幅 (Augment)",
-    "remove": "移除 (Remove)",
-    "randomise": "随机 (Randomise)",
-    "sacrifice": "献祭 (Sacrifice)",
-}
 
 
 @dataclass
@@ -507,7 +487,6 @@ class AppSettings:
     template_threshold: float = 0.82
     match_mode: str = MatchMode.ALL.value
     craft_mode: str = CraftMode.GENERIC.value
-    craft_preset: str = "reforge"
     templates_dir: str = "assets/templates"
     rules_file: str = "config/rules.json"
     workflow_file: str = "config/workflows.json"

@@ -1,0 +1,24 @@
+{
+  "version": 2,
+  "group_combine": "all",
+  "groups": [
+    {
+      "id": "default-group",
+      "name": "规则组 1",
+      "combine": "all",
+      "enabled": true,
+      "min_matches": null,
+      "rules": [
+        {
+          "id": "sample-life",
+          "pattern": "最大生命",
+          "operator": ">=",
+          "threshold": 80,
+          "threshold2": null,
+          "enabled": false,
+          "note": "示例条件，可直接删改"
+        }
+      ]
+    }
+  ]
+}

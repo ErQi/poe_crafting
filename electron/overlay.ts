@@ -1,4 +1,6 @@
-const { ipcRenderer } = require("electron") as typeof import("electron");
+const bridge = (window as unknown as {
+  overlay: { on(channel: string, cb: (...args: any[]) => void): void };
+}).overlay;
 
 const host = document.getElementById("lines")!;
 const MAX = 8;
@@ -15,9 +17,9 @@ function clear(): void {
   host.innerHTML = "";
 }
 
-ipcRenderer.on("overlay:clear", () => clear());
-ipcRenderer.on("overlay:line", (_e, text: string, success?: boolean) => addLine(text, Boolean(success)));
-ipcRenderer.on("overlay:lines", (_e, lines: string[], success?: boolean) => {
+bridge.on("overlay:clear", () => clear());
+bridge.on("overlay:line", (text: string, success?: boolean) => addLine(text, Boolean(success)));
+bridge.on("overlay:lines", (lines: string[], success?: boolean) => {
   clear();
   for (const text of [...lines].reverse()) addLine(text, Boolean(success));
 });

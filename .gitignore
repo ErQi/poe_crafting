@@ -18,3 +18,10 @@ tmp_crops/
 *.log
 .DS_Store
 Thumbs.db
+
+# 运行时配置（出厂默认在 config/defaults/）
+config/*
+!config/defaults/
+
+# 用户自己截的模板与标定截图，不该进仓库
+assets/templates/*.jpg

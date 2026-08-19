@@ -9,20 +9,6 @@ export function getClipboard(): string {
   }
 }
 
-export function setClipboard(text: string): boolean {
-  try {
-    if (!text) {
-      clipboard.clear();
-      return true;
-    }
-    clipboard.writeText(text);
-    return true;
-  } catch (e) {
-    console.error("[craft] 复制失败", e);
-    return false;
-  }
-}
-
 export function clearClipboard(): void {
   try {
     clipboard.clear();

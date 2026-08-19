@@ -39,7 +39,3 @@ export async function moveScreen(x: number, y: number, settleMs = 40): Promise<v
   moveTo(x, y);
   await sleepMs(settleMs);
 }
-
-export function pressKey(key: string): void {
-  hotkey(key.toLowerCase());
-}

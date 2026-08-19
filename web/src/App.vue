@@ -26,14 +26,11 @@ const splash = ref(true);
 const isMax = ref(false);
 const bootError = ref("");
 const runtime = ref({ running: false, logs: [], status_text: "状态: 空闲" });
-const dlg = reactive({
-  show: false,
-  title: "",
-  message: "",
-  input: null,
-  hideCancel: false,
-  resolve: null,
-});
+const pendingPreview = ref("");
+let pendingInfo = "";
+// 队列而非单槽位：引擎告警随时可能到达，不能覆盖掉正在等待的确认框
+const dlgQueue = reactive([]);
+const dlg = computed(() => dlgQueue[0] || null);
 let pollId = 0;
 let lastAlertId = 0;
 
@@ -53,23 +50,36 @@ function apply(res) {
     state.value.item_preview = res.item_preview;
     runtime.value.item_preview = res.item_preview;
   }
+  if (res.pending_preview !== undefined) setPending(res.pending_preview, res.runtime?.pending_info);
   if (res.runtime) runtime.value = res.runtime;
   return true;
 }
 
+function setPending(url, info) {
+  pendingInfo = info || "";
+  pendingPreview.value = url || "";
+}
+
+// 预览图不再随 runtime 下发：粘贴的响应里直接带回，其余情况只在 pending_info 变化时补取一次
+async function syncPending(info) {
+  const next = info || "";
+  if (next === pendingInfo) return;
+  setPending("", next); // 先占位，避免连续 push 期间重复取图
+  if (!next || next === "未粘贴") return;
+  const res = await call("get_pending_preview").catch(() => null);
+  setPending(res?.pending_preview, next);
+}
+
 function modal({ title, message, input = null, hideCancel = false }) {
   return new Promise((resolve) => {
-    Object.assign(dlg, { show: true, title, message, input, hideCancel, resolve });
+    dlgQueue.push({ title, message, input, hideCancel, resolve });
   });
 }
 
 function closeDlg(ok) {
-  const fn = dlg.resolve;
-  const value = dlg.input;
-  const hadInput = dlg.input !== null;
-  dlg.show = false;
-  dlg.resolve = null;
-  fn?.(ok ? (hadInput ? value : true) : null);
+  const cur = dlgQueue.shift();
+  if (!cur) return;
+  cur.resolve(ok ? (cur.input !== null ? cur.input : true) : null);
 }
 
 function onPrompt(payload) {
@@ -94,7 +104,9 @@ function onAlert(rt) {
 function pushRuntime(rt) {
   runtime.value = rt;
   if (rt.item_preview && state.value) state.value.item_preview = rt.item_preview;
-  if (rt.init_error) bootError.value = rt.init_error;
+  // 必须跟着清空：识别库最终加载成功后主进程会把 init_error 置空并推一次
+  bootError.value = rt.init_error || "";
+  void syncPending(rt.pending_info);
   onAlert(rt);
 }
 
@@ -107,15 +119,13 @@ function finishSplash(error = "") {
 async function loadState() {
   try {
     state.value = await call("get_state");
-    runtime.value = state.value.runtime || runtime.value;
-    if (runtime.value.init_error) bootError.value = runtime.value.init_error;
+    if (state.value.runtime) pushRuntime(state.value.runtime);
     await setTab("help");
   } catch {
     /* 宿主尚未就绪 */
   }
 }
 
-window.__poePush = pushRuntime;
 let offPush = null;
 let offBoot = null;
 let offMax = null;
@@ -160,9 +170,10 @@ async function applyCall(fn) {
   }
 }
 
-async function persistSettings(p) {
-  if (!(await applyCall(() => call("update_settings", p)))) return;
-  await applyCall(() => call("save_settings"));
+// done 让设置页知道往返已结束，可以用后端真实值回写输入框
+async function persistSettings(p, done) {
+  if (await applyCall(() => call("update_settings", p))) await applyCall(() => call("save_settings"));
+  done?.();
 }
 
 function craftKind() {
@@ -171,32 +182,36 @@ function craftKind() {
   return "";
 }
 
+// 主进程靠 uiPage 判断热键是否启动工艺，必须等它确认后再切页，否则两边会错位
 async function setTab(next) {
-  tab.value = next;
   try {
-    apply(await call("set_ui_page", next));
-  } catch {
-    /* 宿主尚未就绪 */
+    const res = await call("set_ui_page", next);
+    apply(res);
+    tab.value = res?.page || next;
+  } catch (e) {
+    await alertBox("切换页面失败", e.message || String(e));
   }
 }
 
 async function startFrom(kind) {
   const k = kind || craftKind() || "normal";
-  const prep = await call("prepare_start", k);
-  if (!prep.ok) {
-    await alertBox("无法开始", prep.error);
+  try {
+    const prep = await call("prepare_start", k);
+    if (!prep.ok) {
+      await alertBox("无法开始", prep.error);
+      return;
+    }
+    if (!(await confirmBox("确认执行", prep.tips))) return;
+  } catch (e) {
+    await alertBox("无法开始", e.message || String(e));
     return;
   }
-  if (!(await confirmBox("确认执行", prep.tips))) return;
   await wrap(() => call("start", k));
 }
 
 async function poll() {
   try {
-    const rt = await call("get_runtime");
-    runtime.value = rt;
-    if (rt.init_error) bootError.value = rt.init_error;
-    onAlert(rt);
+    pushRuntime(await call("get_runtime"));
   } catch {
     /* 宿主尚未就绪 */
   }
@@ -222,7 +237,7 @@ onMounted(async () => {
   await ready();
   offPush = onPush(pushRuntime);
   await loadState();
-  pollId = window.setInterval(poll, 400);
+  pollId = window.setInterval(poll, 2000);
   window.addEventListener("paste", onPaste);
 });
 
@@ -357,6 +372,7 @@ async function removeStep(id) {
         v-show="tab === 'templates'"
         :state="state"
         :runtime="runtime"
+        :preview="pendingPreview"
         :disabled="running"
         @paste="wrap(() => call('paste_template'))"
         @save="saveTemplate"
@@ -371,6 +387,7 @@ async function removeStep(id) {
         @settings="(p) => applyCall(() => call('update_settings', p))"
         @persist="persistSettings"
         @save-settings="() => applyCall(() => call('save_settings'))"
+        @open-data-dir="wrap(() => call('open_data_dir'))"
       />
     </main>
     </template>
@@ -378,7 +395,7 @@ async function removeStep(id) {
   </div>
 
   <Modal
-    v-if="dlg.show"
+    v-if="dlg"
     :title="dlg.title"
     :message="dlg.message"
     :input="dlg.input"

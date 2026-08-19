@@ -40,7 +40,6 @@ export const STOP_REASON_TEXT: Record<string, string> = {
   [StopReason.PARSE_FAILURES]: "连续解析失败",
   [StopReason.TEMPLATE_NOT_FOUND]: "匹配资源未找到",
   [StopReason.CURRENCY_UNAVAILABLE]: "通货已用完或不可用",
-  [StopReason.LIFEFORCE_INSUFFICIENT]: "生命力/材料不足",
   [StopReason.UNCHANGED]: "词缀连续无变化",
   [StopReason.WINDOW_NOT_FOUND]: "未找到流放之路窗口",
   [StopReason.WORKFLOW_STOP]: "流程按配置停止",

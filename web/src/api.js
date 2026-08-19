@@ -23,14 +23,17 @@ function toPayload(args) {
   }
 }
 
+// Electron 跨进程会包一层 "Error invoking remote method 'x': Error: "，剥掉只留一层上下文
+const REMOTE_PREFIX = /^Error invoking remote method '[^']*':\s*(?:Error:\s*)?/;
+
 export async function call(name, ...args) {
   const bridge = api();
   if (!bridge?.invoke) throw new Error("未连接到工艺引擎");
   try {
     return await bridge.invoke(name, toPayload(args));
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(`${name}: ${msg}`);
+    const raw = (e instanceof Error ? e.message : String(e)).replace(REMOTE_PREFIX, "");
+    throw new Error(raw.startsWith(`${name}:`) ? raw : `${name}: ${raw}`);
   }
 }
 

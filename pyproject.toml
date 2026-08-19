@@ -5,16 +5,12 @@ description = "PoE1 单工艺与多步骤通货自动化工具"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "customtkinter>=5.2.0",
     "opencv-python>=4.8.0",
     "numpy>=1.24.0",
     "mss>=9.0.0",
-    "Pillow>=10.0.0",
     "pydirectinput>=1.0.4",
     "pyperclip>=1.8.2",
-    "pynput>=1.7.6",
     "pywin32>=306",
-    "pywebview>=6.2.1",
 ]
 
 [tool.uv]
