@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { CURRENCY_BY_LABEL, currencyLabel } from "../currencies";
-import { currencyCellHit, currencySlotCandidates } from "../stashGrid";
+import { currencyCellHit, currencySlotCandidates, hasCurrencyCell } from "../stashGrid";
 import type { MatchHit } from "../vision";
 import { makeWindow } from "./helpers";
 
@@ -135,6 +135,8 @@ describe("越界保护", () => {
   it("未收录的模板名没有候选格", () => {
     expect(currencySlotCandidates(win4k, "item_slot")).toEqual([]);
     expect(currencySlotCandidates(win4k, "currency_unknown")).toEqual([]);
+    expect(hasCurrencyCell("currency_divine")).toBe(false);
+    expect(hasCurrencyCell("currency_alteration")).toBe(true);
   });
 });
 

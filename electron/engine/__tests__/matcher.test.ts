@@ -256,6 +256,25 @@ describe("splitPatternKeywords", () => {
   });
 });
 
+describe("泛匹配「元素伤害提高」不吃攻击技能子串", () => {
+  it("不命中攻击技能那条，仍命中无限定的元素伤害", () => {
+    const attack = new Item();
+    attack.affixes = [new Affix("攻击技能的元素伤害提高 19%", [19])];
+    expect(matchItem(attack, [rule("元素伤害提高", ">=", 19)]).success).toBe(false);
+
+    const generic = new Item();
+    generic.affixes = [new Affix("元素伤害提高 19%", [19])];
+    expect(matchItem(generic, [rule("元素伤害提高", ">=", 19)]).success).toBe(true);
+  });
+
+  it("完整关键字「攻击技能的元素伤害提高」仍命中攻击那条", () => {
+    const attack = new Item();
+    attack.affixes = [new Affix("攻击技能的元素伤害提高 43%", [43])];
+    expect(matchItem(attack, [rule("攻击技能的元素伤害提高", ">=", 43)]).success).toBe(true);
+    expect(matchItem(attack, [rule("元素伤害提高", ">=", 19)]).success).toBe(false);
+  });
+});
+
 describe("normalizeOperator", () => {
   it("全角与别名归一到半角", () => {
     expect(normalizeOperator("≥")).toBe(">=");

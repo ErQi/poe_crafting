@@ -41,7 +41,10 @@ export function splitPatternKeywords(pattern: string): string[] {
 }
 
 function affixHasKeywords(text: string, keywords: string[]): boolean {
-  return keywords.every((k) => text.includes(k));
+  if (!keywords.every((k) => text.includes(k))) return false;
+  // 「元素伤害提高」是「攻击技能的元素伤害提高」的子串，泛匹配时排除后者。
+  if (keywords.length === 1 && keywords[0] === "元素伤害提高" && text.includes("攻击技能")) return false;
+  return true;
 }
 
 function compare(actual: number, op: string, threshold: number): boolean {

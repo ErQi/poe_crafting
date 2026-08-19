@@ -9,10 +9,12 @@ import {
   isCurrencyClipboardText,
   pointInHit,
   shouldSkipAugmentation,
+  stepTransition,
   workflowAssetLabel,
 } from "../automation";
 import { parseItemText } from "../itemParser";
 import { CraftStep } from "../models";
+import { defaultWorkflow, resolveTransition, TRANSITION_REPEAT } from "../workflow";
 import type { MatchHit } from "../vision";
 import { itemText, makeWindow, readSample } from "./helpers";
 
@@ -44,6 +46,16 @@ describe("shouldSkipAugmentation", () => {
   it("其他通货步骤永不跳过", () => {
     const twoMods = parseItemText(itemText("魔法", "元素伤害提高 19%", "+25% 冰霜抗性"));
     expect(shouldSkipAugmentation(alteration, twoMods)).toBe(false);
+  });
+
+  it("2 词缀魔法装跳过增幅时走 NEXT，即使未命中配成 REPEAT", () => {
+    const wf = defaultWorkflow();
+    const augment = wf.getStep("augment_missing_target")!;
+    augment.onFailure = TRANSITION_REPEAT;
+    const twoMods = parseItemText(itemText("魔法", "元素伤害提高 19%", "+25% 冰霜抗性"));
+    expect(shouldSkipAugmentation(augment, twoMods)).toBe(true);
+    expect(stepTransition(augment, twoMods, false)).not.toBe(TRANSITION_REPEAT);
+    expect(resolveTransition(wf, augment.id, stepTransition(augment, twoMods, false)).nextStepId).toBe("regal_t1_life");
   });
 
   it("按显式词缀数判断，不受固有词缀行数影响", () => {

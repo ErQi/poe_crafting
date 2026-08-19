@@ -66,6 +66,13 @@ describe("validateWorkflow", () => {
     expect(validateWorkflow(unknown).join()).toMatch(/选择了未内置的通货/);
   });
 
+  it("没有仓库格的内置通货报错", () => {
+    for (const currency of ["currency_divine", "currency_vaal", "currency_mirror"]) {
+      const wf = new CraftWorkflow({ steps: [step({ id: "a", name: "一", currencyTemplate: currency })] });
+      expect(validateWorkflow(wf).join()).toMatch(/选择了没有仓库格的通货/);
+    }
+  });
+
   it("禁用的步骤不检查通货", () => {
     const wf = new CraftWorkflow({
       steps: [step({ id: "a", currencyTemplate: "currency_nope", enabled: false }), step({ id: "b" })],
@@ -244,6 +251,7 @@ describe("内置示例流程「头盔·元素+生命」", () => {
     const s = wf.getStep("alteration_t1_elemental")!;
     expect(evaluateStep(parseItemText(itemText("魔法", "元素伤害提高 18%")), s).success).toBe(false);
     expect(evaluateStep(parseItemText(itemText("魔法", "元素伤害提高 19%")), s).success).toBe(true);
+    expect(evaluateStep(parseItemText(itemText("魔法", "攻击技能的元素伤害提高 19%")), s).success).toBe(false);
     expect(evaluateStep(parseItemText(itemText("魔法", "+129 最大生命")), s).success).toBe(false);
     expect(evaluateStep(parseItemText(itemText("魔法", "+130 最大生命")), s).success).toBe(true);
   });

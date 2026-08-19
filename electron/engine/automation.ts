@@ -36,6 +36,7 @@ import {
   resolveTransition,
   ROUTE_FINISH,
   ROUTE_STOP,
+  TRANSITION_NEXT,
   validateWorkflow,
 } from "./workflow";
 
@@ -153,6 +154,12 @@ export function shouldSkipAugmentation(step: CraftStep, item: Item): boolean {
   return step.currencyTemplate === "currency_augmentation" && item.craftAffixCount !== 1;
 }
 
+/** 跳过增幅视为本步未执行，固定走 NEXT，不用命中/未命中去向。 */
+export function stepTransition(step: CraftStep, item: Item, success: boolean): string {
+  if (shouldSkipAugmentation(step, item)) return TRANSITION_NEXT;
+  return success ? step.onSuccess : step.onFailure;
+}
+
 export class CraftAutomation {
   private onLog: (m: string) => void;
   private onStatus: (s: RunStatus) => void;
@@ -253,10 +260,9 @@ export class CraftAutomation {
     }
   }
 
-  /** 所有结束路径唯一出口：日志、running、停止原因、计数器都在这里收口。 */
+  /** 所有结束路径唯一出口：日志、running、停止原因、计数器都在这里收口。active 只在 runSafe finally 末尾清掉。 */
   private finish(reason: StopReasonValue, message: string, attempt = 0, unchanged = 0): void {
     this.log(`结束: ${reason} — ${message}`);
-    this.active = false;
     this.update({
       running: false,
       stopReason: reason,
@@ -493,9 +499,9 @@ export class CraftAutomation {
       console.log("[craft] after first: step", stepIndex, step.name);
       this.update({ attempt, workflowStepName: step.name, workflowStepIndex: stepIndex, message: `步骤 ${stepIndex}: ${step.name}` }, false);
       const t0 = Date.now();
-      const actionPerformed = !shouldSkipAugmentation(step, item);
+      const skipped = shouldSkipAugmentation(step, item);
       let nextItem: Item | null = null;
-      if (!actionPerformed) {
+      if (skipped) {
         nextItem = item;
         idle += 1;
         this.log(`显式词缀=${item.craftAffixCount}，跳过增幅`);
@@ -524,10 +530,15 @@ export class CraftAutomation {
         idle = 0;
       }
       item = nextItem;
-      const evaluation = evaluateStep(item, step);
-      this.update({ lastItem: item, lastMatch: evaluation.match });
-      this.log(`#${attempt} ${Date.now() - t0}ms | ${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
-      if (actionPerformed) {
+      let success = false;
+      if (skipped) {
+        unchanged = 0;
+        this.update({ lastItem: item, unchangedStreak: 0 });
+      } else {
+        const evaluation = evaluateStep(item, step);
+        success = evaluation.success;
+        this.update({ lastItem: item, lastMatch: evaluation.match });
+        this.log(`#${attempt} ${Date.now() - t0}ms | ${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
         const rawKey = `${item.rarity}|${item.affixTexts().join("|")}`;
         if (rawKey && rawKey === lastRaw && step.id === lastActionStepId) {
           unchanged += 1;
@@ -543,13 +554,10 @@ export class CraftAutomation {
         }
         lastRaw = rawKey;
         lastActionStepId = step.id;
-      } else {
-        unchanged = 0;
-        this.update({ unchangedStreak: 0 });
       }
       let route;
       try {
-        route = resolveTransition(workflow, step.id, evaluation.success ? step.onSuccess : step.onFailure);
+        route = resolveTransition(workflow, step.id, stepTransition(step, item, success));
       } catch (e) {
         reason = StopReason.ERROR;
         message = String(e);
@@ -671,8 +679,8 @@ export class CraftAutomation {
         for (const a of parsed.affixes) this.log(`  • ${a.text}`);
         break;
       }
-      const rawKey = parsed.affixTexts().join("|");
-      if (rawKey && rawKey === lastRaw) {
+      const rawKey = `${parsed.rarity}|${parsed.affixTexts().join("|")}`;
+      if (rawKey === lastRaw) {
         unchanged += 1;
         this.update({ unchangedStreak: unchanged });
         if (unchanged >= s.maxUnchanged) {
@@ -972,8 +980,8 @@ export class CraftAutomation {
     if (!park) return false;
     await this.moveToHit(park);
     clearClipboard();
-    const leftover = normalizeClipboardText(getClipboard());
-    if (leftover && isEquipmentClipboardText(leftover)) return false;
+    let leftover = normalizeClipboardText(getClipboard());
+    if (leftover && isEquipmentClipboardText(leftover)) leftover = "";
     const text = await this.copyItemText(Math.max(HOLD_CHECK_MS, this.copyTimeoutMs), leftover, true);
     return Boolean(text);
   }

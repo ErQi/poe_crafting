@@ -1,5 +1,6 @@
 import { CURRENCY_BY_TEMPLATE } from "./currencies";
 import { matchRuleset } from "./matcher";
+import { hasCurrencyCell } from "./stashGrid";
 import {
   CraftStep,
   CraftWorkflow,
@@ -108,6 +109,8 @@ export function validateWorkflow(workflow: CraftWorkflow): string[] {
     if (step.enabled && !step.currencyTemplate.trim()) errors.push(`${label}未选择使用通货`);
     else if (step.enabled && !(step.currencyTemplate in CURRENCY_BY_TEMPLATE)) {
       errors.push(`${label}选择了未内置的通货`);
+    } else if (step.enabled && !hasCurrencyCell(step.currencyTemplate)) {
+      errors.push(`${label}选择了没有仓库格的通货`);
     }
     if (!RARITY_VALUES.includes(step.expectedRarity)) {
       errors.push(`${label}的期望稀有度无效: ${step.expectedRarity}`);

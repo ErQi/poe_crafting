@@ -91,6 +91,10 @@ function neighborCells(row: number, col: number): [number, number][] {
   return out;
 }
 
+export function hasCurrencyCell(templateName: string): boolean {
+  return templateName in CURRENCY_CELLS;
+}
+
 export function currencySlotCandidates(win: WindowInfo, templateName: string): MatchHit[] {
   const slot = CURRENCY_CELLS[templateName];
   if (!slot) return [];

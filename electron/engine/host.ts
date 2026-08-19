@@ -15,6 +15,7 @@ import {
   takeLoadErrors,
 } from "./configStore";
 import { CURRENCIES, CURRENCY_BY_TEMPLATE, currencyLabel } from "./currencies";
+import { hasCurrencyCell } from "./stashGrid";
 import { focusGameWindow } from "./input";
 import { formatItemPreview, ItemParseError, parseItemText } from "./itemParser";
 import { matchRuleset, normalizeOperator, parseThresholdText } from "./matcher";
@@ -319,7 +320,10 @@ export class AppHost {
 
   private meta() {
     return {
-      currencies: CURRENCIES.map((c) => ({ label: c.label, template: c.templateName })),
+      currencies: CURRENCIES.filter((c) => hasCurrencyCell(c.templateName)).map((c) => ({
+        label: c.label,
+        template: c.templateName,
+      })),
       rarities: [
         { value: "", label: "不校验" },
         { value: "普通", label: "普通" },
