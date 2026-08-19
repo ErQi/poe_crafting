@@ -72,29 +72,29 @@ const CURSOR_CHECK_LOG: Record<string, string> = {
   like_pointer: "装备格光标仍像普通指针（光标上没有东西），不左键",
 };
 
-function clampMs(v: unknown, min: number, max: number, fallback: number): number {
+export function clampMs(v: unknown, min: number, max: number, fallback: number): number {
   const n = Number(v);
   return Number.isFinite(n) && n > 0 ? Math.min(max, Math.max(min, Math.round(n))) : fallback;
 }
 
-function workflowAssetLabel(name: string): string {
+export function workflowAssetLabel(name: string): string {
   if (name === "item_slot") return "目标装备";
   const label = currencyLabel(name);
   return label !== name ? `${label}图标` : name;
 }
 
-function hitClientRegion(hit: MatchHit): [number, number, number, number] {
+export function hitClientRegion(hit: MatchHit): [number, number, number, number] {
   const hw = Math.floor(hit.width / 2);
   const hh = Math.floor(hit.height / 2);
   return [hit.clientX - hw, hit.clientY - hh, hit.clientX - hw + hit.width, hit.clientY - hh + hit.height];
 }
 
-function hitCenterInRegion(hit: MatchHit, region: [number, number, number, number]): boolean {
+export function hitCenterInRegion(hit: MatchHit, region: [number, number, number, number]): boolean {
   const [left, top, right, bottom] = region;
   return left <= hit.clientX && hit.clientX < right && top <= hit.clientY && hit.clientY < bottom;
 }
 
-function hitInWindow(hit: MatchHit, win: WindowInfo): boolean {
+export function hitInWindow(hit: MatchHit, win: WindowInfo): boolean {
   return (
     Number.isFinite(hit.screenX) &&
     Number.isFinite(hit.screenY) &&
@@ -105,7 +105,7 @@ function hitInWindow(hit: MatchHit, win: WindowInfo): boolean {
   );
 }
 
-function pointInHit(x: number, y: number, hit: MatchHit): boolean {
+export function pointInHit(x: number, y: number, hit: MatchHit): boolean {
   const hw = Math.floor(hit.width / 2);
   const hh = Math.floor(hit.height / 2);
   return (
@@ -125,7 +125,7 @@ function cursorUnlike(a: Mat | null, b: Mat | null, limit = CURSOR_ON_CURRENCY_R
   return a != null && b != null && patchRmse(a, b) >= limit;
 }
 
-function hitsClose(a?: MatchHit | null, b?: MatchHit | null, px = 8): boolean {
+export function hitsClose(a?: MatchHit | null, b?: MatchHit | null, px = 8): boolean {
   if (!a || !b) return false;
   return Math.abs(a.screenX - b.screenX) <= px && Math.abs(a.screenY - b.screenY) <= px;
 }
@@ -134,7 +134,7 @@ function hitHalfCell(hit: MatchHit): number {
   return Math.max(1, Math.max(hit.width, hit.height) / 2);
 }
 
-function currencyHitConflict(hit: MatchHit, other: MatchHit): boolean {
+export function currencyHitConflict(hit: MatchHit, other: MatchHit): boolean {
   if (pointInHit(hit.screenX, hit.screenY, other) || pointInHit(other.screenX, other.screenY, hit)) return true;
   const half = Math.max(hitHalfCell(hit), hitHalfCell(other));
   const dx = hit.screenX - other.screenX;
@@ -142,14 +142,14 @@ function currencyHitConflict(hit: MatchHit, other: MatchHit): boolean {
   return dx * dx + dy * dy < half * half;
 }
 
-function isCurrencyClipboardText(text: string): boolean {
+export function isCurrencyClipboardText(text: string): boolean {
   const raw = (text || "").trim();
   if (!raw || raw.includes("未找到物品") || raw.startsWith("http")) return false;
   if (currencyStackCount(raw) != null) return true;
   return raw.includes("通货") || raw.includes("Currency");
 }
 
-function shouldSkipAugmentation(step: CraftStep, item: Item): boolean {
+export function shouldSkipAugmentation(step: CraftStep, item: Item): boolean {
   return step.currencyTemplate === "currency_augmentation" && item.craftAffixCount !== 1;
 }
 

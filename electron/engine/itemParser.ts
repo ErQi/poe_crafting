@@ -90,13 +90,18 @@ function taggedModKind(line: string): "implicit" | "enchant" | null {
   return null;
 }
 
+/** 冒号后的全部内容；JS 的 split(":", n) 会截断数组而不是保留剩余段，不能用。 */
+function metadataValue(normalized: string): string {
+  return normalized.slice(normalized.indexOf(":") + 1);
+}
+
 export function isEquipmentClipboardText(text: string): boolean {
   const raw = (text || "").trim();
   if (!raw || raw.includes("未找到物品") || raw.startsWith("http")) return false;
   for (const line of raw.split(/\r?\n/)) {
     const normalized = normalizeMetadataLine(line);
-    if (normalized.startsWith("物品类别:") && normalized.split(":", 2)[1].includes("通货")) return false;
-    if (normalized.startsWith("稀有度:") && ["通货", "Currency"].includes(normalized.split(":", 2)[1].trim())) {
+    if (normalized.startsWith("物品类别:") && metadataValue(normalized).includes("通货")) return false;
+    if (normalized.startsWith("稀有度:") && ["通货", "Currency"].includes(metadataValue(normalized).trim())) {
       return false;
     }
   }

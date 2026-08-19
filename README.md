@@ -37,8 +37,6 @@ npm run dev
 
 `npm start` 会构建 `web/` 并用 `file://` 加载；`npm run dev` 加载 `http://127.0.0.1:5173`。
 
-旧的 `uv run python main.py` / pywebview 不再是正式入口。
-
 ## 自定义匹配图片
 
 将 PNG 放到 `assets/templates/`，**推荐直接在 GUI 粘贴**：
@@ -53,7 +51,7 @@ npm run dev
 | `craft_button.png` | **必需** 执行工艺按钮 |
 | `item_slot.png` | **必需** 目标装备本身（工艺槽或背包内，悬停后 Ctrl+C） |
 
-多步骤模式**不需要通货图片**：通货按「非绑定 / 通用」通货页的仓库格坐标定位，右键前再悬停按 `Ctrl+C` 核对中文通货名与堆叠数量。仓库里的 `assets/templates/currency_*.png` 只供单元测试和 `scripts/calibrate-stash.cjs` 标定仓库格，不打进安装包。
+多步骤模式**不需要通货图片**：通货按「非绑定 / 通用」通货页的仓库格坐标定位，右键前再悬停按 `Ctrl+C` 核对中文通货名与堆叠数量。仓库里的 `assets/templates/currency_*.png` 只供 `scripts/calibrate-stash.cjs` 标定仓库格用，不打进安装包。
 
 截取建议：
 
@@ -102,23 +100,31 @@ npm run dev
 ## 项目结构
 
 ```
-package.json          npm start / npm run dev
+package.json          npm start / npm run dev / npm test
 electron/             主进程、IPC、热键、浮窗
-  engine/             从 Python 迁来的工艺引擎（正式实现）
+  engine/             工艺引擎（正式实现）
+  engine/__tests__/   vitest 单元测试与物品文本 fixture
 web/                  Vue 界面（花园 / 普通 / 模板）
 config/               settings.json / rules.json / workflows.json
-assets/templates/
-src/                  已废弃的 Python 实现，仅用于支撑 tests/
-tests/                pytest 单元测试（仓库唯一测试套件）
+assets/templates/     用户自截的匹配图 + 仓库格标定截图
+assets/build/         electron-builder 的 buildResources（icon.ico）
+scripts/              构建、开发热更新、仓库格标定
 ```
 
-`src/` 已不是运行入口，保留它的**唯一理由**是 `tests/` 依赖它：那是仓库里唯一的测试套件，
-覆盖词缀解析、阈值比较、流程状态机和模板匹配。改行为请改 `electron/engine/`；
-`tests/` 用不到的 Python 代码应当直接删除，而不是留在 `src/` 里。
+## 测试
+
+用 [vitest](https://vitest.dev/) 跑纯逻辑单元测试，Node 环境，不需要游戏窗口：
 
 ```powershell
-uv run --with pytest python -m pytest
+npm test          # 单次运行
+npm run test:watch
+npm run typecheck # tsc --noEmit
 ```
+
+覆盖 `electron/engine/` 下不依赖外部状态的部分：词缀解析与显式词缀计数、规则匹配与阈值比较、
+流程状态机与配置校验、通货仓库格坐标标定、设置项 clamp、浮窗文案。
+需要真实窗口、Win32 调用或截屏的代码（`vision.ts`、`win32.ts`、`input.ts`，以及
+`automation.ts` 的主循环）不在测试范围内；`automation.ts` 只覆盖其中的纯判定护栏。
 
 ## 限制
 

@@ -513,6 +513,8 @@ type NumericSettingKey = keyof typeof NUMERIC_SETTINGS;
 
 /** 解析 + 校验 + clamp；无法解析成有限数时返回 null，由调用方保留原值 */
 export function clampSetting(key: NumericSettingKey, value: unknown): number | null {
+  // Number(null) 和 Number("") 都是 0，会把空白的 template_threshold 变成「什么都匹配」
+  if (value == null || value === "") return null;
   const spec = NUMERIC_SETTINGS[key];
   const n = spec.int ? parseInt(String(value), 10) : Number(value);
   if (!Number.isFinite(n)) return null;

@@ -1,15 +1,8 @@
-.venv/
 .electron-data/
 node_modules/
 web/node_modules/
 electron/dist/
 web/dist/
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 dist/
 build/
 release/
@@ -18,6 +11,10 @@ tmp_crops/
 *.log
 .DS_Store
 Thumbs.db
+
+# assets/build 是 electron-builder 的 buildResources（icon.ico 等），
+# 不能被上面那条通用 build/ 规则挡掉
+!assets/build/
 
 # 运行时配置（出厂默认在 config/defaults/）
 config/*
