@@ -6,11 +6,22 @@ web/dist/
 dist/
 build/
 release/
+tools/.cache/
+assets/patcher/win-x64/
+/tools/PoeBundleTool/bin/
+/tools/PoeBundleTool/obj/
 dist_electron/
 tmp_crops/
+coverage/
+*.tsbuildinfo
 *.log
 .DS_Store
 Thumbs.db
+
+# 本地环境变量；示例配置仍可提交
+.env
+.env.*
+!.env.example
 
 # assets/build 是 electron-builder 的 buildResources（icon.ico 等），
 # 不能被上面那条通用 build/ 规则挡掉
@@ -19,6 +30,9 @@ Thumbs.db
 # 运行时配置（出厂默认在 config/defaults/）
 config/*
 !config/defaults/
+
+# 标价补丁的客户端基线、事务状态和临时文件
+/price-patch/
 
 # 用户自己截的模板与标定截图，不该进仓库
 assets/templates/*.jpg

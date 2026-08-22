@@ -34,6 +34,10 @@ function resolveDevUserData(): string {
 }
 
 app.commandLine.appendSwitch("disable-gpu-shader-disk-cache");
+// 品牌更名不迁移用户数据目录，避免老用户升级后看起来像配置被清空。
+if (app.isPackaged) {
+  app.setPath("userData", path.join(app.getPath("appData"), "PoeCrafting"));
+}
 if (DEV) {
   app.setPath("userData", resolveDevUserData());
   app.commandLine.appendSwitch("disk-cache-size", "0");
@@ -437,7 +441,7 @@ function bindHost(): void {
 
 async function createMain(): Promise<void> {
   const win = new BrowserWindow({
-    title: "PoE1 自动工艺",
+    title: "POE Tools",
     width: 1180,
     height: 800,
     minWidth: 960,

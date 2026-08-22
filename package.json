@@ -1,21 +1,22 @@
 {
   "name": "poe-crafting",
   "private": true,
-  "version": "0.2.0",
-  "description": "PoE1 自动工艺 — Electron",
-  "productName": "PoeCrafting",
-  "author": "poe-crafting",
+  "version": "0.3.0",
+  "description": "POE Tools",
+  "productName": "POE Tools",
+  "author": "Faith",
   "main": "electron/dist/main.js",
   "scripts": {
+    "build:patcher": "node scripts/build-patcher.cjs",
     "build:electron": "node scripts/build-electron.cjs",
     "build:web": "npm run build --prefix web",
     "build": "npm run build:web && npm run build:electron",
-    "build:exe": "npm run build && electron-builder --win portable",
-    "dev": "node scripts/dev.cjs",
+    "build:exe": "npm run build:patcher && npm run build && electron-builder --win portable",
+    "dev": "npm run build:patcher && node scripts/dev.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",
-    "start": "npm run build && electron .",
+    "start": "npm run build:patcher && npm run build && electron .",
     "postinstall": "npm install --prefix web"
   },
   "dependencies": {
@@ -39,7 +40,8 @@
     "asar": true,
     "asarUnpack": [
       "node_modules/koffi/**",
-      "node_modules/opencv-wasm/**"
+      "node_modules/opencv-wasm/**",
+      "assets/patcher/**"
     ],
     "files": [
       "package.json",
@@ -47,6 +49,7 @@
       "!electron/dist/*.map",
       "web/dist/**/*",
       "config/defaults/*.json",
+      "assets/patcher/win-x64/**/*",
       "assets/templates/README.txt",
       "!node_modules/koffi/build/koffi/!(win32_${arch})/**",
       "!node_modules/koffi/build/koffi/*/*.{exp,lib}",
@@ -65,7 +68,7 @@
       ]
     },
     "portable": {
-      "artifactName": "PoeCrafting-${version}-portable.${ext}"
+      "artifactName": "POE-Tools-${version}-portable.${ext}"
     }
   }
 }

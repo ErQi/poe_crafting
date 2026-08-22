@@ -5,7 +5,6 @@ const path = require("path");
 
 const root = path.join(__dirname, "..");
 const web = path.join(root, "web");
-const electronDir = path.join(root, "electron");
 const DEV_URL = "http://127.0.0.1:5173";
 
 let electron = null;
@@ -148,13 +147,6 @@ function buildElectron() {
   execSync("node scripts/build-electron.cjs --sourcemap", { cwd: root, stdio: "inherit" });
 }
 
-function isElectronSource(filename) {
-  if (!filename) return false;
-  const n = String(filename).replace(/\\/g, "/");
-  if (n === "dist" || n.startsWith("dist/")) return false;
-  return /\.(ts|js|html|css|json)$/.test(n);
-}
-
 async function main() {
   buildElectron();
 
@@ -184,7 +176,6 @@ async function main() {
   };
 
   let generation = 0;
-  let restarting = false;
   let stopping = false;
 
   // 关终端 / Ctrl+C 都要等 taskkill 真正做完，否则 electron.exe 变孤儿
@@ -243,48 +234,10 @@ async function main() {
     stop(code);
   }
 
-  function waitExit(child) {
-    if (!child || child.exitCode != null) return Promise.resolve();
-    return new Promise((resolve) => {
-      child.once("exit", resolve);
-      setTimeout(resolve, 4000);
-    });
-  }
-
-  async function restartElectron() {
-    if (restarting) return;
-    restarting = true;
-    generation += 1;
-    const prev = electron;
-    try {
-      console.log("[dev] 检测到 electron/ 变动，重建并重启");
-      buildElectron();
-      killTree(prev);
-      await waitExit(prev);
-      await waitPidsGone(appElectronPids(), 4000);
-      startElectron();
-    } catch (err) {
-      console.error("[dev] 重启失败:", err);
-    } finally {
-      restarting = false;
-    }
-  }
-
-  console.log(`[dev] 加载 ${DEV_URL}（Vue 热更新；改 electron/ 会重启进程）`);
+  console.log(`[dev] 加载 ${DEV_URL}（仅 Vue 热更新；Electron 源码变更需手动重启开发进程）`);
   killAppElectrons();
   await waitPidsGone(appElectronPids(), 4000);
   startElectron();
-
-  let debounce;
-  try {
-    fs.watch(electronDir, { recursive: true }, (_evt, filename) => {
-      if (!isElectronSource(filename)) return;
-      clearTimeout(debounce);
-      debounce = setTimeout(() => void restartElectron(), 300);
-    });
-  } catch (err) {
-    console.error("[dev] 无法监视 electron/:", err);
-  }
 
   for (const signal of ["SIGINT", "SIGTERM", "SIGBREAK", "SIGHUP"]) {
     process.on(signal, () => stop(0));

@@ -37,19 +37,22 @@ import { formatCompletionOverlayLines, STOP_REASON_TEXT } from "./overlayFormat"
 import { dataRoot } from "./paths";
 import { initVision, VisionError, VisionService } from "./vision";
 import { TRANSITION_GOTO_PREFIX, TRANSITION_STOP, validateWorkflow } from "./workflow";
+import { PricePatchController } from "../pricePatch/controller";
 
 export const UI_HELP = "help";
 export const UI_GARDEN = "garden";
 export const UI_NORMAL = "normal";
 export const UI_TEMPLATES = "templates";
 export const UI_SETTINGS = "settings";
-const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_SETTINGS];
+export const UI_PRICE_PATCH = "price_patch";
+const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_PRICE_PATCH, UI_SETTINGS];
 const UI_PAGE_LABELS: Record<string, string> = {
   [UI_HELP]: "使用说明",
   [UI_SETTINGS]: "设置",
   [UI_TEMPLATES]: "模板",
+  [UI_PRICE_PATCH]: "标价补丁",
 };
-const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES];
+const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES, UI_PRICE_PATCH];
 
 const TEMPLATE_SLOTS: [string, string, boolean][] = [
   ["craft_button", "执行工艺按钮", true],
@@ -149,6 +152,7 @@ export class AppHost {
   alert: { id: number; title: string; message: string } | null = null;
   private alertId = 0;
   automation: CraftAutomation;
+  private readonly pricePatch: PricePatchController;
   private uiPage = UI_NORMAL;
   private lastCraftPage = UI_NORMAL;
   private pushFn: ((rt: Record<string, unknown>) => void) | null = null;
@@ -168,6 +172,7 @@ export class AppHost {
     this.library = loadLibrary(resolvePath(this.settings.workflowFile));
     this.workflow = this.library.active();
     this.automation = new CraftAutomation((m) => this.onLog(m), (s) => this.onStatus(s));
+    this.pricePatch = new PricePatchController();
     this.uiPage = UI_HELP;
     this.lastCraftPage = this.settings.craftMode === CraftMode.WORKFLOW ? UI_NORMAL : UI_GARDEN;
     const configErrors = takeLoadErrors();
@@ -225,10 +230,12 @@ export class AppHost {
   attach(push: (rt: Record<string, unknown>) => void, overlay: OverlayBridge): void {
     this.pushFn = push;
     this.overlay = overlay;
+    this.pricePatch.start(() => this.push());
   }
 
   shutdown(): void {
     this.automation.requestStop(StopReason.USER_STOP);
+    this.pricePatch.shutdown();
   }
 
   /** 热键值变化时重新注册；注册入口只有这一个，避免同一件事两个触发点 */
@@ -289,6 +296,7 @@ export class AppHost {
       meta: this.meta(),
       runtime: this.runtime(),
       templates: this.templateRows(),
+      price_patch: this.pricePatch.view(),
     };
   }
 
@@ -315,6 +323,7 @@ export class AppHost {
       template_test: { ...this.templateTest },
       pending_info: this.pendingInfo(),
       init_error: this.initError,
+      price_patch: this.pricePatch.view(),
     };
   }
 
@@ -427,6 +436,9 @@ export class AppHost {
       open_data_dir: () => this.openDataDir(),
       refresh_templates: () => this.refreshTemplates(),
       test_templates: () => this.testTemplates(),
+      price_patch_apply: () => this.pricePatch.apply(),
+      price_patch_restore: () => this.pricePatch.restore(),
+      price_patch_set_auto: (enabled) => this.pricePatch.setAutoUpdate(Boolean(enabled)),
     };
     const fn = map[name];
     if (!fn) return err(`未知接口: ${name}`);

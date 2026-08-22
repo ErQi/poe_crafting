@@ -18,6 +18,7 @@ import HelpPage from "./pages/HelpPage.vue";
 import CraftPage from "./pages/CraftPage.vue";
 import WorkflowPage from "./pages/WorkflowPage.vue";
 import TemplatesPage from "./pages/TemplatesPage.vue";
+import PricePatchPage from "./pages/PricePatchPage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
 
 const tab = ref("help");
@@ -45,6 +46,10 @@ function apply(res) {
   if (res.settings) state.value.settings = res.settings;
   if (res.ruleset) state.value.ruleset = res.ruleset;
   if (res.templates) state.value.templates = res.templates;
+  if (res.price_patch) {
+    state.value.price_patch = res.price_patch;
+    runtime.value.price_patch = res.price_patch;
+  }
   if (res.meta) state.value.meta = res.meta;
   if (res.item_preview) {
     state.value.item_preview = res.item_preview;
@@ -275,12 +280,13 @@ async function removeStep(id) {
 <template>
   <div class="shell">
     <header class="top">
-      <div class="brand">PoE1 自动工艺</div>
+      <div class="brand">POE Tools</div>
       <nav v-if="state && !splash">
         <button type="button" :class="{ on: tab === 'help' }" @click="setTab('help')">使用说明</button>
         <button type="button" :class="{ on: tab === 'garden' }" @click="setTab('garden')">花园工艺</button>
         <button type="button" :class="{ on: tab === 'normal' }" @click="setTab('normal')">普通工艺</button>
         <button type="button" class="sub" :class="{ on: tab === 'templates' }" @click="setTab('templates')">模板</button>
+        <button type="button" class="sub" :class="{ on: tab === 'price_patch' }" @click="setTab('price_patch')">标价补丁</button>
         <button type="button" class="sub" :class="{ on: tab === 'settings' }" @click="setTab('settings')">设置</button>
       </nav>
       <div class="drag-fill" />
@@ -379,6 +385,14 @@ async function removeStep(id) {
         @open="wrap(() => call('open_templates_dir'))"
         @test="wrap(() => call('test_templates'))"
         @refresh="wrap(() => call('refresh_templates'))"
+      />
+      <PricePatchPage
+        v-show="tab === 'price_patch'"
+        :state="state"
+        :runtime="runtime"
+        @apply="applyCall(() => call('price_patch_apply'))"
+        @restore="applyCall(() => call('price_patch_restore'))"
+        @auto="(enabled) => applyCall(() => call('price_patch_set_auto', enabled))"
       />
       <SettingsPage
         v-show="tab === 'settings'"

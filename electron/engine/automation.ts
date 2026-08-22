@@ -154,9 +154,9 @@ export function shouldSkipAugmentation(step: CraftStep, item: Item): boolean {
   return step.currencyTemplate === "currency_augmentation" && item.craftAffixCount !== 1;
 }
 
-/** 跳过增幅视为本步未执行，固定走 NEXT，不用命中/未命中去向。 */
+/** 跳过增幅时不执行动作；现有词缀已满足本步则走命中路由，否则固定 NEXT，避免 REPEAT 空转。 */
 export function stepTransition(step: CraftStep, item: Item, success: boolean): string {
-  if (shouldSkipAugmentation(step, item)) return TRANSITION_NEXT;
+  if (shouldSkipAugmentation(step, item)) return success ? step.onSuccess : TRANSITION_NEXT;
   return success ? step.onSuccess : step.onFailure;
 }
 
@@ -532,8 +532,11 @@ export class CraftAutomation {
       item = nextItem;
       let success = false;
       if (skipped) {
+        const evaluation = evaluateStep(item, step);
+        success = evaluation.success;
         unchanged = 0;
-        this.update({ lastItem: item, unchangedStreak: 0 });
+        this.update({ lastItem: item, lastMatch: evaluation.match, unchangedStreak: 0 });
+        this.log(`未消耗增幅，检查现有词缀：${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
       } else {
         const evaluation = evaluateStep(item, step);
         success = evaluation.success;

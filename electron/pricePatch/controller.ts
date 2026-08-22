@@ -1,0 +1,249 @@
+import { loadJson, resolvePath, saveJson } from "../engine/configStore";
+import { ClientPricePatcher, GameRunningError } from "./clientPatcher";
+import { isGameRunning } from "./clientLocator";
+import { PoeCurrencyPriceSource } from "./priceSource";
+import {
+  defaultPricePatchState,
+  pricePatchStateFrom,
+  pricePatchView,
+  type PricePatchPendingAction,
+  type PricePatchState,
+  type PricePatchView,
+} from "./types";
+
+const UPDATE_INTERVAL_MS = 60 * 60 * 1000;
+const TICK_MS = 15_000;
+const RETRY_MS = 10 * 60 * 1000;
+
+function time(value: string): number {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+export class PricePatchController {
+  private readonly stateFile = resolvePath("config/price-patch.json");
+  private state: PricePatchState;
+  private timer: ReturnType<typeof setInterval> | null = null;
+  private notify: (() => void) | null = null;
+  private operation: Promise<void> | null = null;
+
+  constructor(
+    private readonly source = new PoeCurrencyPriceSource(),
+    private readonly patcher = new ClientPricePatcher(),
+    private readonly gameRunning: () => Promise<boolean> = isGameRunning,
+  ) {
+    const loaded = loadJson(this.stateFile, defaultPricePatchState());
+    this.state = pricePatchStateFrom(loaded);
+  }
+
+  view(): PricePatchView {
+    return pricePatchView(this.state);
+  }
+
+  start(notify: () => void): void {
+    this.notify = notify;
+    if (this.state.pendingAction) {
+      this.state.phase = "waiting";
+      this.state.statusText = this.state.pendingAction === "restore" ? "等待游戏退出后恢复原版" : "等待游戏退出后更新价格";
+      this.persist();
+    } else if (this.state.applied && this.state.phase !== "error") {
+      this.state.phase = "idle";
+      this.state.statusText = "已应用";
+    }
+    if (!this.timer) this.timer = setInterval(() => void this.tick(), TICK_MS);
+    setTimeout(() => void this.tick(), 1000);
+  }
+
+  shutdown(): void {
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    this.notify = null;
+  }
+
+  private persist(): void {
+    saveJson(this.stateFile, this.state);
+    this.notify?.();
+  }
+
+  private patch(values: Partial<PricePatchState>, persist = true): void {
+    Object.assign(this.state, values);
+    if (persist) this.persist();
+    else this.notify?.();
+  }
+
+  private waiting(action: Exclude<PricePatchPendingAction, null>): void {
+    const restoring = action === "restore";
+    this.patch({
+      pendingAction: action,
+      phase: "waiting",
+      statusText: restoring ? "游戏运行中，退出后将自动恢复原版" : "游戏运行中，退出后将自动应用最新价格",
+      error: "",
+    });
+  }
+
+  private due(now = Date.now()): boolean {
+    if (!this.state.applied || !this.state.autoUpdate) return false;
+    if (this.state.nextRetryAt && now < time(this.state.nextRetryAt)) return false;
+    return !this.state.lastUpdatedAt || now - time(this.state.lastUpdatedAt) >= UPDATE_INTERVAL_MS;
+  }
+
+  private async tick(): Promise<void> {
+    try {
+      if (this.operation) return;
+      const action = this.state.pendingAction;
+      if (action) {
+        if (action === "update" && this.state.nextRetryAt && Date.now() < time(this.state.nextRetryAt)) return;
+        if (await this.gameRunning()) return;
+        if (action === "restore") await this.startOperation(() => this.runRestore());
+        else await this.startOperation(() => this.runApply(action));
+        return;
+      }
+      if (!this.due()) return;
+      if (await this.gameRunning()) {
+        this.waiting("update");
+        return;
+      }
+      await this.startOperation(() => this.runApply("update"));
+    } catch {
+      // runApply/runRestore 已把完整错误写入状态；定时器不能再制造未处理拒绝。
+    }
+  }
+
+  private async startOperation(run: () => Promise<void>): Promise<void> {
+    if (this.operation) return this.operation;
+    this.operation = run().finally(() => {
+      this.operation = null;
+    });
+    return this.operation;
+  }
+
+  private async runApply(action: "apply" | "update"): Promise<void> {
+    this.patch({
+      pendingAction: action,
+      phase: "applying",
+      statusText: action === "apply" ? "正在应用标价补丁…" : "正在更新最新价格…",
+      error: "",
+    });
+    try {
+      const clientRoot = await this.patcher.clientRoot(this.state.clientRoot);
+      const checkedAt = new Date().toISOString();
+      this.patch({ clientRoot, lastCheckedAt: checkedAt }, false);
+      const prices = await this.source.fetch();
+      const result = await this.patcher.apply(clientRoot, this.state, prices);
+      const completedAt = new Date().toISOString();
+      this.patch({
+        clientRoot,
+        baselineId: result.baselineId,
+        applied: true,
+        pendingAction: null,
+        phase: "idle",
+        statusText: result.skipped ? "已应用，当前价格无需改写" : `已应用，已标价 ${result.matchedCount} 个物品`,
+        lastUpdatedAt: completedAt,
+        lastCheckedAt: completedAt,
+        sourceUpdatedAt: prices.sourceUpdatedAt,
+        nextRetryAt: "",
+        lastPriceDigest: prices.digest,
+        lastPatchedResourceSha256: result.patchedResourceSha256,
+        appliedFiles: result.appliedFiles,
+        appliedCustomFiles: result.appliedCustomFiles,
+        updatedItemCount: result.matchedCount,
+        error: "",
+      });
+    } catch (error) {
+      if (error instanceof GameRunningError) {
+        this.waiting(action);
+        return;
+      }
+      const message = errorText(error);
+      const retry = action === "update";
+      this.patch({
+        pendingAction: retry ? "update" : null,
+        phase: "error",
+        statusText: `应用失败：${message}`,
+        nextRetryAt: retry ? new Date(Date.now() + RETRY_MS).toISOString() : "",
+        error: message,
+      });
+      throw error;
+    }
+  }
+
+  private async runRestore(): Promise<void> {
+    this.patch({ pendingAction: "restore", phase: "restoring", statusText: "正在校验备份并恢复原版…", error: "" });
+    try {
+      const clientRoot = await this.patcher.clientRoot(this.state.clientRoot);
+      const result = await this.patcher.restore(clientRoot, this.state);
+      this.patch({
+        clientRoot,
+        baselineId: result.baselineId,
+        applied: false,
+        pendingAction: null,
+        phase: "idle",
+        statusText: result.restored ? "已取消补丁，客户端已恢复原版" : "未应用标价补丁",
+        nextRetryAt: "",
+        lastPriceDigest: "",
+        lastPatchedResourceSha256: "",
+        appliedFiles: [],
+        appliedCustomFiles: [],
+        updatedItemCount: 0,
+        error: "",
+      });
+    } catch (error) {
+      if (error instanceof GameRunningError) {
+        this.waiting("restore");
+        return;
+      }
+      const message = errorText(error);
+      this.patch({
+        pendingAction: null,
+        phase: "error",
+        statusText: `恢复失败，客户端未继续改动：${message}`,
+        error: message,
+      });
+      throw error;
+    }
+  }
+
+  async apply(): Promise<Record<string, unknown>> {
+    if (this.operation) return { ok: false, error: "标价补丁正在处理中", price_patch: this.view() };
+    if (await this.gameRunning()) {
+      this.waiting("apply");
+      return { ok: true, price_patch: this.view() };
+    }
+    try {
+      await this.startOperation(() => this.runApply("apply"));
+      return { ok: true, price_patch: this.view() };
+    } catch (error) {
+      return { ok: false, error: errorText(error), price_patch: this.view() };
+    }
+  }
+
+  async restore(): Promise<Record<string, unknown>> {
+    if (this.operation) return { ok: false, error: "标价补丁正在处理中", price_patch: this.view() };
+    if (await this.gameRunning()) {
+      this.waiting("restore");
+      return { ok: true, price_patch: this.view() };
+    }
+    try {
+      await this.startOperation(() => this.runRestore());
+      return { ok: true, price_patch: this.view() };
+    } catch (error) {
+      return { ok: false, error: errorText(error), price_patch: this.view() };
+    }
+  }
+
+  setAutoUpdate(enabled: boolean): Record<string, unknown> {
+    const pendingAction = !enabled && this.state.pendingAction === "update" ? null : this.state.pendingAction;
+    this.patch({
+      autoUpdate: enabled,
+      pendingAction,
+      phase: pendingAction ? "waiting" : this.state.phase === "waiting" ? "idle" : this.state.phase,
+      statusText: pendingAction ? this.state.statusText : this.state.applied ? "已应用" : "尚未应用",
+    });
+    if (enabled) setTimeout(() => void this.tick(), 0);
+    return { ok: true, price_patch: this.view() };
+  }
+}

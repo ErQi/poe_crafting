@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="LibBundle3">
+      <HintPath>$(LibGGPK3Dir)\LibBundle3.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="SystemExtensions">
+      <HintPath>$(LibGGPK3Dir)\SystemExtensions.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <None Include="$(LibGGPK3Dir)\oo2core.dll" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

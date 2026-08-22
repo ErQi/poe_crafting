@@ -14,7 +14,7 @@ import {
 } from "../automation";
 import { parseItemText } from "../itemParser";
 import { CraftStep } from "../models";
-import { defaultWorkflow, resolveTransition, TRANSITION_REPEAT } from "../workflow";
+import { defaultWorkflow, evaluateStep, resolveTransition, TRANSITION_FINISH, TRANSITION_REPEAT } from "../workflow";
 import type { MatchHit } from "../vision";
 import { itemText, makeWindow, readSample } from "./helpers";
 
@@ -56,6 +56,17 @@ describe("shouldSkipAugmentation", () => {
     expect(shouldSkipAugmentation(augment, twoMods)).toBe(true);
     expect(stepTransition(augment, twoMods, false)).not.toBe(TRANSITION_REPEAT);
     expect(resolveTransition(wf, augment.id, stepTransition(augment, twoMods, false)).nextStepId).toBe("regal_t1_life");
+  });
+
+  it("2 词缀魔法装跳过增幅时，完整目标已命中则走命中路由", () => {
+    const wf = defaultWorkflow();
+    const augment = wf.getStep("augment_missing_target")!;
+    augment.onSuccess = TRANSITION_FINISH;
+    const complete = parseItemText(itemText("魔法", "元素伤害提高 19%", "+130 最大生命"));
+    const evaluation = evaluateStep(complete, augment);
+    expect(shouldSkipAugmentation(augment, complete)).toBe(true);
+    expect(evaluation.success).toBe(true);
+    expect(stepTransition(augment, complete, evaluation.success)).toBe(TRANSITION_FINISH);
   });
 
   it("按显式词缀数判断，不受固有词缀行数影响", () => {
