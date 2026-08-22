@@ -36,7 +36,12 @@ import {
 import { formatCompletionOverlayLines, STOP_REASON_TEXT } from "./overlayFormat";
 import { dataRoot } from "./paths";
 import { initVision, VisionError, VisionService } from "./vision";
-import { TRANSITION_GOTO_PREFIX, TRANSITION_STOP, validateWorkflow } from "./workflow";
+import {
+  EXPLICIT_AFFIX_COUNT_VALUES,
+  TRANSITION_GOTO_PREFIX,
+  TRANSITION_STOP,
+  validateWorkflow,
+} from "./workflow";
 import { PricePatchController } from "../pricePatch/controller";
 
 export const UI_HELP = "help";
@@ -339,6 +344,10 @@ export class AppHost {
         { value: "魔法", label: "魔法" },
         { value: "稀有", label: "稀有" },
       ],
+      affix_counts: [
+        { value: "", label: "不校验" },
+        ...EXPLICIT_AFFIX_COUNT_VALUES.map((value) => ({ value, label: `${value} 条` })),
+      ],
       ops: ["", ">=", ">", "<=", "<", "="],
       template_slots: TEMPLATE_SLOTS.map(([key, title, required]) => ({ key, title, required })),
       hotkey_start: this.hotkeyLabel("start"),
@@ -530,7 +539,17 @@ export class AppHost {
     if ("name" in fields) step.name = String(fields.name || "").trim() || "未命名步骤";
     if ("enabled" in fields) step.enabled = Boolean(fields.enabled);
     if ("currency_template" in fields) step.currencyTemplate = String(fields.currency_template || "").trim();
+    if ("before_affix_count" in fields) {
+      const raw = fields.before_affix_count;
+      const parsed = raw == null || raw === "" ? null : Number(raw);
+      step.beforeAffixCount = parsed == null || !Number.isFinite(parsed) ? null : parsed;
+    }
     if ("expected_rarity" in fields) step.expectedRarity = String(fields.expected_rarity || "").trim();
+    if ("expected_affix_count" in fields) {
+      const raw = fields.expected_affix_count;
+      const parsed = raw == null || raw === "" ? null : Number(raw);
+      step.expectedAffixCount = parsed == null || !Number.isFinite(parsed) ? null : parsed;
+    }
     if ("on_success" in fields) step.onSuccess = String(fields.on_success || TRANSITION_STOP);
     if ("on_failure" in fields) step.onFailure = String(fields.on_failure || TRANSITION_STOP);
     this.library.put(this.workflow);

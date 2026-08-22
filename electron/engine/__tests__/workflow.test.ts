@@ -6,6 +6,7 @@ import {
   defaultLibrary,
   defaultWorkflow,
   evaluateStep,
+  evaluateStepPrecondition,
   firstEnabledStep,
   resolveTransition,
   ROUTE_FINISH,
@@ -87,6 +88,21 @@ describe("validateWorkflow", () => {
     }
     const bad = new CraftWorkflow({ steps: [step({ id: "a", name: "一", expectedRarity: "传奇" })] });
     expect(validateWorkflow(bad).join()).toMatch(/期望稀有度无效: 传奇/);
+  });
+
+  it("动作前后显式词缀数只能是不校验或 0–6 的整数", () => {
+    for (const count of [null, 0, 1, 2, 3, 4, 5, 6]) {
+      const before = new CraftWorkflow({ steps: [step({ id: "a", beforeAffixCount: count })] });
+      const after = new CraftWorkflow({ steps: [step({ id: "a", expectedAffixCount: count })] });
+      expect(validateWorkflow(before).join()).not.toMatch(/动作前显式词缀数无效/);
+      expect(validateWorkflow(after).join()).not.toMatch(/动作后显式词缀数无效/);
+    }
+    for (const count of [-1, 1.5, 7]) {
+      const before = new CraftWorkflow({ steps: [step({ id: "a", name: "一", beforeAffixCount: count })] });
+      const after = new CraftWorkflow({ steps: [step({ id: "a", name: "一", expectedAffixCount: count })] });
+      expect(validateWorkflow(before).join()).toMatch(/动作前显式词缀数无效/);
+      expect(validateWorkflow(after).join()).toMatch(/动作后显式词缀数无效/);
+    }
   });
 
   it("分支去向必须是内置动作或指向已启用步骤", () => {
@@ -211,6 +227,27 @@ describe("evaluateStep", () => {
     expect(evaluateStep(parseItemText(itemText("普通")), s).rarityMatched).toBe(true);
   });
 
+  it("显式词缀数量与稀有度、词缀规则同时参与命中判定", () => {
+    const s = step({
+      expectedAffixCount: 1,
+      ruleset: new RuleSet({
+        groups: [new RuleGroup({ rules: [new MatchRule({ pattern: "最大生命", operator: ">=", threshold: 100 })] })],
+      }),
+    });
+    const one = evaluateStep(parseItemText(itemText("魔法", "+110 最大生命")), s);
+    const two = evaluateStep(parseItemText(itemText("魔法", "+110 最大生命", "+52 智慧")), s);
+    expect(one).toMatchObject({ success: true, affixCountMatched: true, rulesMatched: true });
+    expect(two).toMatchObject({ success: false, affixCountMatched: false, rulesMatched: true });
+    expect(two.summary).toMatch(/✗显式词缀数=1（实际=2）/);
+  });
+
+  it("只配置显式词缀数量时不显示无条件", () => {
+    const s = step({ expectedRarity: "", expectedAffixCount: 0, ruleset: new RuleSet({ groups: [] }) });
+    const result = evaluateStep(parseItemText(itemText("普通")), s);
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("✓显式词缀数=0（实际=0）");
+  });
+
   it("没有启用规则时只看稀有度，摘要写「无条件」", () => {
     const s = step({ expectedRarity: "", ruleset: new RuleSet({ groups: [] }) });
     const r = evaluateStep(parseItemText(itemText("普通")), s);
@@ -227,6 +264,49 @@ describe("evaluateStep", () => {
     });
     const r = evaluateStep(parseItemText(itemText("魔法", "+130 最大生命")), s);
     expect(r.match.success).toBe(false);
+  });
+});
+
+describe("evaluateStepPrecondition", () => {
+  it("未配置动作前条件时不因通货种类自动跳过", () => {
+    const augment = step({ currencyTemplate: "currency_augmentation", beforeAffixCount: null });
+    const twoMods = parseItemText(itemText("魔法", "+110 最大生命", "+52 智慧"));
+    expect(evaluateStepPrecondition(twoMods, augment)).toMatchObject({ success: true, affixCountMatched: true });
+  });
+
+  it("配置为 1 时只放行恰好一条显式词缀", () => {
+    const configured = step({ beforeAffixCount: 1 });
+    const oneMod = evaluateStepPrecondition(parseItemText(itemText("魔法", "+110 最大生命")), configured);
+    const twoMods = evaluateStepPrecondition(
+      parseItemText(itemText("魔法", "+110 最大生命", "+52 智慧")),
+      configured,
+    );
+    expect(oneMod.success).toBe(true);
+    expect(twoMods.success).toBe(false);
+    expect(twoMods.summary).toBe("✗动作前显式词缀数=1（实际=2）");
+  });
+
+  it("动作前条件按显式词缀计数，不把固有词缀算进去", () => {
+    const configured = step({ beforeAffixCount: 1 });
+    const withImplicit = parseItemText(
+      [
+        "物品类别: 头部",
+        "稀有度: 魔法",
+        "测试头盔",
+        "威武皮盔",
+        "--------",
+        "物品等级: 84",
+        "--------",
+        "+20 最大生命 (implicit)",
+        "--------",
+        "元素伤害提高 19%",
+        "--------",
+        "已鉴定",
+      ].join("\n"),
+    );
+    expect(withImplicit.affixes.length).toBe(2);
+    expect(withImplicit.craftAffixCount).toBe(1);
+    expect(evaluateStepPrecondition(withImplicit, configured).success).toBe(true);
   });
 });
 
@@ -345,6 +425,8 @@ describe("内置流程库", () => {
   it("蓝装两词缀流程的增幅步骤要求两个目标同时具备", () => {
     const wf = beltRecombinatorWorkflows().find((w) => w.id === "belt-life-fireres")!;
     const augment = wf.getStep("belt-life-fireres__augment")!;
+    expect(augment.beforeAffixCount).toBe(1);
+    expect(augment.expectedAffixCount).toBe(2);
     expect(evaluateStep(parseItemText(itemText("魔法", "+130 最大生命")), augment).success).toBe(false);
     expect(
       evaluateStep(parseItemText(itemText("魔法", "+130 最大生命", "+46% 冰霜抗性")), augment).success,

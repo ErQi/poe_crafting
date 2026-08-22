@@ -8,90 +8,20 @@ import {
   hitsClose,
   isCurrencyClipboardText,
   pointInHit,
-  shouldSkipAugmentation,
-  stepTransition,
   workflowAssetLabel,
 } from "../automation";
-import { parseItemText } from "../itemParser";
-import { CraftStep } from "../models";
-import { defaultWorkflow, evaluateStep, resolveTransition, TRANSITION_FINISH, TRANSITION_REPEAT } from "../workflow";
 import type { MatchHit } from "../vision";
-import { itemText, makeWindow, readSample } from "./helpers";
+import { makeWindow, readSample } from "./helpers";
 
 /**
  * automation.ts 的循环主体依赖真实窗口、截屏、剪贴板和光标状态，替身要跟着私有方法签名走，
  * 一改接口就烂；这里只覆盖不依赖外部状态的纯判定：「该不该点」「点的是不是同一个东西」
- * 这类护栏，以及跳过增幅的条件。
+ * 这类护栏。步骤前置条件作为纯流程语义在 workflow.test.ts 覆盖。
  */
 
 function makeHit(x: number, y: number, size: number, name = "hit"): MatchHit {
   return { name, score: 1, screenX: x, screenY: y, clientX: x, clientY: y, width: size, height: size };
 }
-
-describe("shouldSkipAugmentation", () => {
-  const augment = new CraftStep({ currencyTemplate: "currency_augmentation" });
-  const alteration = new CraftStep({ currencyTemplate: "currency_alteration" });
-
-  it("只有恰好 1 条显式词缀时才使用增幅石", () => {
-    const oneMod = parseItemText(itemText("魔法", "元素伤害提高 19%"));
-    const twoMods = parseItemText(itemText("魔法", "元素伤害提高 19%", "+25% 冰霜抗性"));
-    expect(shouldSkipAugmentation(augment, oneMod)).toBe(false);
-    expect(shouldSkipAugmentation(augment, twoMods)).toBe(true);
-  });
-
-  it("没有显式词缀时也跳过（增幅对普通装备无意义）", () => {
-    expect(shouldSkipAugmentation(augment, parseItemText(itemText("普通")))).toBe(true);
-  });
-
-  it("其他通货步骤永不跳过", () => {
-    const twoMods = parseItemText(itemText("魔法", "元素伤害提高 19%", "+25% 冰霜抗性"));
-    expect(shouldSkipAugmentation(alteration, twoMods)).toBe(false);
-  });
-
-  it("2 词缀魔法装跳过增幅时走 NEXT，即使未命中配成 REPEAT", () => {
-    const wf = defaultWorkflow();
-    const augment = wf.getStep("augment_missing_target")!;
-    augment.onFailure = TRANSITION_REPEAT;
-    const twoMods = parseItemText(itemText("魔法", "元素伤害提高 19%", "+25% 冰霜抗性"));
-    expect(shouldSkipAugmentation(augment, twoMods)).toBe(true);
-    expect(stepTransition(augment, twoMods, false)).not.toBe(TRANSITION_REPEAT);
-    expect(resolveTransition(wf, augment.id, stepTransition(augment, twoMods, false)).nextStepId).toBe("regal_t1_life");
-  });
-
-  it("2 词缀魔法装跳过增幅时，完整目标已命中则走命中路由", () => {
-    const wf = defaultWorkflow();
-    const augment = wf.getStep("augment_missing_target")!;
-    augment.onSuccess = TRANSITION_FINISH;
-    const complete = parseItemText(itemText("魔法", "元素伤害提高 19%", "+130 最大生命"));
-    const evaluation = evaluateStep(complete, augment);
-    expect(shouldSkipAugmentation(augment, complete)).toBe(true);
-    expect(evaluation.success).toBe(true);
-    expect(stepTransition(augment, complete, evaluation.success)).toBe(TRANSITION_FINISH);
-  });
-
-  it("按显式词缀数判断，不受固有词缀行数影响", () => {
-    // 固有 +20 生命 + 1 条显式：affixes 有 2 行，但显式只有 1 条 → 应该用增幅
-    const withImplicit = parseItemText(
-      [
-        "物品类别: 头部",
-        "稀有度: 魔法",
-        "测试头盔",
-        "威武皮盔",
-        "--------",
-        "物品等级: 84",
-        "--------",
-        "+20 最大生命 (implicit)",
-        "--------",
-        "元素伤害提高 19%",
-        "--------",
-        "已鉴定",
-      ].join("\n"),
-    );
-    expect(withImplicit.affixes.length).toBe(2);
-    expect(withImplicit.craftAffixCount).toBe(1);
-    expect(shouldSkipAugmentation(augment, withImplicit)).toBe(false);
-  });
-});
 
 describe("hitClientRegion / hitCenterInRegion", () => {
   it("按中心与宽高推出客户区矩形", () => {

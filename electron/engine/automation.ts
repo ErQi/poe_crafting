@@ -32,11 +32,11 @@ import { currencySlotCandidates } from "./stashGrid";
 import { initVision, patchRmse, VisionError, visionErrText, VisionService, type MatchHit, type Mat } from "./vision";
 import {
   evaluateStep,
+  evaluateStepPrecondition,
   firstEnabledStep,
   resolveTransition,
   ROUTE_FINISH,
   ROUTE_STOP,
-  TRANSITION_NEXT,
   validateWorkflow,
 } from "./workflow";
 
@@ -60,7 +60,7 @@ const HOLD_CHECK_MS = 80;
 const WINDOW_MOVE_PX = 12;
 const CURSOR_ON_CURRENCY_RMSE = 18;
 const CURSOR_CONFIRM_TIMEOUT_MS = 280;
-/** 没有真正应用通货的轮次（跳过增幅、通货未确认）单独限量，避免空转吃掉 maxAttempts。 */
+/** 没有真正应用通货的轮次（前置条件不符、通货未确认）单独限量，避免空转吃掉 maxAttempts。 */
 const IDLE_ROUND_LIMIT = 12;
 const HARVEST_TEMPLATES = ["craft_button", "item_slot"];
 
@@ -148,16 +148,6 @@ export function isCurrencyClipboardText(text: string): boolean {
   if (!raw || raw.includes("未找到物品") || raw.startsWith("http")) return false;
   if (currencyStackCount(raw) != null) return true;
   return raw.includes("通货") || raw.includes("Currency");
-}
-
-export function shouldSkipAugmentation(step: CraftStep, item: Item): boolean {
-  return step.currencyTemplate === "currency_augmentation" && item.craftAffixCount !== 1;
-}
-
-/** 跳过增幅时不执行动作；现有词缀已满足本步则走命中路由，否则固定 NEXT，避免 REPEAT 空转。 */
-export function stepTransition(step: CraftStep, item: Item, success: boolean): string {
-  if (shouldSkipAugmentation(step, item)) return success ? step.onSuccess : TRANSITION_NEXT;
-  return success ? step.onSuccess : step.onFailure;
 }
 
 export class CraftAutomation {
@@ -484,7 +474,7 @@ export class CraftAutomation {
       }
       if (idle >= IDLE_ROUND_LIMIT) {
         reason = StopReason.UNCHANGED;
-        message = `连续 ${idle} 轮没有成功应用通货（跳过增幅或通货未确认），已停止`;
+        message = `连续 ${idle} 轮没有成功应用通货（前置条件不符或通货未确认），已停止`;
         break;
       }
       const live = workflow.getStep(step.id);
@@ -499,12 +489,13 @@ export class CraftAutomation {
       console.log("[craft] after first: step", stepIndex, step.name);
       this.update({ attempt, workflowStepName: step.name, workflowStepIndex: stepIndex, message: `步骤 ${stepIndex}: ${step.name}` }, false);
       const t0 = Date.now();
-      const skipped = shouldSkipAugmentation(step, item);
+      const precondition = evaluateStepPrecondition(item, step);
+      const skipped = !precondition.success;
       let nextItem: Item | null = null;
       if (skipped) {
         nextItem = item;
         idle += 1;
-        this.log(`显式词缀=${item.craftAffixCount}，跳过增幅`);
+        this.log(`${precondition.summary}，跳过步骤「${step.name}」的通货消耗`);
       } else {
         const result = await this.applyUntilNewItem(vision, game, step, s, item, currencyNames);
         nextItem = result.item;
@@ -536,7 +527,7 @@ export class CraftAutomation {
         success = evaluation.success;
         unchanged = 0;
         this.update({ lastItem: item, lastMatch: evaluation.match, unchangedStreak: 0 });
-        this.log(`未消耗增幅，检查现有词缀：${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
+        this.log(`未消耗通货，检查现有结果：${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
       } else {
         const evaluation = evaluateStep(item, step);
         success = evaluation.success;
@@ -560,7 +551,7 @@ export class CraftAutomation {
       }
       let route;
       try {
-        route = resolveTransition(workflow, step.id, stepTransition(step, item, success));
+        route = resolveTransition(workflow, step.id, success ? step.onSuccess : step.onFailure);
       } catch (e) {
         reason = StopReason.ERROR;
         message = String(e);

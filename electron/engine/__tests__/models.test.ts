@@ -185,12 +185,31 @@ describe("CraftWorkflow.fromDict 防御性", () => {
     expect(wf.startStepId).toBe("a");
   });
 
+  it("旧配置缺少动作前后词缀数时均不校验，新配置可读取数字字符串", () => {
+    const oldStep = CraftWorkflow.fromDict({ steps: [{ id: "a" }] }).steps[0];
+    expect(oldStep.beforeAffixCount).toBeNull();
+    expect(oldStep.expectedAffixCount).toBeNull();
+    const configured = CraftWorkflow.fromDict({
+      steps: [{ id: "a", before_affix_count: "1", expected_affix_count: "2" }],
+    }).steps[0];
+    expect(configured.beforeAffixCount).toBe(1);
+    expect(configured.expectedAffixCount).toBe(2);
+  });
+
   it("toDict / fromDict 往返一致", () => {
     const wf = new CraftWorkflow({
       id: "wf",
       name: "流程",
       startStepId: "s1",
-      steps: [new CraftStep({ id: "s1", currencyTemplate: "currency_alteration", expectedRarity: "魔法" })],
+      steps: [
+        new CraftStep({
+          id: "s1",
+          currencyTemplate: "currency_alteration",
+          beforeAffixCount: 1,
+          expectedRarity: "魔法",
+          expectedAffixCount: 1,
+        }),
+      ],
     });
     expect(CraftWorkflow.fromDict(wf.toDict()).toDict()).toEqual(wf.toDict());
   });

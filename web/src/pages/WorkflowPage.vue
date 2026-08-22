@@ -209,12 +209,30 @@ function patchStep(fields) {
             />
           </label>
           <label class="field">
+            <span>动作前显式词缀数</span>
+            <UiSelect
+              :model-value="step.before_affix_count ?? ''"
+              :options="meta.affix_counts"
+              :disabled="disabled"
+              @change="patchStep({ before_affix_count: $event })"
+            />
+          </label>
+          <label class="field">
             <span>动作后稀有度</span>
             <UiSelect
               :model-value="step.expected_rarity"
               :options="meta.rarities"
               :disabled="disabled"
               @change="patchStep({ expected_rarity: $event })"
+            />
+          </label>
+          <label class="field">
+            <span>动作后显式词缀数</span>
+            <UiSelect
+              :model-value="step.expected_affix_count ?? ''"
+              :options="meta.affix_counts"
+              :disabled="disabled"
+              @change="patchStep({ expected_affix_count: $event })"
             />
           </label>
           <label class="field">
@@ -239,7 +257,7 @@ function patchStep(fields) {
         <div class="rules raised">
           <RuleEditor
             :model-value="step.ruleset"
-            title="命中条件（留空则只看稀有度）"
+            title="动作后词缀条件（留空则只看动作后稀有度 / 词缀数）"
             :ops="meta.ops"
             :disabled="disabled"
             @update:model-value="$emit('rules', $event, step.id)"
@@ -249,7 +267,7 @@ function patchStep(fields) {
       </section>
     </div>
 
-    <p class="tiny foot">每步：右键通货 → 左键装备 → Ctrl+C。命中/未命中决定去向。点开始即跑本页流程。</p>
+    <p class="tiny foot">动作前词缀数不符时不会消耗通货，会直接按现有装备检查动作后条件；命中/未命中决定去向。</p>
 
     <section class="card logs">
       <div class="h status">{{ runtime.status_text || "状态: 空闲" }}</div>

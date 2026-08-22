@@ -219,7 +219,9 @@ export class RuleSet {
 export class CraftStep {
   name: string;
   currencyTemplate: string;
+  beforeAffixCount: number | null;
   expectedRarity: string;
+  expectedAffixCount: number | null;
   ruleset: RuleSet;
   onSuccess: string;
   onFailure: string;
@@ -229,7 +231,9 @@ export class CraftStep {
   constructor(init: Partial<CraftStep> = {}) {
     this.name = init.name ?? "新步骤";
     this.currencyTemplate = init.currencyTemplate ?? "";
+    this.beforeAffixCount = init.beforeAffixCount ?? null;
     this.expectedRarity = init.expectedRarity ?? "";
+    this.expectedAffixCount = init.expectedAffixCount ?? null;
     this.ruleset = init.ruleset ?? new RuleSet({ groups: [new RuleGroup({ name: "本步条件" })] });
     this.onSuccess = init.onSuccess ?? "next";
     this.onFailure = init.onFailure ?? "repeat";
@@ -243,7 +247,9 @@ export class CraftStep {
       name: this.name,
       enabled: this.enabled,
       currency_template: this.currencyTemplate,
+      before_affix_count: this.beforeAffixCount,
       expected_rarity: this.expectedRarity,
+      expected_affix_count: this.expectedAffixCount,
       ruleset: this.ruleset.toDict(),
       on_success: this.onSuccess,
       on_failure: this.onFailure,
@@ -263,7 +269,9 @@ export class CraftStep {
       name: String(data.name || "新步骤"),
       enabled: Boolean(data.enabled ?? true),
       currencyTemplate: String(data.currency_template || "").trim(),
+      beforeAffixCount: optionalInt(data.before_affix_count),
       expectedRarity: String(data.expected_rarity || "").trim(),
+      expectedAffixCount: optionalInt(data.expected_affix_count),
       ruleset: RuleSet.fromDict(rawRuleset),
       onSuccess: String(data.on_success || "next"),
       onFailure: String(data.on_failure || "repeat"),

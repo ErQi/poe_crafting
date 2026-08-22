@@ -22,12 +22,20 @@ export const ROUTE_STEP = "step";
 export const ROUTE_FINISH = "finish";
 export const ROUTE_STOP = "stop";
 export const RARITY_VALUES = ["", "普通", "魔法", "稀有"];
+export const EXPLICIT_AFFIX_COUNT_VALUES = [0, 1, 2, 3, 4, 5, 6];
 
 export interface StepEvaluation {
   success: boolean;
   rarityMatched: boolean;
+  affixCountMatched: boolean;
   rulesMatched: boolean;
   match: MatchResult;
+  summary: string;
+}
+
+export interface StepPreconditionEvaluation {
+  success: boolean;
+  affixCountMatched: boolean;
   summary: string;
 }
 
@@ -42,6 +50,19 @@ function hasEnabledRules(ruleset: RuleSet): boolean {
   );
 }
 
+export function evaluateStepPrecondition(item: Item, step: CraftStep): StepPreconditionEvaluation {
+  const expected = step.beforeAffixCount;
+  const affixCountMatched = expected == null || item.craftAffixCount === expected;
+  return {
+    success: affixCountMatched,
+    affixCountMatched,
+    summary:
+      expected == null
+        ? "无动作前条件"
+        : `${affixCountMatched ? "✓" : "✗"}动作前显式词缀数=${expected}（实际=${item.craftAffixCount}）`,
+  };
+}
+
 export function evaluateStep(item: Item, step: CraftStep): StepEvaluation {
   let match: MatchResult;
   let rulesMatched: boolean;
@@ -54,13 +75,18 @@ export function evaluateStep(item: Item, step: CraftStep): StepEvaluation {
   }
   const expected = step.expectedRarity.trim();
   const rarityMatched = !expected || item.rarity.trim() === expected;
-  const success = rarityMatched && rulesMatched;
+  const expectedAffixCount = step.expectedAffixCount;
+  const affixCountMatched = expectedAffixCount == null || item.craftAffixCount === expectedAffixCount;
+  const success = rarityMatched && affixCountMatched && rulesMatched;
   match.success = success;
   const parts: string[] = [];
   if (expected) parts.push(`${rarityMatched ? "✓" : "✗"}稀有度=${expected}（实际=${item.rarity || "-"}）`);
+  if (expectedAffixCount != null) {
+    parts.push(`${affixCountMatched ? "✓" : "✗"}显式词缀数=${expectedAffixCount}（实际=${item.craftAffixCount}）`);
+  }
   if (hasEnabledRules(step.ruleset)) parts.push(match.summary);
-  else if (!expected) parts.push("无条件");
-  return { success, rarityMatched, rulesMatched, match, summary: parts.join(" | ") };
+  else if (!expected && expectedAffixCount == null) parts.push("无条件");
+  return { success, rarityMatched, affixCountMatched, rulesMatched, match, summary: parts.join(" | ") };
 }
 
 export function firstEnabledStep(workflow: CraftWorkflow): CraftStep | undefined {
@@ -114,6 +140,14 @@ export function validateWorkflow(workflow: CraftWorkflow): string[] {
     }
     if (!RARITY_VALUES.includes(step.expectedRarity)) {
       errors.push(`${label}的期望稀有度无效: ${step.expectedRarity}`);
+    }
+    for (const [timing, count] of [
+      ["动作前", step.beforeAffixCount],
+      ["动作后", step.expectedAffixCount],
+    ] as const) {
+      if (count != null && (!Number.isInteger(count) || !EXPLICIT_AFFIX_COUNT_VALUES.includes(count))) {
+        errors.push(`${label}的${timing}显式词缀数无效: ${count}`);
+      }
     }
     for (const [branchName, transition] of [
       ["命中去向", step.onSuccess],
@@ -235,7 +269,9 @@ export function magicTwoModWorkflow(
         id: augmentId,
         name: "单词缀时增幅补另一目标",
         currencyTemplate: "currency_augmentation",
+        beforeAffixCount: 1,
         expectedRarity: "魔法",
+        expectedAffixCount: 2,
         ruleset: bothSet,
         onSuccess: TRANSITION_FINISH,
         onFailure: `${TRANSITION_GOTO_PREFIX}${alterationId}`,
@@ -331,7 +367,9 @@ export function rareTwoPrefixWorkflow(
         id: ids.augment,
         name: "单词缀时增幅尝试补齐另一目标",
         currencyTemplate: "currency_augmentation",
+        beforeAffixCount: 1,
         expectedRarity: "魔法",
+        expectedAffixCount: 2,
         ruleset: bothSet,
         onSuccess: TRANSITION_NEXT,
         onFailure: TRANSITION_NEXT,
