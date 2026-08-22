@@ -1,6 +1,6 @@
 import { loadJson, resolvePath, saveJson } from "../engine/configStore";
 import { ClientPricePatcher, GameRunningError } from "./clientPatcher";
-import { isGameRunning } from "./clientLocator";
+import { isGameRunning, normalizePoeClientRoot } from "./clientLocator";
 import { PoeCurrencyPriceSource } from "./priceSource";
 import {
   defaultPricePatchState,
@@ -245,5 +245,40 @@ export class PricePatchController {
     });
     if (enabled) setTimeout(() => void this.tick(), 0);
     return { ok: true, price_patch: this.view() };
+  }
+
+  setClientRoot(value: string): Record<string, unknown> {
+    if (this.operation) return { ok: false, error: "标价补丁正在处理中", price_patch: this.view() };
+    if (this.state.applied) {
+      return { ok: false, error: "请先取消补丁并恢复原版，再修改客户端路径", price_patch: this.view() };
+    }
+    if (this.state.pendingAction) {
+      return { ok: false, error: "已有等待执行的标价操作，暂时不能修改客户端路径", price_patch: this.view() };
+    }
+
+    try {
+      const input = String(value || "").trim();
+      const clientRoot = input ? normalizePoeClientRoot(input) : "";
+      const changed = clientRoot.toLocaleLowerCase("en-US") !== this.state.clientRoot.toLocaleLowerCase("en-US");
+      this.patch({
+        clientRoot,
+        baselineId: changed ? "" : this.state.baselineId,
+        phase: "idle",
+        statusText: clientRoot ? "客户端路径已保存，尚未应用" : "已改为自动检测客户端，尚未应用",
+        lastUpdatedAt: changed ? "" : this.state.lastUpdatedAt,
+        lastCheckedAt: changed ? "" : this.state.lastCheckedAt,
+        sourceUpdatedAt: changed ? "" : this.state.sourceUpdatedAt,
+        nextRetryAt: "",
+        lastPriceDigest: changed ? "" : this.state.lastPriceDigest,
+        lastPatchedResourceSha256: changed ? "" : this.state.lastPatchedResourceSha256,
+        appliedFiles: changed ? [] : this.state.appliedFiles,
+        appliedCustomFiles: changed ? [] : this.state.appliedCustomFiles,
+        updatedItemCount: changed ? 0 : this.state.updatedItemCount,
+        error: "",
+      });
+      return { ok: true, price_patch: this.view() };
+    } catch (error) {
+      return { ok: false, error: errorText(error), price_patch: this.view() };
+    }
   }
 }

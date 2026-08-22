@@ -34,6 +34,7 @@ import {
   evaluateStep,
   evaluateStepPrecondition,
   firstEnabledStep,
+  hasStepPreconditions,
   resolveTransition,
   ROUTE_FINISH,
   ROUTE_STOP,
@@ -404,28 +405,40 @@ export class CraftAutomation {
       const evaluation = evaluateStep(initialItem, inspected);
       this.update({ lastMatch: evaluation.match });
       this.log(`已有装备状态按步骤「${inspected.name}」判定：${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
-      let route;
-      try {
-        route = resolveTransition(workflow, inspected.id, evaluation.success ? inspected.onSuccess : inspected.onFailure);
-      } catch (e) {
-        this.finish(StopReason.ERROR, String(e));
-        return;
+      let resumedByPrecondition = false;
+      if (!evaluation.success && hasStepPreconditions(inspected)) {
+        const precondition = evaluateStepPrecondition(initialItem, inspected);
+        if (precondition.success) {
+          current = inspected;
+          resumedByPrecondition = true;
+          this.update({ lastMatch: precondition.match });
+          this.log(`已有装备满足步骤「${inspected.name}」的前置判断，将从该步骤继续 | ${precondition.summary}`);
+        }
       }
-      if (route.kind === ROUTE_FINISH) {
-        this.finish(StopReason.SUCCESS, "当前装备已满足流程目标");
-        return;
+      if (!resumedByPrecondition) {
+        let route;
+        try {
+          route = resolveTransition(workflow, inspected.id, evaluation.success ? inspected.onSuccess : inspected.onFailure);
+        } catch (e) {
+          this.finish(StopReason.ERROR, String(e));
+          return;
+        }
+        if (route.kind === ROUTE_FINISH) {
+          this.finish(StopReason.SUCCESS, "当前装备已满足流程目标");
+          return;
+        }
+        if (route.kind === ROUTE_STOP) {
+          this.finish(StopReason.WORKFLOW_STOP, `当前装备按步骤「${inspected.name}」的配置停止`);
+          return;
+        }
+        const resumed = workflow.getStep(route.nextStepId);
+        if (!resumed) {
+          this.finish(StopReason.ERROR, `找不到下一步骤: ${route.nextStepId}`);
+          return;
+        }
+        current = resumed;
+        this.log(`启动后将从步骤「${current.name}」继续`);
       }
-      if (route.kind === ROUTE_STOP) {
-        this.finish(StopReason.WORKFLOW_STOP, `当前装备按步骤「${inspected.name}」的配置停止`);
-        return;
-      }
-      const resumed = workflow.getStep(route.nextStepId);
-      if (!resumed) {
-        this.finish(StopReason.ERROR, `找不到下一步骤: ${route.nextStepId}`);
-        return;
-      }
-      current = resumed;
-      this.log(`启动后将从步骤「${current.name}」继续`);
     }
 
     this.log("正在按仓库通货格坐标定位，并逐个悬停 Ctrl+C 核对中文名称…");

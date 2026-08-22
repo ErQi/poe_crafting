@@ -1,15 +1,42 @@
 <script setup>
-import { computed } from "vue";
+import { computed, ref, watch } from "vue";
 
 const props = defineProps({
   state: { type: Object, required: true },
   runtime: { type: Object, required: true },
 });
-const emit = defineEmits(["apply", "restore", "auto"]);
+const emit = defineEmits(["apply", "restore", "auto", "client-root", "choose-client-root"]);
 
 const patch = computed(() => props.runtime.price_patch || props.state.price_patch || {});
 const applied = computed(() => Boolean(patch.value.applied));
 const busy = computed(() => Boolean(patch.value.busy));
+const clientRootLocked = computed(() => Boolean(patch.value.client_root_locked));
+const clientRootDraft = ref("");
+const clientRootDirty = ref(false);
+
+watch(
+  () => patch.value.client_root,
+  (value) => {
+    if (!clientRootDirty.value) clientRootDraft.value = String(value || "");
+  },
+  { immediate: true },
+);
+
+function completeClientRoot(result) {
+  if (!result || result.ok === false || result.canceled) return;
+  clientRootDirty.value = false;
+  clientRootDraft.value = String(result.price_patch?.client_root || "");
+}
+
+function saveClientRoot() {
+  if (clientRootLocked.value || !clientRootDirty.value) return;
+  emit("client-root", clientRootDraft.value, completeClientRoot);
+}
+
+function chooseClientRoot() {
+  if (clientRootLocked.value) return;
+  emit("choose-client-root", clientRootDraft.value, completeClientRoot);
+}
 
 function displayTime(value) {
   if (!value) return "尚未更新";
@@ -44,6 +71,41 @@ function displayTime(value) {
       <div class="status-block">
         <span>最后更新时间</span>
         <b>{{ displayTime(patch.last_updated_at) }}</b>
+      </div>
+
+      <div class="client-path-block">
+        <label for="price-client-root">客户端目录</label>
+        <div class="client-path-row">
+          <input
+            id="price-client-root"
+            v-model="clientRootDraft"
+            class="ctrl"
+            type="text"
+            spellcheck="false"
+            :readonly="clientRootLocked"
+            placeholder="留空则自动检测国服客户端"
+            @input="clientRootDirty = true"
+            @keydown.enter.prevent="saveClientRoot"
+          />
+          <button
+            type="button"
+            class="btn"
+            :disabled="clientRootLocked"
+            @click="chooseClientRoot"
+          >
+            选择目录
+          </button>
+          <button
+            type="button"
+            class="btn ok"
+            :disabled="clientRootLocked || !clientRootDirty"
+            @click="saveClientRoot"
+          >
+            保存
+          </button>
+        </div>
+        <small v-if="clientRootLocked">已应用或有等待操作时路径锁定；请先恢复原版再修改。</small>
+        <small v-else>可直接粘贴或选择目录；留空保存后会在应用时自动查找。</small>
       </div>
 
       <button
@@ -98,7 +160,7 @@ function displayTime(value) {
   padding-top: min(8vh, 64px);
 }
 .panel {
-  width: min(560px, 100%);
+  width: min(700px, 100%);
   display: flex;
   flex-direction: column;
   gap: 14px;
@@ -132,6 +194,24 @@ function displayTime(value) {
 }
 .status-block span { color: var(--muted); }
 .status-block b { font-weight: 600; }
+.client-path-block {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 10px 12px;
+  background: var(--row);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.client-path-block > label { color: var(--muted); }
+.client-path-block > small { color: var(--muted); }
+.client-path-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+}
+.client-path-row .btn { white-space: nowrap; }
+.client-path-row .ctrl[readonly] { opacity: 0.6; cursor: default; }
 .primary { width: 100%; height: 40px; font-size: 14px; font-weight: 700; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 .auto-row {
@@ -145,4 +225,8 @@ function displayTime(value) {
 .auto-row span { display: flex; flex-direction: column; gap: 2px; }
 .auto-row small { color: var(--muted); }
 .auto-row input { width: 18px; height: 18px; accent-color: var(--accent); }
+@media (max-width: 680px) {
+  .client-path-row { grid-template-columns: 1fr 1fr; }
+  .client-path-row .ctrl { grid-column: 1 / -1; }
+}
 </style>

@@ -14,6 +14,7 @@ const props = defineProps({
   title: { type: String, default: "命中条件" },
   ops: { type: Array, default: () => ["", ">=", ">", "<=", "<", "="] },
   disabled: { type: Boolean, default: false },
+  compact: { type: Boolean, default: false },
 });
 const emit = defineEmits(["update:modelValue", "prompt"]);
 
@@ -124,7 +125,7 @@ syncThr();
 </script>
 
 <template>
-  <div class="re" :class="{ off: disabled }">
+  <div class="re" :class="{ off: disabled, compact }">
     <div class="bar">
       <span class="h">{{ title }}</span>
       <span class="tiny">组间</span>
@@ -175,6 +176,9 @@ syncThr();
         @change="setMin($event.target.value)"
       />
       <span class="tiny">条</span>
+      <span v-if="compact" class="tool-spacer" />
+      <button v-if="compact" type="button" class="btn ok" :disabled="disabled" @click="addRule">+ 添加条件</button>
+      <button v-if="compact" type="button" class="btn danger" :disabled="disabled" @click="delRule">删除选中</button>
     </div>
 
     <div class="table-wrap scroll">
@@ -185,7 +189,7 @@ syncThr();
         <div class="th">阈值</div>
         <div class="th">备注</div>
         <template v-if="!group.rules.length">
-          <div class="empty">本组还没有词缀条件<br />点击下方「+ 添加条件」</div>
+          <div class="empty">本组还没有词缀条件<br />点击{{ compact ? "上方" : "下方" }}「+ 添加条件」</div>
         </template>
         <template v-else>
           <template v-for="(rule, i) in group.rules" :key="rule.id">
@@ -215,11 +219,11 @@ syncThr();
       </div>
     </div>
 
-    <div class="ops">
+    <div v-if="!compact" class="ops">
       <button type="button" class="btn ok" :disabled="disabled" @click="addRule">+ 添加条件</button>
       <button type="button" class="btn danger" :disabled="disabled" @click="delRule">删除选中</button>
     </div>
-    <p class="tiny tip">数字 = 本组命中 N 条即可。文本可用空格/逗号写多关键字。</p>
+    <p v-if="!compact" class="tiny tip">数字 = 本组命中 N 条即可。文本可用空格/逗号写多关键字。</p>
   </div>
 </template>
 
@@ -241,6 +245,7 @@ syncThr();
   flex-shrink: 0;
 }
 .bar .hscroll { flex: 1; }
+.tool-spacer { flex: 1; }
 .w118 { width: 118px; flex: 0 0 118px; }
 .min { width: 52px; }
 .table-wrap {
@@ -286,6 +291,16 @@ syncThr();
   overflow: hidden;
   margin: 0;
 }
+.re.compact { gap: 4px; }
+.compact .bar, .compact .tools { gap: 6px; }
+.compact .bar .hscroll { padding: 0; }
+.compact .w118 { width: 108px; flex-basis: 108px; }
+.compact .btn { padding: 0 9px; }
+.compact .table {
+  grid-template-columns: 42px minmax(140px, 3fr) 78px 82px minmax(80px, 2fr);
+}
+.compact .th { padding: 5px 4px; }
+.compact .cell { padding: 3px; }
 @media (max-height: 800px) {
   .tip { display: none; }
 }

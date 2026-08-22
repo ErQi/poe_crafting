@@ -219,7 +219,9 @@ export class RuleSet {
 export class CraftStep {
   name: string;
   currencyTemplate: string;
+  beforeRarity: string;
   beforeAffixCount: number | null;
+  beforeRuleset: RuleSet;
   expectedRarity: string;
   expectedAffixCount: number | null;
   ruleset: RuleSet;
@@ -231,7 +233,9 @@ export class CraftStep {
   constructor(init: Partial<CraftStep> = {}) {
     this.name = init.name ?? "新步骤";
     this.currencyTemplate = init.currencyTemplate ?? "";
+    this.beforeRarity = init.beforeRarity ?? "";
     this.beforeAffixCount = init.beforeAffixCount ?? null;
+    this.beforeRuleset = init.beforeRuleset ?? new RuleSet({ groups: [new RuleGroup({ name: "前置条件" })] });
     this.expectedRarity = init.expectedRarity ?? "";
     this.expectedAffixCount = init.expectedAffixCount ?? null;
     this.ruleset = init.ruleset ?? new RuleSet({ groups: [new RuleGroup({ name: "本步条件" })] });
@@ -247,7 +251,9 @@ export class CraftStep {
       name: this.name,
       enabled: this.enabled,
       currency_template: this.currencyTemplate,
+      before_rarity: this.beforeRarity,
       before_affix_count: this.beforeAffixCount,
+      before_ruleset: this.beforeRuleset.toDict(),
       expected_rarity: this.expectedRarity,
       expected_affix_count: this.expectedAffixCount,
       ruleset: this.ruleset.toDict(),
@@ -257,6 +263,7 @@ export class CraftStep {
   }
 
   static fromDict(data: Record<string, unknown>): CraftStep {
+    const rawBeforeRuleset = data.before_ruleset;
     let rawRuleset = data.ruleset;
     if (!rawRuleset || typeof rawRuleset !== "object") {
       rawRuleset = {
@@ -269,7 +276,12 @@ export class CraftStep {
       name: String(data.name || "新步骤"),
       enabled: Boolean(data.enabled ?? true),
       currencyTemplate: String(data.currency_template || "").trim(),
+      beforeRarity: String(data.before_rarity || "").trim(),
       beforeAffixCount: optionalInt(data.before_affix_count),
+      beforeRuleset:
+        rawBeforeRuleset && typeof rawBeforeRuleset === "object"
+          ? RuleSet.fromDict(rawBeforeRuleset)
+          : new RuleSet({ groups: [new RuleGroup({ name: "前置条件" })] }),
       expectedRarity: String(data.expected_rarity || "").trim(),
       expectedAffixCount: optionalInt(data.expected_affix_count),
       ruleset: RuleSet.fromDict(rawRuleset),

@@ -46,6 +46,8 @@ export interface PricePatchState {
 }
 
 export interface PricePatchView {
+  client_root: string;
+  client_root_locked: boolean;
   applied: boolean;
   auto_update: boolean;
   pending: boolean;
@@ -128,13 +130,16 @@ export function pricePatchStateFrom(value: unknown): PricePatchState {
 }
 
 export function pricePatchView(state: PricePatchState): PricePatchView {
+  const busy = state.phase === "applying" || state.phase === "restoring";
   return {
+    client_root: state.clientRoot,
+    client_root_locked: state.applied || state.pendingAction !== null || busy,
     applied: state.applied,
     auto_update: state.autoUpdate,
     pending: state.pendingAction !== null,
     pending_action: state.pendingAction,
     phase: state.phase,
-    busy: state.phase === "applying" || state.phase === "restoring",
+    busy,
     status: state.statusText,
     last_updated_at: state.lastUpdatedAt,
     source_updated_at: state.sourceUpdatedAt,

@@ -429,6 +429,20 @@ function bindHost(): void {
     if (!host) throw new Error("宿主尚未就绪");
     const args = payload == null ? [] : Array.isArray(payload) ? payload : [payload];
     try {
+      if (String(name) === "price_patch_choose_client_root") {
+        const requested = String(args[0] || "").trim();
+        const options: Electron.OpenDialogOptions = {
+          title: "选择《流放之路》国服客户端目录",
+          buttonLabel: "选择此目录",
+          properties: ["openDirectory"],
+          ...(requested && fs.existsSync(requested) ? { defaultPath: requested } : {}),
+        };
+        const selected = mainWindow
+          ? await dialog.showOpenDialog(mainWindow, options)
+          : await dialog.showOpenDialog(options);
+        if (selected.canceled || !selected.filePaths[0]) return { ok: true, canceled: true };
+        return (await host.invoke("price_patch_set_client_root", [selected.filePaths[0]])) ?? null;
+      }
       return (await host.invoke(String(name || ""), args)) ?? null;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

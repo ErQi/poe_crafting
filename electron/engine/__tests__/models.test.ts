@@ -185,14 +185,29 @@ describe("CraftWorkflow.fromDict 防御性", () => {
     expect(wf.startStepId).toBe("a");
   });
 
-  it("旧配置缺少动作前后词缀数时均不校验，新配置可读取数字字符串", () => {
+  it("旧配置缺少前置判断时保持不校验，新配置可读取完整前置条件", () => {
     const oldStep = CraftWorkflow.fromDict({ steps: [{ id: "a" }] }).steps[0];
+    expect(oldStep.beforeRarity).toBe("");
     expect(oldStep.beforeAffixCount).toBeNull();
+    expect(oldStep.beforeRuleset.groups).toHaveLength(1);
+    expect(oldStep.beforeRuleset.groups[0].rules).toEqual([]);
     expect(oldStep.expectedAffixCount).toBeNull();
     const configured = CraftWorkflow.fromDict({
-      steps: [{ id: "a", before_affix_count: "1", expected_affix_count: "2" }],
+      steps: [
+        {
+          id: "a",
+          before_rarity: "魔法",
+          before_affix_count: "1",
+          before_ruleset: {
+            groups: [{ rules: [{ pattern: "最大生命", operator: ">=", threshold: 100 }] }],
+          },
+          expected_affix_count: "2",
+        },
+      ],
     }).steps[0];
+    expect(configured.beforeRarity).toBe("魔法");
     expect(configured.beforeAffixCount).toBe(1);
+    expect(configured.beforeRuleset.groups[0].rules[0].threshold).toBe(100);
     expect(configured.expectedAffixCount).toBe(2);
   });
 
@@ -205,7 +220,11 @@ describe("CraftWorkflow.fromDict 防御性", () => {
         new CraftStep({
           id: "s1",
           currencyTemplate: "currency_alteration",
+          beforeRarity: "魔法",
           beforeAffixCount: 1,
+          beforeRuleset: new RuleSet({
+            groups: [new RuleGroup({ rules: [new MatchRule({ pattern: "最大生命", threshold: 100 })] })],
+          }),
           expectedRarity: "魔法",
           expectedAffixCount: 1,
         }),

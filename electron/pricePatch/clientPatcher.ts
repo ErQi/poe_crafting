@@ -4,7 +4,7 @@ import path from "path";
 import { resolvePath } from "../engine/configStore";
 import { cleanLocalizedBaseItems, patchLocalizedBaseItems } from "./dat64";
 import { PoeBundleTool } from "./bundleTool";
-import { detectPoeClient, isGameRunning, isPoeClientRoot } from "./clientLocator";
+import { detectPoeClient, isGameRunning, isPoeClientRoot, normalizePoeClientRoot } from "./clientLocator";
 import {
   assertFilesStable,
   fingerprintFile,
@@ -160,7 +160,8 @@ export class ClientPricePatcher {
   }
 
   async clientRoot(lastKnown = ""): Promise<string> {
-    const root = await this.locateClient(lastKnown);
+    // 配置里有明确路径时必须使用它；路径失效应直接报错，不能误改另一份自动探测到的客户端。
+    const root = lastKnown ? normalizePoeClientRoot(lastKnown) : await this.locateClient();
     if (!isPoeClientRoot(root)) throw new Error("国服客户端目录不完整");
     return path.resolve(root);
   }

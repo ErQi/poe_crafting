@@ -27,6 +27,7 @@ const lib = computed(() => props.state.library);
 const meta = computed(() => props.state.meta);
 const stepId = ref(wf.value.steps[0]?.id || "");
 const groupName = ref("");
+const conditionTiming = ref("before");
 
 watch(
   () => wf.value.id,
@@ -181,7 +182,7 @@ function patchStep(fields) {
 
       <section v-if="step" class="card detail">
         <div class="fields">
-          <label class="field wide">
+          <label class="field step-name">
             <span>步骤名称</span>
             <input
               class="ctrl"
@@ -199,7 +200,7 @@ function patchStep(fields) {
             />
             启用本步骤
           </label>
-          <label class="field">
+          <label class="field currency">
             <span>使用通货</span>
             <UiSelect
               :model-value="step.currency_template"
@@ -208,35 +209,8 @@ function patchStep(fields) {
               @change="patchStep({ currency_template: $event })"
             />
           </label>
-          <label class="field">
-            <span>动作前显式词缀数</span>
-            <UiSelect
-              :model-value="step.before_affix_count ?? ''"
-              :options="meta.affix_counts"
-              :disabled="disabled"
-              @change="patchStep({ before_affix_count: $event })"
-            />
-          </label>
-          <label class="field">
-            <span>动作后稀有度</span>
-            <UiSelect
-              :model-value="step.expected_rarity"
-              :options="meta.rarities"
-              :disabled="disabled"
-              @change="patchStep({ expected_rarity: $event })"
-            />
-          </label>
-          <label class="field">
-            <span>动作后显式词缀数</span>
-            <UiSelect
-              :model-value="step.expected_affix_count ?? ''"
-              :options="meta.affix_counts"
-              :disabled="disabled"
-              @change="patchStep({ expected_affix_count: $event })"
-            />
-          </label>
-          <label class="field">
-            <span>命中后</span>
+          <label class="field success-route">
+            <span>后置命中后</span>
             <UiSelect
               :model-value="step.on_success"
               :options="transOpts"
@@ -244,8 +218,8 @@ function patchStep(fields) {
               @change="patchStep({ on_success: $event })"
             />
           </label>
-          <label class="field">
-            <span>未命中后</span>
+          <label class="field failure-route">
+            <span>后置未命中后</span>
             <UiSelect
               :model-value="step.on_failure"
               :options="transOpts"
@@ -255,19 +229,92 @@ function patchStep(fields) {
           </label>
         </div>
         <div class="rules raised">
+          <div class="condition-bar">
+            <div class="condition-tabs" role="tablist" aria-label="判断阶段">
+              <button
+                type="button"
+                class="chip"
+                :class="{ on: conditionTiming === 'before' }"
+                :disabled="disabled"
+                @click="conditionTiming = 'before'"
+              >
+                前置判断
+              </button>
+              <button
+                type="button"
+                class="chip"
+                :class="{ on: conditionTiming === 'after' }"
+                :disabled="disabled"
+                @click="conditionTiming = 'after'"
+              >
+                后置判断
+              </button>
+            </div>
+            <span class="tiny">稀有度</span>
+            <UiSelect
+              v-if="conditionTiming === 'before'"
+              :model-value="step.before_rarity || ''"
+              :options="meta.rarities"
+              :disabled="disabled"
+              class="condition-select"
+              @change="patchStep({ before_rarity: $event })"
+            />
+            <UiSelect
+              v-else
+              :model-value="step.expected_rarity || ''"
+              :options="meta.rarities"
+              :disabled="disabled"
+              class="condition-select"
+              @change="patchStep({ expected_rarity: $event })"
+            />
+            <span class="tiny">显式词缀数</span>
+            <UiSelect
+              v-if="conditionTiming === 'before'"
+              :model-value="step.before_affix_count ?? ''"
+              :options="meta.affix_counts"
+              :disabled="disabled"
+              class="condition-select count"
+              @change="patchStep({ before_affix_count: $event })"
+            />
+            <UiSelect
+              v-else
+              :model-value="step.expected_affix_count ?? ''"
+              :options="meta.affix_counts"
+              :disabled="disabled"
+              class="condition-select count"
+              @change="patchStep({ expected_affix_count: $event })"
+            />
+            <span class="tiny condition-help">
+              {{ conditionTiming === "before"
+                ? "全部命中才消耗通货；不命中则直接检查后置判断"
+                : "使用通货后检查，并按命中 / 未命中去向继续" }}
+            </span>
+          </div>
           <RuleEditor
-            :model-value="step.ruleset"
-            title="动作后词缀条件（留空则只看动作后稀有度 / 词缀数）"
+            v-if="conditionTiming === 'before'"
+            :key="`${step.id}:before`"
+            :model-value="step.before_ruleset"
+            title="前置词缀条件"
             :ops="meta.ops"
             :disabled="disabled"
-            @update:model-value="$emit('rules', $event, step.id)"
+            compact
+            @update:model-value="$emit('rules', $event, step.id, 'before')"
+            @prompt="$emit('prompt', $event)"
+          />
+          <RuleEditor
+            v-else
+            :key="`${step.id}:after`"
+            :model-value="step.ruleset"
+            title="后置词缀条件"
+            :ops="meta.ops"
+            :disabled="disabled"
+            compact
+            @update:model-value="$emit('rules', $event, step.id, 'after')"
             @prompt="$emit('prompt', $event)"
           />
         </div>
       </section>
     </div>
-
-    <p class="tiny foot">动作前词缀数不符时不会消耗通货，会直接按现有装备检查动作后条件；命中/未命中决定去向。</p>
 
     <section class="card logs">
       <div class="h status">{{ runtime.status_text || "状态: 空闲" }}</div>
@@ -278,22 +325,24 @@ function patchStep(fields) {
 
 <style scoped>
 .wf {
+  --ctrl-h: 28px;
+  --chip-h: 26px;
   height: 100%;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
   min-height: 0;
   overflow: hidden;
 }
 .switcher, .meta {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
+  gap: 6px;
+  padding: 4px 8px;
   flex: 0 0 auto;
 }
 .switcher .hscroll { flex: 1; }
-.grp { width: 120px; flex: 0 0 120px; }
+.grp { width: 108px; flex: 0 0 108px; }
 .meta { display: grid; grid-template-columns: minmax(140px, 2fr) minmax(180px, 2fr) minmax(140px, 3fr); }
 .grow { min-width: 0; }
 .exec {
@@ -301,16 +350,16 @@ function patchStep(fields) {
   min-height: 0;
   overflow: hidden;
   display: grid;
-  grid-template-columns: 248px 1fr;
-  gap: 8px;
+  grid-template-columns: 220px 1fr;
+  gap: 6px;
 }
 .steps, .detail {
   min-height: 0;
   overflow: hidden;
   display: flex;
   flex-direction: column;
-  padding: 10px;
-  gap: 8px;
+  padding: 7px;
+  gap: 6px;
 }
 .steps .h, .step-ops { flex-shrink: 0; }
 .list { flex: 1; min-height: 0; }
@@ -318,8 +367,8 @@ function patchStep(fields) {
   display: flex;
   align-items: center;
   width: 100%;
-  height: 52px;
-  margin-bottom: 8px;
+  height: 44px;
+  margin-bottom: 6px;
   padding: 0;
   border-radius: 8px;
   border: 1px solid var(--border);
@@ -333,8 +382,8 @@ function patchStep(fields) {
 }
 .step i {
   width: 4px;
-  height: 28px;
-  margin: 0 10px;
+  height: 24px;
+  margin: 0 8px;
   border-radius: 2px;
   background: var(--border);
 }
@@ -346,44 +395,92 @@ function patchStep(fields) {
 .fields {
   flex: 0 0 auto;
   display: grid;
-  grid-template-columns: 3fr 2fr;
-  gap: 8px 10px;
+  grid-template-columns: minmax(180px, 1.4fr) minmax(130px, 1fr) minmax(120px, 0.8fr) minmax(140px, 1fr);
+  grid-template-areas:
+    "step-name step-name currency enabled"
+    "success-route success-route failure-route failure-route";
+  gap: 5px 8px;
 }
-.wide { grid-column: 1; }
-.en { align-self: end; padding-bottom: 4px; }
+.fields .field { gap: 2px; }
+.step-name { grid-area: step-name; }
+.currency { grid-area: currency; }
+.success-route { grid-area: success-route; }
+.failure-route { grid-area: failure-route; }
+.en {
+  grid-area: enabled;
+  align-self: end;
+  min-height: var(--ctrl-h);
+  padding: 0;
+}
 .rules {
   flex: 1;
   min-height: 0;
-  padding: 8px;
+  padding: 6px;
   display: flex;
   flex-direction: column;
+  gap: 5px;
 }
-.foot {
-  flex: 0 1 auto;
-  min-height: 0;
+.condition-bar {
+  flex: 0 0 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.condition-tabs {
+  display: flex;
+  gap: 4px;
+  padding-right: 4px;
+  border-right: 1px solid var(--border);
+}
+.condition-tabs .chip { padding: 0 11px; }
+.condition-select { width: 118px; flex: 0 0 118px; }
+.condition-select.count { width: 92px; flex-basis: 92px; }
+.condition-help {
+  min-width: 0;
+  flex: 1;
   overflow: hidden;
-  margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .logs {
-  flex: 0 1 132px;
-  min-height: 56px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px;
+  flex: 0 0 58px;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  align-items: stretch;
+  gap: 8px;
+  padding: 6px 8px;
 }
 .logs .box {
-  flex: 1;
+  min-width: 0;
+  min-height: 0;
   margin: 0;
-  padding: 6px 8px;
+  padding: 4px 6px;
   background: var(--input);
   border: 1px solid var(--border);
   border-radius: 6px;
 }
-.status { font-size: 13px; }
+.status {
+  align-self: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+}
 @media (max-height: 800px) {
-  .switcher, .meta { padding: 4px 8px; gap: 6px; }
-  .foot { display: none; }
-  .logs { flex-basis: 88px; }
+  .logs { flex-basis: 54px; min-height: 54px; }
+}
+@media (max-width: 1000px) {
+  .exec { grid-template-columns: 200px 1fr; }
+  .fields {
+    grid-template-columns: 1fr 1fr;
+    grid-template-areas:
+      "step-name enabled"
+      "currency currency"
+      "success-route failure-route";
+  }
+  .condition-bar { flex-wrap: wrap; }
+  .condition-help { flex-basis: 100%; }
 }
 </style>

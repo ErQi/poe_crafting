@@ -175,6 +175,16 @@ async function applyCall(fn) {
   }
 }
 
+async function setPricePatchClientRoot(value, done) {
+  const result = await applyCall(() => call("price_patch_set_client_root", value));
+  done?.(result);
+}
+
+async function choosePricePatchClientRoot(value, done) {
+  const result = await applyCall(() => call("price_patch_choose_client_root", value));
+  done?.(result);
+}
+
 // done 让设置页知道往返已结束，可以用后端真实值回写输入框
 async function persistSettings(p, done) {
   if (await applyCall(() => call("update_settings", p))) await applyCall(() => call("save_settings"));
@@ -371,7 +381,7 @@ async function removeStep(id) {
         @add-step="wrap(() => call('add_step'))"
         @remove-step="removeStep"
         @move-step="(id, d) => wrap(() => call('move_step', id, d))"
-        @rules="(rs, id) => wrap(() => call('update_rules', rs, id))"
+        @rules="(rs, id, timing) => wrap(() => call('update_rules', rs, id, timing))"
         @prompt="onPrompt"
       />
       <TemplatesPage
@@ -393,6 +403,8 @@ async function removeStep(id) {
         @apply="applyCall(() => call('price_patch_apply'))"
         @restore="applyCall(() => call('price_patch_restore'))"
         @auto="(enabled) => applyCall(() => call('price_patch_set_auto', enabled))"
+        @client-root="setPricePatchClientRoot"
+        @choose-client-root="choosePricePatchClientRoot"
       />
       <SettingsPage
         v-show="tab === 'settings'"

@@ -8,6 +8,7 @@ import {
   evaluateStep,
   evaluateStepPrecondition,
   firstEnabledStep,
+  hasStepPreconditions,
   resolveTransition,
   ROUTE_FINISH,
   ROUTE_STEP,
@@ -88,6 +89,9 @@ describe("validateWorkflow", () => {
     }
     const bad = new CraftWorkflow({ steps: [step({ id: "a", name: "一", expectedRarity: "传奇" })] });
     expect(validateWorkflow(bad).join()).toMatch(/期望稀有度无效: 传奇/);
+
+    const badBefore = new CraftWorkflow({ steps: [step({ id: "a", name: "一", beforeRarity: "传奇" })] });
+    expect(validateWorkflow(badBefore).join()).toMatch(/动作前稀有度无效: 传奇/);
   });
 
   it("动作前后显式词缀数只能是不校验或 0–6 的整数", () => {
@@ -271,6 +275,7 @@ describe("evaluateStepPrecondition", () => {
   it("未配置动作前条件时不因通货种类自动跳过", () => {
     const augment = step({ currencyTemplate: "currency_augmentation", beforeAffixCount: null });
     const twoMods = parseItemText(itemText("魔法", "+110 最大生命", "+52 智慧"));
+    expect(hasStepPreconditions(augment)).toBe(false);
     expect(evaluateStepPrecondition(twoMods, augment)).toMatchObject({ success: true, affixCountMatched: true });
   });
 
@@ -307,6 +312,57 @@ describe("evaluateStepPrecondition", () => {
     expect(withImplicit.affixes.length).toBe(2);
     expect(withImplicit.craftAffixCount).toBe(1);
     expect(evaluateStepPrecondition(withImplicit, configured).success).toBe(true);
+  });
+
+  it("前置稀有度、词缀数量和具体词缀数值必须同时满足", () => {
+    const configured = step({
+      beforeRarity: "魔法",
+      beforeAffixCount: 1,
+      beforeRuleset: new RuleSet({
+        groups: [
+          new RuleGroup({
+            rules: [new MatchRule({ pattern: "最大生命", operator: ">=", threshold: 100 })],
+          }),
+        ],
+      }),
+    });
+    expect(hasStepPreconditions(configured)).toBe(true);
+    const matched = evaluateStepPrecondition(parseItemText(itemText("魔法", "+110 最大生命")), configured);
+    const lowValue = evaluateStepPrecondition(parseItemText(itemText("魔法", "+99 最大生命")), configured);
+    const wrongAffix = evaluateStepPrecondition(parseItemText(itemText("魔法", "+52 智慧")), configured);
+    const wrongRarity = evaluateStepPrecondition(parseItemText(itemText("稀有", "+110 最大生命")), configured);
+
+    expect(matched).toMatchObject({ success: true, rarityMatched: true, affixCountMatched: true, rulesMatched: true });
+    expect(lowValue).toMatchObject({ success: false, rulesMatched: false });
+    expect(wrongAffix).toMatchObject({ success: false, rulesMatched: false });
+    expect(wrongRarity).toMatchObject({ success: false, rarityMatched: false, rulesMatched: true });
+    expect(lowValue.summary).toMatch(/实际=99/);
+  });
+
+  it("增幅前置规则可按组间 OR 放行任一达标目标词", () => {
+    const configured = step({
+      beforeAffixCount: 1,
+      beforeRuleset: new RuleSet({
+        groupCombine: MatchMode.ANY,
+        groups: [
+          new RuleGroup({
+            name: "目标前缀",
+            combine: MatchMode.ANY,
+            rules: [new MatchRule({ pattern: "最大生命", operator: ">=", threshold: 100 })],
+          }),
+          new RuleGroup({
+            name: "目标后缀",
+            combine: MatchMode.ANY,
+            rules: [new MatchRule({ pattern: "智慧", operator: ">=", threshold: 51 })],
+          }),
+        ],
+      }),
+    });
+
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+110 最大生命")), configured).success).toBe(true);
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+52 智慧")), configured).success).toBe(true);
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+99 最大生命")), configured).success).toBe(false);
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+52 敏捷")), configured).success).toBe(false);
   });
 });
 
@@ -346,6 +402,8 @@ describe("内置示例流程「头盔·元素+生命」", () => {
 
   it("增幅检查两个目标，命中与否都进富豪", () => {
     const s = wf.getStep("augment_missing_target")!;
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+130 最大生命")), s).success).toBe(true);
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+52 智慧")), s).success).toBe(false);
     expect(evaluateStep(parseItemText(itemText("魔法", "+130 最大生命")), s).success).toBe(false);
     expect(evaluateStep(parseItemText(itemText("魔法", "+130 最大生命", "元素伤害提高 19%")), s).success).toBe(true);
     expect(resolveTransition(wf, s.id, s.onFailure).nextStepId).toBe("regal_t1_life");
@@ -427,6 +485,8 @@ describe("内置流程库", () => {
     const augment = wf.getStep("belt-life-fireres__augment")!;
     expect(augment.beforeAffixCount).toBe(1);
     expect(augment.expectedAffixCount).toBe(2);
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+130 最大生命")), augment).success).toBe(true);
+    expect(evaluateStepPrecondition(parseItemText(itemText("魔法", "+52 智慧")), augment).success).toBe(false);
     expect(evaluateStep(parseItemText(itemText("魔法", "+130 最大生命")), augment).success).toBe(false);
     expect(
       evaluateStep(parseItemText(itemText("魔法", "+130 最大生命", "+46% 冰霜抗性")), augment).success,

@@ -428,7 +428,12 @@ export class AppHost {
       add_step: () => this.addStep(),
       remove_step: (id) => this.removeStep(String(id || "")),
       move_step: (id, d) => this.moveStep(String(id || ""), Number(d || 0)),
-      update_rules: (rs, id) => this.updateRules((rs as Record<string, unknown>) || {}, id == null ? null : String(id)),
+      update_rules: (rs, id, timing) =>
+        this.updateRules(
+          (rs as Record<string, unknown>) || {},
+          id == null ? null : String(id),
+          String(timing || "after"),
+        ),
       set_ui_page: (p) => this.setUiPage(String(p || "")),
       prepare_start: (k) => this.prepareStart(String(k || "")),
       start: (k) => this.start(String(k || "")),
@@ -448,6 +453,7 @@ export class AppHost {
       price_patch_apply: () => this.pricePatch.apply(),
       price_patch_restore: () => this.pricePatch.restore(),
       price_patch_set_auto: (enabled) => this.pricePatch.setAutoUpdate(Boolean(enabled)),
+      price_patch_set_client_root: (value) => this.pricePatch.setClientRoot(String(value || "")),
     };
     const fn = map[name];
     if (!fn) return err(`未知接口: ${name}`);
@@ -539,6 +545,7 @@ export class AppHost {
     if ("name" in fields) step.name = String(fields.name || "").trim() || "未命名步骤";
     if ("enabled" in fields) step.enabled = Boolean(fields.enabled);
     if ("currency_template" in fields) step.currencyTemplate = String(fields.currency_template || "").trim();
+    if ("before_rarity" in fields) step.beforeRarity = String(fields.before_rarity || "").trim();
     if ("before_affix_count" in fields) {
       const raw = fields.before_affix_count;
       const parsed = raw == null || raw === "" ? null : Number(raw);
@@ -596,13 +603,15 @@ export class AppHost {
     return this.wf();
   }
 
-  updateRules(ruleset: Record<string, unknown>, stepId: string | null) {
+  updateRules(ruleset: Record<string, unknown>, stepId: string | null, timing = "after") {
     if (this.busy()) return err("运行中不能改规则");
     const rs = normalizeRuleset(ruleset);
     if (stepId) {
       const step = this.workflow.getStep(stepId);
       if (!step) return err("步骤不存在");
-      step.ruleset = rs;
+      if (timing === "before") step.beforeRuleset = rs;
+      else if (timing === "after") step.ruleset = rs;
+      else return err(`未知的判断阶段: ${timing}`);
       this.library.put(this.workflow);
       return this.wf();
     }

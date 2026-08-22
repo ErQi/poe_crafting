@@ -19,6 +19,30 @@ export function isPoeClientRoot(root: string): boolean {
   );
 }
 
+function unquote(value: string): string {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if ((first === '"' && last === '"') || (first === "'" && last === "'")) {
+      return trimmed.slice(1, -1).trim();
+    }
+  }
+  return trimmed;
+}
+
+/** 自定义路径必须精确指向一个完整客户端，不能静默回退到别的安装目录。 */
+export function normalizePoeClientRoot(value: string): string {
+  const input = unquote(String(value || ""));
+  if (!input) throw new Error("请输入国服客户端目录");
+  const root = path.resolve(input);
+  const missing: string[] = [];
+  if (!fs.existsSync(path.join(root, "PathOfExile_x64.exe"))) missing.push("PathOfExile_x64.exe");
+  if (!fs.existsSync(path.join(root, "Bundles2", "_.index.bin"))) missing.push("Bundles2\\_.index.bin");
+  if (missing.length) throw new Error(`客户端目录无效，缺少：${missing.join("、")}`);
+  return fs.realpathSync.native(root);
+}
+
 async function railAppCandidates(base: string): Promise<string[]> {
   if (!fs.existsSync(base)) return [];
   const result: string[] = [];
@@ -39,7 +63,7 @@ async function railAppCandidates(base: string): Promise<string[]> {
 export async function detectPoeClient(lastKnown = ""): Promise<string> {
   const direct = [process.env.POE_CLIENT_DIR || "", lastKnown].filter(Boolean);
   for (const candidate of direct) {
-    if (isPoeClientRoot(candidate)) return fs.realpathSync.native(candidate);
+    if (isPoeClientRoot(candidate)) return normalizePoeClientRoot(candidate);
   }
 
   const roots: string[] = [];
