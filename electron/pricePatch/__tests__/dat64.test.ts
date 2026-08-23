@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { cleanLocalizedBaseItems, parseBaseItemTypes, patchLocalizedBaseItems } from "../dat64";
+import {
+  cleanLocalizedBaseItems,
+  isPriceSuffixOnlyBaseItemVariant,
+  parseBaseItemTypes,
+  patchLocalizedBaseItems,
+} from "../dat64";
 import type { PriceQuote } from "../types";
 
 const RECORD_SIZE = 40;
@@ -112,5 +117,22 @@ describe("BaseItemTypes 基线重建", () => {
       "混沌石",
       "普通物品",
     ]);
+  });
+
+  it("可严格识别另一份 POE Tools 从同一基线生成的价格版本", () => {
+    const baseline = dat([
+      { id: "Metadata/Chaos", name: "混沌石" },
+      { id: "Metadata/Divine", name: "神圣石" },
+    ]);
+    const candidate = patchLocalizedBaseItems(baseline, baseline, [
+      quote("混沌石", "混沌石", "1c"),
+      quote("神圣石", "神圣石", "125c"),
+    ]).buffer;
+
+    expect(isPriceSuffixOnlyBaseItemVariant(baseline, candidate)).toBe(true);
+
+    const otherBinaryChange = Buffer.from(candidate);
+    otherBinaryChange[4 + 16] = 1;
+    expect(isPriceSuffixOnlyBaseItemVariant(baseline, otherBinaryChange)).toBe(false);
   });
 });

@@ -87,6 +87,58 @@ export function stripPriceSuffix(value: string): string {
   return result;
 }
 
+/**
+ * 判断候选文件是否由同一份 BaseItemTypes 仅追加本工具价格后缀得到。
+ * 除名称指针和末尾追加字符串外，固定记录及原数据区必须逐字节一致。
+ */
+export function isPriceSuffixOnlyBaseItemVariant(baselineInput: Buffer, candidateInput: Buffer): boolean {
+  try {
+    const baseline = parseBaseItemTypes(baselineInput);
+    const candidate = parseBaseItemTypes(candidateInput);
+    if (
+      baseline.rowCount !== candidate.rowCount ||
+      baseline.recordSize !== candidate.recordSize ||
+      baseline.dataSectionOffset !== candidate.dataSectionOffset
+    ) {
+      return false;
+    }
+
+    const baselineData = baselineInput.subarray(baseline.dataSectionOffset);
+    if (candidateInput.length - candidate.dataSectionOffset < baselineData.length) return false;
+    if (!candidateInput.subarray(candidate.dataSectionOffset, candidate.dataSectionOffset + baselineData.length).equals(baselineData)) {
+      return false;
+    }
+
+    let hasPriceSuffix = false;
+    for (let index = 0; index < baseline.rowCount; index += 1) {
+      const baselineRow = baseline.rows[index];
+      const candidateRow = candidate.rows[index];
+      if (
+        baselineRow.id !== candidateRow.id ||
+        stripPriceSuffix(baselineRow.name) !== stripPriceSuffix(candidateRow.name)
+      ) {
+        return false;
+      }
+      if (stripPriceSuffix(candidateRow.name) !== candidateRow.name) hasPriceSuffix = true;
+
+      const record = 4 + index * baseline.recordSize;
+      if (!baselineInput.subarray(record, record + NAME_POINTER_OFFSET).equals(
+        candidateInput.subarray(record, record + NAME_POINTER_OFFSET),
+      )) {
+        return false;
+      }
+      if (!baselineInput.subarray(record + NAME_POINTER_OFFSET + 8, record + baseline.recordSize).equals(
+        candidateInput.subarray(record + NAME_POINTER_OFFSET + 8, record + candidate.recordSize),
+      )) {
+        return false;
+      }
+    }
+    return hasPriceSuffix;
+  } catch {
+    return false;
+  }
+}
+
 function key(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
 }

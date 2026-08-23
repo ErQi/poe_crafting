@@ -19,6 +19,7 @@ import CraftPage from "./pages/CraftPage.vue";
 import WorkflowPage from "./pages/WorkflowPage.vue";
 import TemplatesPage from "./pages/TemplatesPage.vue";
 import PricePatchPage from "./pages/PricePatchPage.vue";
+import ClientEnhancementsPage from "./pages/ClientEnhancementsPage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
 
 const tab = ref("help");
@@ -49,6 +50,10 @@ function apply(res) {
   if (res.price_patch) {
     state.value.price_patch = res.price_patch;
     runtime.value.price_patch = res.price_patch;
+  }
+  if (res.client_enhancements) {
+    state.value.client_enhancements = res.client_enhancements;
+    runtime.value.client_enhancements = res.client_enhancements;
   }
   if (res.meta) state.value.meta = res.meta;
   if (res.item_preview) {
@@ -297,6 +302,7 @@ async function removeStep(id) {
         <button type="button" :class="{ on: tab === 'normal' }" @click="setTab('normal')">普通工艺</button>
         <button type="button" class="sub" :class="{ on: tab === 'templates' }" @click="setTab('templates')">模板</button>
         <button type="button" class="sub" :class="{ on: tab === 'price_patch' }" @click="setTab('price_patch')">标价补丁</button>
+        <button type="button" class="sub" :class="{ on: tab === 'client_enhancements' }" @click="setTab('client_enhancements')">游戏增强</button>
         <button type="button" class="sub" :class="{ on: tab === 'settings' }" @click="setTab('settings')">设置</button>
       </nav>
       <div class="drag-fill" />
@@ -405,6 +411,15 @@ async function removeStep(id) {
         @auto="(enabled) => applyCall(() => call('price_patch_set_auto', enabled))"
         @client-root="setPricePatchClientRoot"
         @choose-client-root="choosePricePatchClientRoot"
+      />
+      <ClientEnhancementsPage
+        v-show="tab === 'client_enhancements'"
+        :state="state"
+        :runtime="runtime"
+        @update="(values) => applyCall(() => call('client_enhancements_update', values))"
+        @apply="applyCall(() => call('client_enhancements_apply'))"
+        @restore="applyCall(() => call('client_enhancements_restore'))"
+        @retry="applyCall(() => call('client_enhancements_retry'))"
       />
       <SettingsPage
         v-show="tab === 'settings'"

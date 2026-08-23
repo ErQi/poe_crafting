@@ -59,7 +59,7 @@ function displayTime(value) {
       <div class="heading">
         <div>
           <div class="h">国服客户端标价补丁</div>
-          <p class="tiny">国服行情来自 poecurrency.top；缺价物品才使用 poe.ninja 当前赛季行情。</p>
+          <p class="tiny">国服行情优先，缺价时使用 poe.ninja 全部 POE1 类别；等级或词缀变体显示挂单量最高的代表价。</p>
         </div>
         <span class="badge" :class="{ on: applied }">{{ applied ? "已应用" : "未应用" }}</span>
       </div>

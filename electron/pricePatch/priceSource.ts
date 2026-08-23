@@ -24,21 +24,53 @@ export const POE_NINJA_EXCHANGE_TYPES = [
   "Essence",
 ] as const;
 
-// 只拉取能由“物品名称”唯一表达价格的小型仓库类别。装备基底、技能宝石、地图和传奇
-// 会随物品等级、品质、链接或词缀产生大量同名价格，不能安全写进 BaseItemTypes 的统一名称。
+// poe.ninja POE1 stash API 的非唯一物品类别。有等级、品质、词缀或地图阶级的
+// 类别会折叠到客户端可稳定显示的名称，并以挂单量最高的行作为代表价。
 export const POE_NINJA_STASH_ITEM_TYPES = [
   "Wombgift",
   "Corpse",
   "Incubator",
+  "SkillGem",
+  "ImbuedGem",
+  "ClusterJewel",
+  "Map",
+  "BlightedMap",
+  "BlightRavagedMap",
+  "ValdoMap",
   "Invitation",
   "Memory",
+  "IncursionTemple",
+  "ScryingOrb",
+  "BaseType",
+  "Flask",
+  "Beast",
   "Vial",
+] as const;
+
+// 唯一装备名不在 BaseItemTypes，而由 UniqueStashLayout 指向 Words；这些类别走单独的
+// Words.Text2 标价链路。同名多变体沿用 poe.ninja 挂单量最高的代表行。
+export const POE_NINJA_UNIQUE_ITEM_TYPES = [
+  "UniqueWeapon",
+  "UniqueArmour",
+  "UniqueAccessory",
+  "UniqueFlask",
+  "UniqueJewel",
+  "ForbiddenJewel",
+  "ShrineBelt",
+  "UniqueTincture",
+  "UniqueRelic",
+  "UniqueMap",
+] as const;
+
+export const POE_NINJA_ITEM_TYPES = [
+  ...POE_NINJA_STASH_ITEM_TYPES,
+  ...POE_NINJA_UNIQUE_ITEM_TYPES,
 ] as const;
 
 const MAX_PRICE_AGE_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const NINJA_REQUEST_CONCURRENCY = 6;
-const USER_AGENT = "POE-Tools/0.4.1 price-patch";
+const USER_AGENT = "POE-Tools/0.4.3 price-patch";
 
 interface FetchHeaders {
   get(name: string): string | null;
@@ -277,13 +309,43 @@ function betterCandidate(next: NinjaCandidate, current: NinjaCandidate): boolean
   return next.stableId.localeCompare(current.stableId, "en") < 0;
 }
 
+/**
+ * 把 poe.ninja 的可变行名折叠到客户端真正会显示的稳定名称。
+ * 精确变体价依然由挂单量最高的行决定，避免随机名、阶级或词缀导致完全无法匹配。
+ */
+export function ninjaItemTargetName(category: string, line: Record<string, unknown>): string {
+  const name = text(line.name);
+  const baseType = text(line.baseType);
+  switch (category) {
+    case "ForbiddenJewel":
+      return text(line.variant) || name;
+    case "SkillGem":
+      // 瓦尔+异化宝石的 API 名称会组合两个技能名，客户端没有该组合字符串。
+      return /\s+\(.+\)$/u.test(name) ? baseType || name : name;
+    case "ClusterJewel":
+    case "Map":
+    case "ValdoMap":
+    case "ScryingOrb":
+      return baseType || name;
+    case "BlightedMap":
+      return "Blighted Map";
+    case "BlightRavagedMap":
+      return "Blight-ravaged Map";
+    case "IncursionTemple":
+      return name.replace(/\s+\(Tier\s+\d+\)$/iu, "") || baseType;
+    default:
+      return name;
+  }
+}
+
 export function parseNinjaItemOverview(payload: unknown, category: string, sourceTime: string): PriceQuote[] {
   const root = record(payload);
   if (!root || !Array.isArray(root.lines)) throw new Error(`poe.ninja ${category} 行情格式不正确`);
   const selected = new Map<string, NinjaCandidate>();
   for (const line of root.lines) {
     const lineRecord = record(line);
-    const name = text(lineRecord?.name);
+    if (!lineRecord) continue;
+    const name = ninjaItemTargetName(category, lineRecord);
     const chaosValue = finitePositive(lineRecord?.chaosValue);
     if (!name || chaosValue == null) continue;
     const candidate: NinjaCandidate = {
@@ -365,6 +427,11 @@ export class PoeCurrencyPriceSource {
         url: `https://poe.ninja/poe1/api/economy/exchange/current/overview?${query}&type=${encodeURIComponent(type)}`,
       })),
       ...POE_NINJA_STASH_ITEM_TYPES.map((type) => ({
+        kind: "item" as const,
+        type,
+        url: `https://poe.ninja/poe1/api/economy/stash/current/item/overview?${query}&type=${encodeURIComponent(type)}`,
+      })),
+      ...POE_NINJA_UNIQUE_ITEM_TYPES.map((type) => ({
         kind: "item" as const,
         type,
         url: `https://poe.ninja/poe1/api/economy/stash/current/item/overview?${query}&type=${encodeURIComponent(type)}`,

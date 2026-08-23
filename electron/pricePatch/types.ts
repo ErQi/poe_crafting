@@ -27,7 +27,7 @@ export interface AppliedFileFingerprint {
 }
 
 export interface PricePatchState {
-  schemaVersion: 1;
+  schemaVersion: 2;
   clientRoot: string;
   baselineId: string;
   applied: boolean;
@@ -41,6 +41,8 @@ export interface PricePatchState {
   nextRetryAt: string;
   lastPriceDigest: string;
   lastPatchedResourceSha256: string;
+  lastPatchedUniqueWordsSha256: string;
+  lastPatchedAuxiliarySha256: string;
   appliedFiles: AppliedFileFingerprint[];
   appliedCustomFiles: string[];
   updatedItemCount: number;
@@ -65,7 +67,7 @@ export interface PricePatchView {
 
 export function defaultPricePatchState(): PricePatchState {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     clientRoot: "",
     baselineId: "",
     applied: false,
@@ -79,6 +81,8 @@ export function defaultPricePatchState(): PricePatchState {
     nextRetryAt: "",
     lastPriceDigest: "",
     lastPatchedResourceSha256: "",
+    lastPatchedUniqueWordsSha256: "",
+    lastPatchedAuxiliarySha256: "",
     appliedFiles: [],
     appliedCustomFiles: [],
     updatedItemCount: 0,
@@ -122,6 +126,8 @@ export function pricePatchStateFrom(value: unknown): PricePatchState {
     nextRetryAt: text(raw.nextRetryAt),
     lastPriceDigest: text(raw.lastPriceDigest),
     lastPatchedResourceSha256: text(raw.lastPatchedResourceSha256),
+    lastPatchedUniqueWordsSha256: text(raw.lastPatchedUniqueWordsSha256),
+    lastPatchedAuxiliarySha256: text(raw.lastPatchedAuxiliarySha256),
     appliedFiles: files,
     appliedCustomFiles: Array.isArray(raw.appliedCustomFiles)
       ? raw.appliedCustomFiles.map(text).filter(Boolean)

@@ -9,7 +9,11 @@ import {
   parseSourceTime,
   PoeCurrencyPriceSource,
   POE_CURRENCY_SUMMARY_URL,
+  POE_NINJA_EXCHANGE_TYPES,
+  POE_NINJA_ITEM_TYPES,
   POE_NINJA_LEAGUES_URL,
+  POE_NINJA_STASH_ITEM_TYPES,
+  POE_NINJA_UNIQUE_ITEM_TYPES,
 } from "../priceSource";
 import type { PriceSnapshot } from "../types";
 
@@ -84,6 +88,42 @@ describe("poecurrency.top 行情解析", () => {
 describe("poe.ninja 兜底行情", () => {
   const SOURCE_TIME = "2026-08-20T12:20:00.000Z";
 
+  it("覆盖官方 POE1 的 18 个兑换类别和 28 个仓库类别", () => {
+    expect(POE_NINJA_EXCHANGE_TYPES).toHaveLength(18);
+    expect(new Set(POE_NINJA_ITEM_TYPES)).toEqual(new Set([
+      "Wombgift",
+      "Corpse",
+      "Incubator",
+      "UniqueWeapon",
+      "UniqueArmour",
+      "UniqueAccessory",
+      "UniqueFlask",
+      "UniqueJewel",
+      "ForbiddenJewel",
+      "ShrineBelt",
+      "UniqueTincture",
+      "UniqueRelic",
+      "SkillGem",
+      "ImbuedGem",
+      "ClusterJewel",
+      "Map",
+      "BlightedMap",
+      "BlightRavagedMap",
+      "UniqueMap",
+      "ValdoMap",
+      "Invitation",
+      "Memory",
+      "IncursionTemple",
+      "ScryingOrb",
+      "BaseType",
+      "Flask",
+      "Beast",
+      "Vial",
+    ]));
+    expect(POE_NINJA_ITEM_TYPES).toHaveLength(28);
+    expect(new Set([...POE_NINJA_STASH_ITEM_TYPES, ...POE_NINJA_UNIQUE_ITEM_TYPES]).size).toBe(28);
+  });
+
   it("使用联盟接口第一项作为当前赛季", () => {
     expect(parseNinjaLeague([{ id: "Allflame", name: "Allflame" }, { id: "Standard" }])).toBe("Allflame");
     expect(() => parseNinjaLeague([])).toThrow("当前赛季");
@@ -129,6 +169,98 @@ describe("poe.ninja 兜底行情", () => {
     );
     expect(quotes).toHaveLength(1);
     expect(quotes[0]).toMatchObject({ englishName: "Ancient Wombgift", display: "15c" });
+  });
+
+  it("把动态词缀、地图阶级和禁断珠宝折叠到客户端稳定名称", () => {
+    const cluster = parseNinjaItemOverview(
+      { lines: [
+        { name: "12% increased Chaos Damage", baseType: "Large Cluster Jewel", chaosValue: 40, listingCount: 3 },
+        { name: "12% increased Fire Damage", baseType: "Large Cluster Jewel", chaosValue: 8, listingCount: 50 },
+      ] },
+      "ClusterJewel",
+      SOURCE_TIME,
+    );
+    expect(cluster).toEqual([expect.objectContaining({ englishName: "Large Cluster Jewel", display: "8c" })]);
+
+    const map = parseNinjaItemOverview(
+      { lines: [{ name: "Veritania Vaal Temple Map", baseType: "Vaal Temple Map", chaosValue: 84, listingCount: 26 }] },
+      "Map",
+      SOURCE_TIME,
+    );
+    expect(map[0]).toMatchObject({ englishName: "Vaal Temple Map", display: "84c" });
+
+    const blighted = parseNinjaItemOverview(
+      { lines: [{ name: "Blighted Map (Tier 16)", chaosValue: 23, listingCount: 561 }] },
+      "BlightedMap",
+      SOURCE_TIME,
+    );
+    expect(blighted[0]).toMatchObject({ englishName: "Blighted Map", display: "23c" });
+
+    const forbidden = parseNinjaItemOverview(
+      { lines: [{ name: "Vile Bastion", variant: "Forbidden Flesh", chaosValue: 100, listingCount: 8 }] },
+      "ForbiddenJewel",
+      SOURCE_TIME,
+    );
+    expect(forbidden[0]).toMatchObject({ englishName: "Forbidden Flesh", display: "100c" });
+  });
+
+  it("寺庙房间去掉 API 阶级后缀，占星球折叠到物品基底", () => {
+    const temple = parseNinjaItemOverview(
+      { lines: [{ name: "Locus of Corruption (Tier 3)", baseType: "Chronicle of Atzoatl", chaosValue: 379 }] },
+      "IncursionTemple",
+      SOURCE_TIME,
+    );
+    expect(temple[0]).toMatchObject({ englishName: "Locus of Corruption", display: "379c" });
+
+    const scrying = parseNinjaItemOverview(
+      { lines: [{ name: "Vaal Pyramid", baseType: "Scrying Orb", chaosValue: 840 }] },
+      "ScryingOrb",
+      SOURCE_TIME,
+    );
+    expect(scrying[0]).toMatchObject({ englishName: "Scrying Orb", display: "840c" });
+  });
+
+  it("瓦尔异化宝石的组合行名回退到可显示的宝石基底", () => {
+    const quotes = parseNinjaItemOverview(
+      { lines: [{
+        name: "Vaal Cyclone (Cyclone of Tumult)",
+        baseType: "Vaal Cyclone",
+        chaosValue: 20,
+        listingCount: 187,
+      }] },
+      "SkillGem",
+      SOURCE_TIME,
+    );
+    expect(quotes[0]).toMatchObject({ englishName: "Vaal Cyclone", display: "20c" });
+  });
+
+  it("唯一饰品进入抓取类别，并解析乌扎萨的高山代表价", () => {
+    expect(POE_NINJA_UNIQUE_ITEM_TYPES).toContain("UniqueAccessory");
+    const quotes = parseNinjaItemOverview(
+      {
+        lines: [
+          {
+            name: "Uzaza's Mountain",
+            baseType: "Sapphire Ring",
+            chaosValue: 90,
+            divineValue: 0.45,
+            listingCount: 400,
+            count: 314,
+            detailsId: "uzazas-mountain-sapphire-ring",
+          },
+        ],
+      },
+      "UniqueAccessory",
+      SOURCE_TIME,
+    );
+    expect(quotes).toEqual([
+      expect.objectContaining({
+        englishName: "Uzaza's Mountain",
+        category: "poe.ninja UniqueAccessory",
+        display: "90c",
+        source: "poe-ninja",
+      }),
+    ]);
   });
 
   it("合并时逐物品保留国服价，只为缺失物品加入忍者网价", () => {
@@ -192,6 +324,7 @@ describe("poe.ninja 兜底行情", () => {
 
     const snapshot = await new PoeCurrencyPriceSource(request).fetch(NOW);
     expect(request.mock.calls.some(([url]) => String(url).includes("league=Allflame"))).toBe(true);
+    expect(request.mock.calls.some(([url]) => String(url).includes("type=UniqueAccessory"))).toBe(true);
     expect(snapshot.quotes.map((quote) => [quote.englishName, quote.display, quote.source])).toEqual([
       ["Divine Orb", "125c", "poecurrency"],
       ["Chaos Orb", "1c", "poe-ninja"],

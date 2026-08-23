@@ -1,4 +1,5 @@
 import { loadJson, resolvePath, saveJson } from "../engine/configStore";
+import { ClientPatchLock } from "../clientPatchLock";
 import { ClientPricePatcher, GameRunningError } from "./clientPatcher";
 import { isGameRunning, normalizePoeClientRoot } from "./clientLocator";
 import { PoeCurrencyPriceSource } from "./priceSource";
@@ -35,6 +36,7 @@ export class PricePatchController {
     private readonly source = new PoeCurrencyPriceSource(),
     private readonly patcher = new ClientPricePatcher(),
     private readonly gameRunning: () => Promise<boolean> = isGameRunning,
+    private readonly lock = new ClientPatchLock(),
   ) {
     const loaded = loadJson(this.stateFile, defaultPricePatchState());
     this.state = pricePatchStateFrom(loaded);
@@ -42,6 +44,10 @@ export class PricePatchController {
 
   view(): PricePatchView {
     return pricePatchView(this.state);
+  }
+
+  configuredClientRoot(): string {
+    return this.state.clientRoot;
   }
 
   start(notify: () => void): void {
@@ -115,7 +121,7 @@ export class PricePatchController {
 
   private async startOperation(run: () => Promise<void>): Promise<void> {
     if (this.operation) return this.operation;
-    this.operation = run().finally(() => {
+    this.operation = this.lock.run("标价补丁", run).finally(() => {
       this.operation = null;
     });
     return this.operation;
@@ -148,6 +154,8 @@ export class PricePatchController {
         nextRetryAt: "",
         lastPriceDigest: prices.digest,
         lastPatchedResourceSha256: result.patchedResourceSha256,
+        lastPatchedUniqueWordsSha256: result.patchedUniqueWordsSha256,
+        lastPatchedAuxiliarySha256: result.patchedAuxiliarySha256,
         appliedFiles: result.appliedFiles,
         appliedCustomFiles: result.appliedCustomFiles,
         updatedItemCount: result.matchedCount,
@@ -186,6 +194,8 @@ export class PricePatchController {
         nextRetryAt: "",
         lastPriceDigest: "",
         lastPatchedResourceSha256: "",
+        lastPatchedUniqueWordsSha256: "",
+        lastPatchedAuxiliarySha256: "",
         appliedFiles: [],
         appliedCustomFiles: [],
         updatedItemCount: 0,
@@ -271,6 +281,8 @@ export class PricePatchController {
         nextRetryAt: "",
         lastPriceDigest: changed ? "" : this.state.lastPriceDigest,
         lastPatchedResourceSha256: changed ? "" : this.state.lastPatchedResourceSha256,
+        lastPatchedUniqueWordsSha256: changed ? "" : this.state.lastPatchedUniqueWordsSha256,
+        lastPatchedAuxiliarySha256: changed ? "" : this.state.lastPatchedAuxiliarySha256,
         appliedFiles: changed ? [] : this.state.appliedFiles,
         appliedCustomFiles: changed ? [] : this.state.appliedCustomFiles,
         updatedItemCount: changed ? 0 : this.state.updatedItemCount,

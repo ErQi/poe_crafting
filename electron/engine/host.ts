@@ -43,6 +43,8 @@ import {
   validateWorkflow,
 } from "./workflow";
 import { PricePatchController } from "../pricePatch/controller";
+import { ClientPatchLock } from "../clientPatchLock";
+import { ClientEnhancementController } from "../clientEnhancements/controller";
 
 export const UI_HELP = "help";
 export const UI_GARDEN = "garden";
@@ -50,14 +52,16 @@ export const UI_NORMAL = "normal";
 export const UI_TEMPLATES = "templates";
 export const UI_SETTINGS = "settings";
 export const UI_PRICE_PATCH = "price_patch";
-const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_PRICE_PATCH, UI_SETTINGS];
+export const UI_CLIENT_ENHANCEMENTS = "client_enhancements";
+const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_PRICE_PATCH, UI_CLIENT_ENHANCEMENTS, UI_SETTINGS];
 const UI_PAGE_LABELS: Record<string, string> = {
   [UI_HELP]: "使用说明",
   [UI_SETTINGS]: "设置",
   [UI_TEMPLATES]: "模板",
   [UI_PRICE_PATCH]: "标价补丁",
+  [UI_CLIENT_ENHANCEMENTS]: "游戏增强",
 };
-const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES, UI_PRICE_PATCH];
+const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES, UI_PRICE_PATCH, UI_CLIENT_ENHANCEMENTS];
 
 const TEMPLATE_SLOTS: [string, string, boolean][] = [
   ["craft_button", "执行工艺按钮", true],
@@ -158,6 +162,7 @@ export class AppHost {
   private alertId = 0;
   automation: CraftAutomation;
   private readonly pricePatch: PricePatchController;
+  private readonly clientEnhancements: ClientEnhancementController;
   private uiPage = UI_NORMAL;
   private lastCraftPage = UI_NORMAL;
   private pushFn: ((rt: Record<string, unknown>) => void) | null = null;
@@ -177,7 +182,14 @@ export class AppHost {
     this.library = loadLibrary(resolvePath(this.settings.workflowFile));
     this.workflow = this.library.active();
     this.automation = new CraftAutomation((m) => this.onLog(m), (s) => this.onStatus(s));
-    this.pricePatch = new PricePatchController();
+    const clientPatchLock = new ClientPatchLock();
+    this.pricePatch = new PricePatchController(undefined, undefined, undefined, clientPatchLock);
+    this.clientEnhancements = new ClientEnhancementController(
+      undefined,
+      undefined,
+      clientPatchLock,
+      () => this.pricePatch.configuredClientRoot(),
+    );
     this.uiPage = UI_HELP;
     this.lastCraftPage = this.settings.craftMode === CraftMode.WORKFLOW ? UI_NORMAL : UI_GARDEN;
     const configErrors = takeLoadErrors();
@@ -236,11 +248,13 @@ export class AppHost {
     this.pushFn = push;
     this.overlay = overlay;
     this.pricePatch.start(() => this.push());
+    this.clientEnhancements.start(() => this.push());
   }
 
   shutdown(): void {
     this.automation.requestStop(StopReason.USER_STOP);
     this.pricePatch.shutdown();
+    this.clientEnhancements.shutdown();
   }
 
   /** 热键值变化时重新注册；注册入口只有这一个，避免同一件事两个触发点 */
@@ -302,6 +316,7 @@ export class AppHost {
       runtime: this.runtime(),
       templates: this.templateRows(),
       price_patch: this.pricePatch.view(),
+      client_enhancements: this.clientEnhancements.view(),
     };
   }
 
@@ -329,6 +344,7 @@ export class AppHost {
       pending_info: this.pendingInfo(),
       init_error: this.initError,
       price_patch: this.pricePatch.view(),
+      client_enhancements: this.clientEnhancements.view(),
     };
   }
 
@@ -454,6 +470,11 @@ export class AppHost {
       price_patch_restore: () => this.pricePatch.restore(),
       price_patch_set_auto: (enabled) => this.pricePatch.setAutoUpdate(Boolean(enabled)),
       price_patch_set_client_root: (value) => this.pricePatch.setClientRoot(String(value || "")),
+      client_enhancements_update: (values) =>
+        this.clientEnhancements.update((values as Record<string, unknown>) || {}),
+      client_enhancements_apply: () => this.clientEnhancements.apply(),
+      client_enhancements_restore: () => this.clientEnhancements.restore(),
+      client_enhancements_retry: () => this.clientEnhancements.retry(),
     };
     const fn = map[name];
     if (!fn) return err(`未知接口: ${name}`);
