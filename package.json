@@ -1,7 +1,7 @@
 {
   "name": "poe-crafting",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "POE Tools",
   "productName": "POE Tools",
   "author": "Faith",
@@ -58,6 +58,7 @@
       "!node_modules/opencv-wasm/types/**"
     ],
     "win": {
+      "requestedExecutionLevel": "requireAdministrator",
       "target": [
         {
           "target": "portable",
@@ -68,7 +69,8 @@
       ]
     },
     "portable": {
-      "artifactName": "POE-Tools-${version}-portable.${ext}"
+      "artifactName": "POE-Tools-${version}-portable.${ext}",
+      "requestExecutionLevel": "admin"
     }
   }
 }

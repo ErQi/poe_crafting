@@ -38,7 +38,7 @@ export const POE_NINJA_STASH_ITEM_TYPES = [
 const MAX_PRICE_AGE_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const NINJA_REQUEST_CONCURRENCY = 6;
-const USER_AGENT = "POE-Tools/0.4.0 price-patch";
+const USER_AGENT = "POE-Tools/0.4.1 price-patch";
 
 interface FetchHeaders {
   get(name: string): string | null;
