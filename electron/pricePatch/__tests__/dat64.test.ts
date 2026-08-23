@@ -32,7 +32,12 @@ function dat(rows: Array<{ id: string; name: string }>): Buffer {
   return result;
 }
 
-function quote(englishName: string, itemName: string, display: string): PriceQuote {
+function quote(
+  englishName: string,
+  itemName: string,
+  display: string,
+  source: PriceQuote["source"] = "poecurrency",
+): PriceQuote {
   return {
     englishName,
     itemName,
@@ -41,6 +46,7 @@ function quote(englishName: string, itemName: string, display: string): PriceQuo
     value: 1,
     unit: display.endsWith("d") ? "d" : "c",
     sourceTime: "2026-08-20 20:00:00",
+    source,
   };
 }
 
@@ -79,6 +85,16 @@ describe("BaseItemTypes 基线重建", () => {
     const patched = patchLocalizedBaseItems(english, localized, [quote("Kishara's Ducat", "琪莎拉纪念币", "5c")]);
     expect(patched.matchedIds).toEqual([id]);
     expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("琪莎拉纪念币 · 5c");
+  });
+
+  it("中英文命中来自不同数据源时仍严格优先国服价格", () => {
+    const english = dat([{ id: "Metadata/Divine", name: "Divine Orb" }]);
+    const localized = dat([{ id: "Metadata/Divine", name: "神圣石" }]);
+    const patched = patchLocalizedBaseItems(english, localized, [
+      quote("Divine Orb", "", "1d", "poe-ninja"),
+      quote("", "神圣石", "125c", "poecurrency"),
+    ]);
+    expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("神圣石 · 125c");
   });
 
   it("建立新版本基线时可清理本功能留下的价格后缀", () => {

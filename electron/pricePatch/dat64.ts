@@ -116,6 +116,26 @@ function appendNames(parsed: ParsedBaseItemTypes, updates: Map<number, string>):
   return Buffer.concat(chunks);
 }
 
+function sourcePriority(quote: PriceQuote): number {
+  // 未标来源的旧调用按原有国服行情处理，避免升级后改变既有匹配语义。
+  return quote.source === "poe-ninja" ? 1 : 0;
+}
+
+function keepPreferredQuote(map: Map<string, PriceQuote>, name: string, quote: PriceQuote): void {
+  const existing = map.get(name);
+  // 同一来源延续原有的“后条目生效”；只有低优先级来源不能覆盖国服。
+  if (!existing || sourcePriority(quote) <= sourcePriority(existing)) map.set(name, quote);
+}
+
+function preferredQuote(english: PriceQuote | undefined, chinese: PriceQuote | undefined): PriceQuote | undefined {
+  if (!english) return chinese;
+  if (!chinese) return english;
+  const englishPriority = sourcePriority(english);
+  const chinesePriority = sourcePriority(chinese);
+  // 同一来源仍优先英文名 + 内部 Id；跨来源时国服行情永远优先。
+  return chinesePriority < englishPriority ? chinese : english;
+}
+
 export function cleanLocalizedBaseItems(input: Buffer): { buffer: Buffer; changedCount: number } {
   const parsed = parseBaseItemTypes(input);
   const updates = new Map<number, string>();
@@ -142,17 +162,18 @@ export function patchLocalizedBaseItems(
   const quoteByEnglish = new Map<string, PriceQuote>();
   const quoteByChinese = new Map<string, PriceQuote>();
   for (const quote of quotes) {
-    if (quote.englishName) quoteByEnglish.set(key(quote.englishName), quote);
-    if (quote.itemName) quoteByChinese.set(chineseKey(quote.itemName), quote);
+    if (quote.englishName) keepPreferredQuote(quoteByEnglish, key(quote.englishName), quote);
+    if (quote.itemName) keepPreferredQuote(quoteByChinese, chineseKey(quote.itemName), quote);
   }
 
   const updates = new Map<number, string>();
   const matchedIds: string[] = [];
   for (const [id, localizedRow] of localizedById) {
     const englishRow = englishById.get(id);
-    const quote =
-      (englishRow ? quoteByEnglish.get(key(englishRow.name)) : undefined) ??
-      quoteByChinese.get(chineseKey(localizedRow.name));
+    const quote = preferredQuote(
+      englishRow ? quoteByEnglish.get(key(englishRow.name)) : undefined,
+      quoteByChinese.get(chineseKey(localizedRow.name)),
+    );
     if (!quote) continue;
     const baselineName = stripPriceSuffix(localizedRow.name);
     updates.set(localizedRow.index, `${baselineName} · ${quote.display}`);

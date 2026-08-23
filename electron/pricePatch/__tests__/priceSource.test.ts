@@ -1,5 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { formatPrice, parsePriceSummary, parseSourceTime } from "../priceSource";
+import { describe, expect, it, vi } from "vitest";
+import {
+  formatPrice,
+  mergePriceSnapshots,
+  parseNinjaExchangeOverview,
+  parseNinjaItemOverview,
+  parseNinjaLeague,
+  parsePriceSummary,
+  parseSourceTime,
+  PoeCurrencyPriceSource,
+  POE_CURRENCY_SUMMARY_URL,
+  POE_NINJA_LEAGUES_URL,
+} from "../priceSource";
+import type { PriceSnapshot } from "../types";
 
 const NOW = Date.parse("2026-08-20T12:30:00Z"); // 北京时间 20:30
 
@@ -24,7 +36,7 @@ describe("poecurrency.top 行情解析", () => {
       NOW,
     );
     expect(snapshot.quotes).toHaveLength(1);
-    expect(snapshot.quotes[0]).toMatchObject({ itemName: "神圣石", display: "125c" });
+    expect(snapshot.quotes[0]).toMatchObject({ itemName: "神圣石", display: "125c", source: "poecurrency" });
   });
 
   it("异常数据被跳过，且只接受最新卖1", () => {
@@ -66,5 +78,123 @@ describe("poecurrency.top 行情解析", () => {
       englishName: "Kishara's Ducat",
       display: "5c",
     });
+  });
+});
+
+describe("poe.ninja 兜底行情", () => {
+  const SOURCE_TIME = "2026-08-20T12:20:00.000Z";
+
+  it("使用联盟接口第一项作为当前赛季", () => {
+    expect(parseNinjaLeague([{ id: "Allflame", name: "Allflame" }, { id: "Standard" }])).toBe("Allflame");
+    expect(() => parseNinjaLeague([])).toThrow("当前赛季");
+  });
+
+  it("按元数据名称解析兑换行情，并在价格较高时改用神圣石显示", () => {
+    const quotes = parseNinjaExchangeOverview(
+      {
+        core: { primary: "chaos", rates: { divine: 0.005 } },
+        items: [
+          { id: "divine", name: "Divine Orb" },
+          { id: "missing-line", name: "Missing Line" },
+        ],
+        lines: [
+          { id: "divine", primaryValue: 250 },
+          { id: "missing-name", primaryValue: 5 },
+        ],
+      },
+      "Currency",
+      SOURCE_TIME,
+    );
+    expect(quotes).toEqual([
+      expect.objectContaining({
+        englishName: "Divine Orb",
+        display: "1.3d",
+        source: "poe-ninja",
+        sourceTime: SOURCE_TIME,
+      }),
+    ]);
+  });
+
+  it("同名仓库行情只保留挂单量最高的代表价格", () => {
+    const quotes = parseNinjaItemOverview(
+      {
+        lines: [
+          { name: "Ancient Wombgift", chaosValue: 30, listingCount: 5, count: 5, detailsId: "rare" },
+          { name: "Ancient Wombgift", chaosValue: 15, listingCount: 200, count: 100, detailsId: "common" },
+          { name: "Broken", chaosValue: 0, listingCount: 999 },
+        ],
+      },
+      "Wombgift",
+      SOURCE_TIME,
+    );
+    expect(quotes).toHaveLength(1);
+    expect(quotes[0]).toMatchObject({ englishName: "Ancient Wombgift", display: "15c" });
+  });
+
+  it("合并时逐物品保留国服价，只为缺失物品加入忍者网价", () => {
+    const primary = parsePriceSummary([{ category_label: "通货", items: [item()] }], NOW);
+    const fallbackQuotes = parseNinjaExchangeOverview(
+      {
+        core: { primary: "chaos", rates: { divine: 0.005 } },
+        items: [
+          { id: "divine", name: "Divine Orb" },
+          { id: "chaos", name: "Chaos Orb" },
+        ],
+        lines: [
+          { id: "divine", primaryValue: 200 },
+          { id: "chaos", primaryValue: 1 },
+        ],
+      },
+      "Currency",
+      SOURCE_TIME,
+    );
+    const fallback: PriceSnapshot = {
+      fetchedAt: SOURCE_TIME,
+      sourceUpdatedAt: SOURCE_TIME,
+      digest: "fallback",
+      quotes: fallbackQuotes,
+    };
+    const merged = mergePriceSnapshots(primary, fallback, NOW);
+    expect(merged.quotes.map((quote) => [quote.englishName, quote.display, quote.source])).toEqual([
+      ["Divine Orb", "125c", "poecurrency"],
+      ["Chaos Orb", "1c", "poe-ninja"],
+    ]);
+  });
+
+  it("实际抓取链路动态使用当前赛季，并在入口完成优先级合并", async () => {
+    const response = (payload: unknown) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name: string) => (name.toLowerCase() === "date" ? "Thu, 20 Aug 2026 12:20:00 GMT" : null) },
+      json: async () => payload,
+    });
+    const request = vi.fn(async (url: string) => {
+      if (url === POE_CURRENCY_SUMMARY_URL) return response([{ category_label: "通货", items: [item()] }]);
+      if (url === POE_NINJA_LEAGUES_URL) return response([{ id: "Allflame", name: "Allflame" }]);
+      if (url.includes("/exchange/") && url.includes("type=Currency")) {
+        return response({
+          core: { primary: "chaos", rates: { divine: 0.005 } },
+          items: [
+            { id: "divine", name: "Divine Orb" },
+            { id: "chaos", name: "Chaos Orb" },
+          ],
+          lines: [
+            { id: "divine", primaryValue: 200 },
+            { id: "chaos", primaryValue: 1 },
+          ],
+        });
+      }
+      if (url.includes("/exchange/")) {
+        return response({ core: { primary: "chaos", rates: { divine: 0.005 } }, items: [], lines: [] });
+      }
+      return response({ lines: [] });
+    });
+
+    const snapshot = await new PoeCurrencyPriceSource(request).fetch(NOW);
+    expect(request.mock.calls.some(([url]) => String(url).includes("league=Allflame"))).toBe(true);
+    expect(snapshot.quotes.map((quote) => [quote.englishName, quote.display, quote.source])).toEqual([
+      ["Divine Orb", "125c", "poecurrency"],
+      ["Chaos Orb", "1c", "poe-ninja"],
+    ]);
   });
 });

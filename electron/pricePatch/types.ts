@@ -1,5 +1,6 @@
 export type PricePatchPendingAction = "apply" | "update" | "restore" | null;
 export type PricePatchPhase = "idle" | "waiting" | "applying" | "restoring" | "error";
+export type PriceQuoteSource = "poecurrency" | "poe-ninja";
 
 export interface PriceQuote {
   itemName: string;
@@ -9,6 +10,7 @@ export interface PriceQuote {
   unit: "c" | "d" | "e";
   display: string;
   sourceTime: string;
+  source?: PriceQuoteSource;
 }
 
 export interface PriceSnapshot {

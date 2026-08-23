@@ -2,13 +2,71 @@ import { createHash } from "crypto";
 import type { PriceQuote, PriceSnapshot } from "./types";
 
 export const POE_CURRENCY_SUMMARY_URL = "https://poecurrency.top/api/summary?version=1";
+export const POE_NINJA_LEAGUES_URL = "https://poe.ninja/poe1/api/economy/leagues";
+export const POE_NINJA_EXCHANGE_TYPES = [
+  "Currency",
+  "Fragment",
+  "Runegraft",
+  "AllflameEmber",
+  "Tattoo",
+  "Omen",
+  "DjinnCoin",
+  "Ducat",
+  "EnshroudingCrystal",
+  "DivinationCard",
+  "Artifact",
+  "Oil",
+  "DeliriumOrb",
+  "Scarab",
+  "Astrolabe",
+  "Fossil",
+  "Resonator",
+  "Essence",
+] as const;
+
+// 只拉取能由“物品名称”唯一表达价格的小型仓库类别。装备基底、技能宝石、地图和传奇
+// 会随物品等级、品质、链接或词缀产生大量同名价格，不能安全写进 BaseItemTypes 的统一名称。
+export const POE_NINJA_STASH_ITEM_TYPES = [
+  "Wombgift",
+  "Corpse",
+  "Incubator",
+  "Invitation",
+  "Memory",
+  "Vial",
+] as const;
+
 const MAX_PRICE_AGE_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const NINJA_REQUEST_CONCURRENCY = 6;
+const USER_AGENT = "POE-Tools/0.4.0 price-patch";
+
+interface FetchHeaders {
+  get(name: string): string | null;
+}
 
 interface FetchResponse {
   ok: boolean;
   status: number;
+  headers?: FetchHeaders;
   json(): Promise<unknown>;
+}
+
+interface NinjaCandidate {
+  quote: PriceQuote;
+  listingCount: number;
+  observationCount: number;
+  stableId: string;
+}
+
+interface NinjaJob {
+  kind: "exchange" | "item";
+  type: string;
+  url: string;
+}
+
+interface NinjaJobResult {
+  quotes: PriceQuote[];
+  error: string;
 }
 
 export type PriceFetch = (
@@ -27,9 +85,26 @@ function finitePositive(value: unknown): number | null {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+function finiteNonNegative(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
+function text(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function record(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
 /** 接口时间没有时区后缀，文档约定为东八区；显式补上，避免系统时区影响过期判断。 */
 export function parseSourceTime(value: unknown): number | null {
-  const raw = typeof value === "string" ? value.trim() : "";
+  const raw = text(value);
   const match = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(raw);
   if (!match) return null;
   const iso = `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}+08:00`;
@@ -37,24 +112,31 @@ export function parseSourceTime(value: unknown): number | null {
   return Number.isFinite(valueMs) ? valueMs : null;
 }
 
+function sourceTimeMs(value: string): number {
+  const chinaTime = parseSourceTime(value);
+  if (chinaTime != null) return chinaTime;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 export function formatPrice(value: number, unit: "c" | "d" | "e"): string {
   const rounded = value < 10 ? Math.round(value * 10) / 10 : Math.round(value);
-  const safe = Math.max(unit === "d" ? 0.1 : 0.1, rounded);
+  const safe = Math.max(0.1, rounded);
   return `${Number.isInteger(safe) ? safe.toFixed(0) : safe.toFixed(1)}${unit}`;
 }
 
-function quoteFrom(raw: Record<string, unknown>, category: string, nowMs: number): PriceQuote | null {
+function quoteFromChina(raw: Record<string, unknown>, category: string, nowMs: number): PriceQuote | null {
   if (raw.error === true) return null;
-  const itemName = typeof raw.item_name === "string" ? raw.item_name.trim() : "";
-  const englishName = typeof raw.engname === "string" ? raw.engname.trim() : "";
+  const itemName = text(raw.item_name);
+  const englishName = text(raw.engname);
   if (!itemName && !englishName) return null;
-  const unitRaw = typeof raw.currency_unit === "string" ? raw.currency_unit.toLowerCase() : "";
+  const unitRaw = text(raw.currency_unit).toLowerCase();
   if (unitRaw !== "c" && unitRaw !== "d" && unitRaw !== "e") return null;
-  const sourceTime = typeof raw.latest_datetime === "string" ? raw.latest_datetime.trim() : "";
+  const sourceTime = text(raw.latest_datetime);
   const sourceMs = parseSourceTime(sourceTime);
   if (sourceMs == null || nowMs - sourceMs > MAX_PRICE_AGE_MS) return null;
 
-  // 标价严格取接口的“最新卖1”；缺失时跳过，避免混入均价或买价。
+  // 国服标价严格取接口的“最新卖1”；缺失时交给 poe.ninja 兜底，不混入均价或买价。
   const value = finitePositive(raw.latest_sell1);
   if (value == null) return null;
   return {
@@ -65,59 +147,279 @@ function quoteFrom(raw: Record<string, unknown>, category: string, nowMs: number
     unit: unitRaw,
     display: formatPrice(value, unitRaw),
     sourceTime,
+    source: "poecurrency",
   };
+}
+
+function normalizedName(value: string): string {
+  return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+function quoteIdentityKeys(quote: PriceQuote): string[] {
+  const keys: string[] = [];
+  if (quote.englishName) keys.push(`en:${normalizedName(quote.englishName)}`);
+  if (quote.itemName) keys.push(`zh:${normalizedName(quote.itemName)}`);
+  return keys;
 }
 
 function canonicalDigest(quotes: PriceQuote[]): string {
   const rows = [...quotes]
     .sort((a, b) => `${a.englishName}\0${a.itemName}`.localeCompare(`${b.englishName}\0${b.itemName}`, "en"))
-    .map((quote) => [quote.englishName, quote.itemName, quote.display, quote.sourceTime]);
+    .map((quote) => [quote.englishName, quote.itemName, quote.display, quote.sourceTime, quote.source]);
   return createHash("sha256").update(JSON.stringify(rows)).digest("hex");
 }
 
-export function parsePriceSummary(payload: unknown, nowMs = Date.now()): PriceSnapshot {
-  if (!Array.isArray(payload)) throw new Error("行情接口返回格式不正确");
-  const quotes: PriceQuote[] = [];
-  for (const group of payload) {
-    if (!group || typeof group !== "object") continue;
-    const record = group as Record<string, unknown>;
-    const category = typeof record.category_label === "string" ? record.category_label.trim() : "";
-    if (!Array.isArray(record.items)) continue;
-    for (const item of record.items) {
-      if (!item || typeof item !== "object") continue;
-      const quote = quoteFrom(item as Record<string, unknown>, category, nowMs);
-      if (quote) quotes.push(quote);
-    }
-  }
-  if (!quotes.length) throw new Error("行情接口没有可用的 POE1 国服价格");
+function snapshotFromQuotes(quotes: PriceQuote[], nowMs: number): PriceSnapshot {
+  const fallbackTime = new Date(nowMs).toISOString();
   const sourceUpdatedAt = quotes.reduce(
-    (latest, quote) => (quote.sourceTime > latest ? quote.sourceTime : latest),
+    (latest, quote) => (sourceTimeMs(quote.sourceTime) > sourceTimeMs(latest) ? quote.sourceTime : latest),
     "",
-  );
+  ) || fallbackTime;
   return {
-    fetchedAt: new Date(nowMs).toISOString(),
+    fetchedAt: fallbackTime,
     sourceUpdatedAt,
     digest: canonicalDigest(quotes),
     quotes,
   };
 }
 
+export function parsePriceSummary(payload: unknown, nowMs = Date.now()): PriceSnapshot {
+  if (!Array.isArray(payload)) throw new Error("行情接口返回格式不正确");
+  const quotes: PriceQuote[] = [];
+  for (const group of payload) {
+    const groupRecord = record(group);
+    if (!groupRecord) continue;
+    const category = text(groupRecord.category_label);
+    if (!Array.isArray(groupRecord.items)) continue;
+    for (const item of groupRecord.items) {
+      const itemRecord = record(item);
+      if (!itemRecord) continue;
+      const quote = quoteFromChina(itemRecord, category, nowMs);
+      if (quote) quotes.push(quote);
+    }
+  }
+  if (!quotes.length) throw new Error("行情接口没有可用的 POE1 国服价格");
+  return snapshotFromQuotes(quotes, nowMs);
+}
+
+export function parseNinjaLeague(payload: unknown): string {
+  if (!Array.isArray(payload)) throw new Error("poe.ninja 联盟接口返回格式不正确");
+  for (const item of payload) {
+    const id = text(record(item)?.id);
+    if (id) return id;
+  }
+  throw new Error("poe.ninja 没有可用的 POE1 当前赛季");
+}
+
+function ninjaQuote(
+  englishName: string,
+  category: string,
+  chaosValue: number,
+  divineValue: number | null,
+  sourceTime: string,
+): PriceQuote {
+  const useDivine = divineValue != null && divineValue >= 1;
+  const value = useDivine ? divineValue : chaosValue;
+  const unit = useDivine ? "d" : "c";
+  return {
+    itemName: "",
+    englishName,
+    category,
+    value,
+    unit,
+    display: formatPrice(value, unit),
+    sourceTime,
+    source: "poe-ninja",
+  };
+}
+
+export function parseNinjaExchangeOverview(payload: unknown, category: string, sourceTime: string): PriceQuote[] {
+  const root = record(payload);
+  if (!root || !Array.isArray(root.lines) || !Array.isArray(root.items)) {
+    throw new Error(`poe.ninja ${category} 行情格式不正确`);
+  }
+  const core = record(root.core);
+  if (root.lines.length && text(core?.primary).toLowerCase() !== "chaos") {
+    throw new Error(`poe.ninja ${category} 行情不是以混沌石计价`);
+  }
+  const rates = record(core?.rates);
+  const divinePerChaos = finitePositive(rates?.divine);
+  const names = new Map<string, string>();
+  for (const item of root.items) {
+    const itemRecord = record(item);
+    const id = text(itemRecord?.id);
+    const name = text(itemRecord?.name);
+    if (id && name) names.set(id, name);
+  }
+
+  const quotes: PriceQuote[] = [];
+  for (const line of root.lines) {
+    const lineRecord = record(line);
+    const name = names.get(text(lineRecord?.id));
+    const chaosValue = finitePositive(lineRecord?.primaryValue);
+    if (!name || chaosValue == null) continue;
+    quotes.push(
+      ninjaQuote(
+        name,
+        `poe.ninja ${category}`,
+        chaosValue,
+        divinePerChaos == null ? null : chaosValue * divinePerChaos,
+        sourceTime,
+      ),
+    );
+  }
+  return quotes;
+}
+
+function betterCandidate(next: NinjaCandidate, current: NinjaCandidate): boolean {
+  if (next.listingCount !== current.listingCount) return next.listingCount > current.listingCount;
+  if (next.observationCount !== current.observationCount) return next.observationCount > current.observationCount;
+  return next.stableId.localeCompare(current.stableId, "en") < 0;
+}
+
+export function parseNinjaItemOverview(payload: unknown, category: string, sourceTime: string): PriceQuote[] {
+  const root = record(payload);
+  if (!root || !Array.isArray(root.lines)) throw new Error(`poe.ninja ${category} 行情格式不正确`);
+  const selected = new Map<string, NinjaCandidate>();
+  for (const line of root.lines) {
+    const lineRecord = record(line);
+    const name = text(lineRecord?.name);
+    const chaosValue = finitePositive(lineRecord?.chaosValue);
+    if (!name || chaosValue == null) continue;
+    const candidate: NinjaCandidate = {
+      quote: ninjaQuote(name, `poe.ninja ${category}`, chaosValue, finitePositive(lineRecord?.divineValue), sourceTime),
+      listingCount: finiteNonNegative(lineRecord?.listingCount),
+      observationCount: finiteNonNegative(lineRecord?.count),
+      stableId: text(lineRecord?.detailsId) || text(lineRecord?.id),
+    };
+    const key = normalizedName(name);
+    const current = selected.get(key);
+    if (!current || betterCandidate(candidate, current)) selected.set(key, candidate);
+  }
+  return [...selected.values()]
+    .map((candidate) => candidate.quote)
+    .sort((a, b) => a.englishName.localeCompare(b.englishName, "en"));
+}
+
+export function mergePriceSnapshots(
+  primary: PriceSnapshot,
+  fallback: PriceSnapshot,
+  nowMs = Date.now(),
+): PriceSnapshot {
+  const primaryKeys = new Set(primary.quotes.flatMap(quoteIdentityKeys));
+  const fallbackKeys = new Set<string>();
+  const fallbackQuotes: PriceQuote[] = [];
+  for (const quote of fallback.quotes) {
+    const keys = quoteIdentityKeys(quote);
+    if (!keys.length || keys.some((key) => primaryKeys.has(key) || fallbackKeys.has(key))) continue;
+    fallbackQuotes.push(quote);
+    for (const key of keys) fallbackKeys.add(key);
+  }
+  return snapshotFromQuotes([...primary.quotes, ...fallbackQuotes], nowMs);
+}
+
+function responseSourceTime(response: FetchResponse, nowMs: number): string {
+  const header = response.headers?.get("date") || response.headers?.get("Date") || "";
+  const parsed = Date.parse(header);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date(nowMs).toISOString();
+}
+
+async function mapLimited<T, U>(items: readonly T[], limit: number, run: (item: T) => Promise<U>): Promise<U[]> {
+  const output = new Array<U>(items.length);
+  let nextIndex = 0;
+  async function worker(): Promise<void> {
+    while (nextIndex < items.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      output[index] = await run(items[index]);
+    }
+  }
+  const workerCount = Math.min(Math.max(1, limit), items.length);
+  await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  return output;
+}
+
 export class PoeCurrencyPriceSource {
   constructor(private readonly request: PriceFetch = defaultFetch) {}
+
+  private async requestJson(url: string, signal: AbortSignal, label: string): Promise<FetchResponse> {
+    const response = await this.request(url, {
+      signal,
+      headers: { Accept: "application/json", "User-Agent": USER_AGENT },
+    });
+    if (!response.ok) throw new Error(`${label}请求失败（HTTP ${response.status}）`);
+    return response;
+  }
+
+  private async fetchChina(signal: AbortSignal, nowMs: number): Promise<PriceSnapshot> {
+    const response = await this.requestJson(POE_CURRENCY_SUMMARY_URL, signal, "国服行情接口");
+    return parsePriceSummary(await response.json(), nowMs);
+  }
+
+  private ninjaJobs(league: string): NinjaJob[] {
+    const query = `league=${encodeURIComponent(league)}`;
+    return [
+      ...POE_NINJA_EXCHANGE_TYPES.map((type) => ({
+        kind: "exchange" as const,
+        type,
+        url: `https://poe.ninja/poe1/api/economy/exchange/current/overview?${query}&type=${encodeURIComponent(type)}`,
+      })),
+      ...POE_NINJA_STASH_ITEM_TYPES.map((type) => ({
+        kind: "item" as const,
+        type,
+        url: `https://poe.ninja/poe1/api/economy/stash/current/item/overview?${query}&type=${encodeURIComponent(type)}`,
+      })),
+    ];
+  }
+
+  private async fetchNinja(signal: AbortSignal, nowMs: number): Promise<PriceSnapshot> {
+    const leagueResponse = await this.requestJson(POE_NINJA_LEAGUES_URL, signal, "poe.ninja 联盟接口");
+    const league = parseNinjaLeague(await leagueResponse.json());
+    const results = await mapLimited(this.ninjaJobs(league), NINJA_REQUEST_CONCURRENCY, async (job): Promise<NinjaJobResult> => {
+      try {
+        const response = await this.requestJson(job.url, signal, `poe.ninja ${job.type} 行情`);
+        const payload = await response.json();
+        const sourceTime = responseSourceTime(response, nowMs);
+        return {
+          quotes:
+            job.kind === "exchange"
+              ? parseNinjaExchangeOverview(payload, job.type, sourceTime)
+              : parseNinjaItemOverview(payload, job.type, sourceTime),
+          error: "",
+        };
+      } catch (error) {
+        return { quotes: [], error: `${job.type}: ${errorText(error)}` };
+      }
+    });
+    const quotes = results.flatMap((result) => result.quotes);
+    const errors = results.map((result) => result.error).filter(Boolean);
+    if (!quotes.length) {
+      const detail = errors.length ? `：${errors.slice(0, 3).join("；")}` : "";
+      throw new Error(`poe.ninja 没有可用的 POE1 当前赛季价格${detail}`);
+    }
+    if (errors.length) console.warn(`[price-patch] poe.ninja 部分类别不可用：${errors.join("；")}`);
+    return snapshotFromQuotes(quotes, nowMs);
+  }
 
   async fetch(nowMs = Date.now()): Promise<PriceSnapshot> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const response = await this.request(POE_CURRENCY_SUMMARY_URL, {
-        signal: controller.signal,
-        headers: { Accept: "application/json", "User-Agent": "POE-Tools/price-patch" },
-      });
-      if (!response.ok) throw new Error(`行情接口请求失败（HTTP ${response.status}）`);
-      return parsePriceSummary(await response.json(), nowMs);
-    } catch (error) {
+      const [china, ninja] = await Promise.allSettled([
+        this.fetchChina(controller.signal, nowMs),
+        this.fetchNinja(controller.signal, nowMs),
+      ]);
       if (controller.signal.aborted) throw new Error("行情接口请求超时");
-      throw error;
+      if (china.status === "fulfilled") {
+        if (ninja.status === "fulfilled") return mergePriceSnapshots(china.value, ninja.value, nowMs);
+        console.warn(`[price-patch] poe.ninja 兜底行情不可用：${errorText(ninja.reason)}`);
+        return china.value;
+      }
+      if (ninja.status === "fulfilled") {
+        console.warn(`[price-patch] 国服行情不可用，临时使用 poe.ninja：${errorText(china.reason)}`);
+        return ninja.value;
+      }
+      throw new Error(`没有可用行情：${errorText(china.reason)}；${errorText(ninja.reason)}`);
     } finally {
       clearTimeout(timer);
     }
