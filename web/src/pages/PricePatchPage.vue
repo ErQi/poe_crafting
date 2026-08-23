@@ -59,9 +59,24 @@ function displayTime(value) {
       <div class="heading">
         <div>
           <div class="h">国服客户端标价补丁</div>
-          <p class="tiny">国服行情优先，缺价时使用 poe.ninja 全部 POE1 类别；等级或词缀变体显示挂单量最高的代表价。</p>
+          <p class="tiny">在游戏物品名称后显示行情价格，价格仅供参考。</p>
         </div>
         <span class="badge" :class="{ on: applied }">{{ applied ? "已应用" : "未应用" }}</span>
+      </div>
+
+      <div class="price-help">
+        <div>
+          <span>数据来源</span>
+          <p>优先使用易刷国服行情；缺价时依次使用国服备用源、poe.ninja 国际服行情。</p>
+        </div>
+        <div>
+          <span>符号说明</span>
+          <p><b>·</b> 表示国服价格（易刷或国服备用源）；<b>⁙</b> 表示非国服价格（poe.ninja 兜底）。</p>
+        </div>
+        <div>
+          <span>显示规则</span>
+          <p>超过 1 枚神圣石的 c 价会按同一来源汇率换算为 d；同名变体显示样本量最高的代表价。</p>
+        </div>
       </div>
 
       <div class="status-block">
@@ -173,6 +188,24 @@ function displayTime(value) {
   gap: 16px;
 }
 .heading p { margin: 5px 0 0; }
+.price-help {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  color: var(--muted);
+  background: var(--row);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.price-help > div {
+  display: grid;
+  grid-template-columns: 72px 1fr;
+  gap: 10px;
+  align-items: baseline;
+}
+.price-help span { color: var(--text); font-weight: 600; }
+.price-help p { margin: 0; line-height: 1.55; }
+.price-help b { color: var(--accent); font-size: 16px; }
 .badge {
   flex: 0 0 auto;
   padding: 4px 10px;

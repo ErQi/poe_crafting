@@ -1,5 +1,5 @@
-import type { PriceQuote } from "./types";
-import { stripPriceSuffix } from "./dat64";
+import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
+import { localizedNameKeys, stripPriceSuffix } from "./dat64";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
 const MAX_RECORD_SIZE = 2048;
@@ -80,6 +80,19 @@ function rowName(buffer: Buffer, layout: DatLayout, row: number, namePointerOffs
 
 function key(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+function keepPreferredQuote(map: Map<string, PriceQuote>, identity: string, quote: PriceQuote): void {
+  const current = map.get(identity);
+  if (!current || priceQuoteSourcePriority(quote.source) < priceQuoteSourcePriority(current.source)) {
+    map.set(identity, quote);
+  }
+}
+
+function preferredQuote(first: PriceQuote | undefined, second: PriceQuote | undefined): PriceQuote | undefined {
+  if (!first) return second;
+  if (!second) return first;
+  return priceQuoteSourcePriority(second.source) < priceQuoteSourcePriority(first.source) ? second : first;
 }
 
 function appendNames(
@@ -207,9 +220,11 @@ export function patchLocalizedNamedDat(
   const localized = findLayout(localizedInput, options.namePointerOffset + 8);
   if (english.rowCount !== localized.rowCount) throw new Error("中英文 DAT 记录数不一致");
   const quoteByEnglish = new Map<string, PriceQuote>();
+  const quoteByChinese = new Map<string, PriceQuote>();
   for (const quote of quotes) {
-    if (quote.englishName && !quoteByEnglish.has(key(quote.englishName))) {
-      quoteByEnglish.set(key(quote.englishName), quote);
+    if (quote.englishName) keepPreferredQuote(quoteByEnglish, key(quote.englishName), quote);
+    if (quote.itemName) {
+      for (const identity of localizedNameKeys(quote.itemName)) keepPreferredQuote(quoteByChinese, identity, quote);
     }
   }
 
@@ -218,10 +233,14 @@ export function patchLocalizedNamedDat(
   for (const index of selectedRows(english, options.rowIndexes)) {
     const englishName = rowName(englishInput, english, index, options.namePointerOffset);
     if (!englishName) continue;
-    const quote = quoteByEnglish.get(key(englishName));
-    if (!quote) continue;
     const localizedName = rowName(localizedInput, localized, index, options.namePointerOffset) || englishName;
-    updates.set(index, `${stripPriceSuffix(localizedName)} · ${quote.display}`);
+    const englishQuote = quoteByEnglish.get(key(englishName));
+    const chineseQuote = localizedNameKeys(localizedName)
+      .map((identity) => quoteByChinese.get(identity))
+      .find(Boolean);
+    const quote = preferredQuote(englishQuote, chineseQuote);
+    if (!quote) continue;
+    updates.set(index, `${stripPriceSuffix(localizedName)}${priceQuoteSeparator(quote.source)}${quote.display}`);
     matchedRows.push(index);
   }
   return {

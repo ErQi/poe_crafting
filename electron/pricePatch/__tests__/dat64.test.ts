@@ -92,14 +92,25 @@ describe("BaseItemTypes 基线重建", () => {
     expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("琪莎拉纪念币 · 5c");
   });
 
-  it("中英文命中来自不同数据源时仍严格优先国服价格", () => {
+  it("中英文命中来自不同数据源时严格按易刷、国服旧源、poe.ninja 排序", () => {
+    const english = dat([{ id: "Metadata/Divine", name: "Divine Orb" }]);
+    const localized = dat([{ id: "Metadata/Divine", name: "神圣石[※ ※]" }]);
+    const patched = patchLocalizedBaseItems(english, localized, [
+      quote("Divine Orb", "", "1d", "poe-ninja"),
+      quote("", "神圣石", "125c", "poecurrency"),
+      quote("", "神圣石", "120c", "efarm"),
+    ]);
+    expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("神圣石[※ ※] · 120c");
+  });
+
+  it("poe.ninja 兜底价使用 ⁙ 标识非国服来源", () => {
     const english = dat([{ id: "Metadata/Divine", name: "Divine Orb" }]);
     const localized = dat([{ id: "Metadata/Divine", name: "神圣石" }]);
     const patched = patchLocalizedBaseItems(english, localized, [
       quote("Divine Orb", "", "1d", "poe-ninja"),
-      quote("", "神圣石", "125c", "poecurrency"),
     ]);
-    expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("神圣石 · 125c");
+
+    expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("神圣石 ⁙ 1d");
   });
 
   it("建立新版本基线时可清理本功能留下的价格后缀", () => {
@@ -107,14 +118,16 @@ describe("BaseItemTypes 基线重建", () => {
       { id: "a", name: "神圣石【1d】" },
       { id: "b", name: "崇高石⌈6.6c⌋" },
       { id: "c", name: "混沌石 · 1c" },
-      { id: "d", name: "普通物品" },
+      { id: "d", name: "机会石 ⁙ 2c" },
+      { id: "e", name: "普通物品" },
     ]);
     const cleaned = cleanLocalizedBaseItems(localized);
-    expect(cleaned.changedCount).toBe(3);
+    expect(cleaned.changedCount).toBe(4);
     expect(parseBaseItemTypes(cleaned.buffer).rows.map((row) => row.name)).toEqual([
       "神圣石",
       "崇高石",
       "混沌石",
+      "机会石",
       "普通物品",
     ]);
   });

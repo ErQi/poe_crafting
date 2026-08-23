@@ -1,5 +1,5 @@
-import type { PriceQuote } from "./types";
-import { stripPriceSuffix } from "./dat64";
+import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
+import { localizedNameKeys, stripPriceSuffix } from "./dat64";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
 const WORDLIST_OFFSET = 0;
@@ -99,6 +99,19 @@ function uniqueWordRows(wordsInput: Buffer, wordsLayout: DatLayout, uniqueLayout
 
 function key(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+function keepPreferredQuote(map: Map<string, PriceQuote>, identity: string, quote: PriceQuote): void {
+  const current = map.get(identity);
+  if (!current || priceQuoteSourcePriority(quote.source) < priceQuoteSourcePriority(current.source)) {
+    map.set(identity, quote);
+  }
+}
+
+function preferredQuote(first: PriceQuote | undefined, second: PriceQuote | undefined): PriceQuote | undefined {
+  if (!first) return second;
+  if (!second) return first;
+  return priceQuoteSourcePriority(second.source) < priceQuoteSourcePriority(first.source) ? second : first;
 }
 
 function appendLocalizedNames(buffer: Buffer, layout: DatLayout, updates: Map<number, string>): Buffer {
@@ -235,17 +248,19 @@ export function patchLocalizedUniqueWords(
 ): PatchedUniqueWords {
   const localizedLayout = findLayout(localizedInput, MIN_WORD_RECORD_SIZE);
   const quoteByEnglish = new Map<string, PriceQuote>();
+  const quoteByChinese = new Map<string, PriceQuote>();
   const foulbornFallback = new Map<string, PriceQuote>();
   for (const quote of quotes) {
-    if (!quote.englishName) continue;
-    const identity = key(quote.englishName);
-    const current = quoteByEnglish.get(identity);
-    // mergePriceSnapshots 已做来源优先级；这里保留先出现的确定结果。
-    if (!current) quoteByEnglish.set(identity, quote);
-    const strippedFoulborn = quote.englishName.replace(/^Foulborn\s+/iu, "");
-    if (strippedFoulborn !== quote.englishName) {
-      const fallbackIdentity = key(strippedFoulborn);
-      if (!foulbornFallback.has(fallbackIdentity)) foulbornFallback.set(fallbackIdentity, quote);
+    if (quote.englishName) {
+      const identity = key(quote.englishName);
+      keepPreferredQuote(quoteByEnglish, identity, quote);
+      const strippedFoulborn = quote.englishName.replace(/^Foulborn\s+/iu, "");
+      if (strippedFoulborn !== quote.englishName) {
+        keepPreferredQuote(foulbornFallback, key(strippedFoulborn), quote);
+      }
+    }
+    if (quote.itemName) {
+      for (const identity of localizedNameKeys(quote.itemName)) keepPreferredQuote(quoteByChinese, identity, quote);
     }
   }
 
@@ -253,11 +268,15 @@ export function patchLocalizedUniqueWords(
   const matchedRows: number[] = [];
   for (const row of parseUniqueWordEntries(englishInput, localizedInput, uniqueLayoutInput)) {
     const aliases = row.englishAliases.map(key);
-    const quote = aliases.map((alias) => quoteByEnglish.get(alias)).find(Boolean)
+    const englishQuote = aliases.map((alias) => quoteByEnglish.get(alias)).find(Boolean)
       || aliases.map((alias) => foulbornFallback.get(alias)).find(Boolean);
+    const chineseQuote = localizedNameKeys(row.localizedName)
+      .map((identity) => quoteByChinese.get(identity))
+      .find(Boolean);
+    const quote = preferredQuote(englishQuote, chineseQuote);
     if (!quote) continue;
     const baselineName = stripPriceSuffix(row.localizedName);
-    updates.set(row.index, `${baselineName} · ${quote.display}`);
+    updates.set(row.index, `${baselineName}${priceQuoteSeparator(quote.source)}${quote.display}`);
     matchedRows.push(row.index);
   }
   return {

@@ -1,6 +1,12 @@
 import { createHash } from "crypto";
+import { gunzipSync } from "zlib";
 import type { PriceQuote, PriceSnapshot } from "./types";
 
+export const EFARM_PRICE_URLS = [
+  ...Array.from({ length: 9 }, (_, index) => `https://cf.981001.xyz/${index + 1}/fkhprice2.txt`),
+  "https://www.710421059.xyz/file/fkhprice2.txt",
+  "https://efarm-zero.981001.xyz/file/fkhprice2.txt",
+] as readonly string[];
 export const POE_CURRENCY_SUMMARY_URL = "https://poecurrency.top/api/summary?version=1";
 export const POE_NINJA_LEAGUES_URL = "https://poe.ninja/poe1/api/economy/leagues";
 export const POE_NINJA_EXCHANGE_TYPES = [
@@ -70,7 +76,9 @@ export const POE_NINJA_ITEM_TYPES = [
 const MAX_PRICE_AGE_MS = 24 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const NINJA_REQUEST_CONCURRENCY = 6;
-const USER_AGENT = "POE-Tools/0.4.3 price-patch";
+const MAX_EFARM_ENCODED_BYTES = 4 * 1024 * 1024;
+const MAX_EFARM_DECODED_BYTES = 64 * 1024 * 1024;
+const USER_AGENT = "POE-Tools/0.4.6 price-patch";
 
 interface FetchHeaders {
   get(name: string): string | null;
@@ -81,6 +89,7 @@ interface FetchResponse {
   status: number;
   headers?: FetchHeaders;
   json(): Promise<unknown>;
+  text?(): Promise<string>;
 }
 
 interface NinjaCandidate {
@@ -99,6 +108,12 @@ interface NinjaJob {
 interface NinjaJobResult {
   quotes: PriceQuote[];
   error: string;
+}
+
+interface EfarmCandidate {
+  quote: PriceQuote;
+  listingCount: number;
+  stableId: string;
 }
 
 export type PriceFetch = (
@@ -151,10 +166,86 @@ function sourceTimeMs(value: string): number {
   return Number.isFinite(parsed) ? parsed : 0;
 }
 
+function parseHttpTime(value: string): number | null {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 export function formatPrice(value: number, unit: "c" | "d" | "e"): string {
-  const rounded = value < 10 ? Math.round(value * 10) / 10 : Math.round(value);
+  const rounded = unit === "d" || value < 10 ? Math.round(value * 10) / 10 : Math.round(value);
   const safe = Math.max(0.1, rounded);
   return `${Number.isInteger(safe) ? safe.toFixed(0) : safe.toFixed(1)}${unit}`;
+}
+
+function efarmTargetName(raw: Record<string, unknown>): string {
+  const name = text(raw.name);
+  const baseType = text(raw.baseType);
+  const frameType = Number(raw.frameType);
+  // 唯一物品必须按唯一名标到 Words；星团珠宝的动态附魔名不会出现在静态资源中。
+  if (frameType === 3) return name || baseType;
+  if (baseType.includes("星团珠宝")) return baseType || name;
+  return name || baseType;
+}
+
+function betterEfarmCandidate(next: EfarmCandidate, current: EfarmCandidate): boolean {
+  if (next.listingCount !== current.listingCount) return next.listingCount > current.listingCount;
+  return next.stableId.localeCompare(current.stableId, "en") < 0;
+}
+
+/** 解析易刷客户端公开使用的当季国服压缩价表；calculated 的单位固定为混沌石。 */
+export function parseEfarmPriceFile(
+  encodedPayload: string,
+  sourceTime: string,
+  nowMs = Date.now(),
+): PriceSnapshot {
+  const sourceMs = parseHttpTime(sourceTime);
+  if (sourceMs == null || nowMs - sourceMs > MAX_PRICE_AGE_MS) throw new Error("易刷国服价表已过期");
+  const encoded = encodedPayload.trim();
+  if (!encoded || Buffer.byteLength(encoded, "utf8") > MAX_EFARM_ENCODED_BYTES) {
+    throw new Error("易刷国服价表大小异常");
+  }
+
+  let payload: unknown;
+  try {
+    const compressed = Buffer.from(encoded, "base64");
+    if (!compressed.length) throw new Error("empty gzip payload");
+    const decoded = gunzipSync(compressed, { maxOutputLength: MAX_EFARM_DECODED_BYTES });
+    payload = JSON.parse(decoded.toString("utf8"));
+  } catch (error) {
+    throw new Error(`易刷国服价表解压失败：${errorText(error)}`);
+  }
+  if (!Array.isArray(payload)) throw new Error("易刷国服价表格式不正确");
+
+  const selected = new Map<string, EfarmCandidate>();
+  for (const item of payload) {
+    const raw = record(item);
+    if (!raw) continue;
+    const itemName = efarmTargetName(raw);
+    const value = finitePositive(raw.calculated);
+    if (!itemName || value == null) continue;
+    const candidate: EfarmCandidate = {
+      quote: {
+        itemName,
+        englishName: "",
+        category: "易刷国服",
+        value,
+        unit: "c",
+        display: formatPrice(value, "c"),
+        sourceTime,
+        source: "efarm",
+      },
+      listingCount: finiteNonNegative(raw.count),
+      stableId: `${text(raw.id)}\0${text(raw.searchCode)}\0${text(raw.variant)}`,
+    };
+    const identity = normalizedName(itemName);
+    const current = selected.get(identity);
+    if (!current || betterEfarmCandidate(candidate, current)) selected.set(identity, candidate);
+  }
+  const quotes = [...selected.values()]
+    .map((candidate) => candidate.quote)
+    .sort((a, b) => a.itemName.localeCompare(b.itemName, "zh-CN"));
+  if (!quotes.length) throw new Error("易刷国服价表没有可用价格");
+  return snapshotFromQuotes(convertHighChaosPricesToDivine(quotes), nowMs);
 }
 
 function quoteFromChina(raw: Record<string, unknown>, category: string, nowMs: number): PriceQuote | null {
@@ -168,8 +259,8 @@ function quoteFromChina(raw: Record<string, unknown>, category: string, nowMs: n
   const sourceMs = parseSourceTime(sourceTime);
   if (sourceMs == null || nowMs - sourceMs > MAX_PRICE_AGE_MS) return null;
 
-  // 国服标价严格取接口的“最新卖1”；缺失时交给 poe.ninja 兜底，不混入均价或买价。
-  const value = finitePositive(raw.latest_sell1);
+  // 国服标价直接取接口的“最新买1”；缺失时才交给 poe.ninja 兜底，不混入均价或卖价算法。
+  const value = finitePositive(raw.latest_buy1);
   if (value == null) return null;
   return {
     itemName,
@@ -185,6 +276,21 @@ function quoteFromChina(raw: Record<string, unknown>, category: string, nowMs: n
 
 function normalizedName(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
+}
+
+function isDivineOrb(quote: PriceQuote): boolean {
+  return normalizedName(quote.englishName) === "divine orb" || normalizedName(quote.itemName) === "神圣石";
+}
+
+/** 同一行情源内，高于一枚神圣石的混沌石价格自动换算成 d。 */
+export function convertHighChaosPricesToDivine(quotes: PriceQuote[]): PriceQuote[] {
+  const divineChaos = quotes.find((quote) => quote.unit === "c" && isDivineOrb(quote))?.value;
+  if (!divineChaos || !Number.isFinite(divineChaos) || divineChaos <= 0) return quotes;
+  return quotes.map((quote) => {
+    if (quote.unit !== "c" || quote.value <= divineChaos) return quote;
+    const value = quote.value / divineChaos;
+    return { ...quote, value, unit: "d", display: formatPrice(value, "d") };
+  });
 }
 
 function quoteIdentityKeys(quote: PriceQuote): string[] {
@@ -231,7 +337,7 @@ export function parsePriceSummary(payload: unknown, nowMs = Date.now()): PriceSn
     }
   }
   if (!quotes.length) throw new Error("行情接口没有可用的 POE1 国服价格");
-  return snapshotFromQuotes(quotes, nowMs);
+  return snapshotFromQuotes(convertHighChaosPricesToDivine(quotes), nowMs);
 }
 
 export function parseNinjaLeague(payload: unknown): string {
@@ -247,19 +353,17 @@ function ninjaQuote(
   englishName: string,
   category: string,
   chaosValue: number,
-  divineValue: number | null,
   sourceTime: string,
 ): PriceQuote {
-  const useDivine = divineValue != null && divineValue >= 1;
-  const value = useDivine ? divineValue : chaosValue;
-  const unit = useDivine ? "d" : "c";
   return {
     itemName: "",
     englishName,
     category,
-    value,
-    unit,
-    display: formatPrice(value, unit),
+    value: chaosValue,
+    unit: "c",
+    // poe.ninja 的 divineValue 使用国际服神圣石汇率，不能直接作为国服的 d 单位。
+    // 保留接口的混沌石基准价，避免同一个数字在国服表示成数倍价值。
+    display: formatPrice(chaosValue, "c"),
     sourceTime,
     source: "poe-ninja",
   };
@@ -274,8 +378,6 @@ export function parseNinjaExchangeOverview(payload: unknown, category: string, s
   if (root.lines.length && text(core?.primary).toLowerCase() !== "chaos") {
     throw new Error(`poe.ninja ${category} 行情不是以混沌石计价`);
   }
-  const rates = record(core?.rates);
-  const divinePerChaos = finitePositive(rates?.divine);
   const names = new Map<string, string>();
   for (const item of root.items) {
     const itemRecord = record(item);
@@ -295,7 +397,6 @@ export function parseNinjaExchangeOverview(payload: unknown, category: string, s
         name,
         `poe.ninja ${category}`,
         chaosValue,
-        divinePerChaos == null ? null : chaosValue * divinePerChaos,
         sourceTime,
       ),
     );
@@ -349,7 +450,7 @@ export function parseNinjaItemOverview(payload: unknown, category: string, sourc
     const chaosValue = finitePositive(lineRecord?.chaosValue);
     if (!name || chaosValue == null) continue;
     const candidate: NinjaCandidate = {
-      quote: ninjaQuote(name, `poe.ninja ${category}`, chaosValue, finitePositive(lineRecord?.divineValue), sourceTime),
+      quote: ninjaQuote(name, `poe.ninja ${category}`, chaosValue, sourceTime),
       listingCount: finiteNonNegative(lineRecord?.listingCount),
       observationCount: finiteNonNegative(lineRecord?.count),
       stableId: text(lineRecord?.detailsId) || text(lineRecord?.id),
@@ -368,22 +469,43 @@ export function mergePriceSnapshots(
   fallback: PriceSnapshot,
   nowMs = Date.now(),
 ): PriceSnapshot {
-  const primaryKeys = new Set(primary.quotes.flatMap(quoteIdentityKeys));
+  const primaryQuotes = primary.quotes.map((quote) => ({ ...quote }));
+  const primaryByKey = new Map<string, number>();
+  primaryQuotes.forEach((quote, index) => {
+    for (const key of quoteIdentityKeys(quote)) if (!primaryByKey.has(key)) primaryByKey.set(key, index);
+  });
   const fallbackKeys = new Set<string>();
   const fallbackQuotes: PriceQuote[] = [];
   for (const quote of fallback.quotes) {
     const keys = quoteIdentityKeys(quote);
-    if (!keys.length || keys.some((key) => primaryKeys.has(key) || fallbackKeys.has(key))) continue;
+    const primaryIndex = keys.map((key) => primaryByKey.get(key)).find((index) => index !== undefined);
+    if (primaryIndex !== undefined) {
+      // 只补齐名称，不改变主数据源的价格；这样中文易刷价仍可借国服旧源获得英文别名。
+      const primaryQuote = primaryQuotes[primaryIndex];
+      if (!primaryQuote.englishName && quote.englishName) primaryQuote.englishName = quote.englishName;
+      if (!primaryQuote.itemName && quote.itemName) primaryQuote.itemName = quote.itemName;
+      for (const key of quoteIdentityKeys(primaryQuote)) if (!primaryByKey.has(key)) primaryByKey.set(key, primaryIndex);
+      continue;
+    }
+    if (!keys.length || keys.some((key) => fallbackKeys.has(key))) continue;
     fallbackQuotes.push(quote);
     for (const key of keys) fallbackKeys.add(key);
   }
-  return snapshotFromQuotes([...primary.quotes, ...fallbackQuotes], nowMs);
+  return snapshotFromQuotes([...primaryQuotes, ...fallbackQuotes], nowMs);
 }
 
 function responseSourceTime(response: FetchResponse, nowMs: number): string {
   const header = response.headers?.get("date") || response.headers?.get("Date") || "";
   const parsed = Date.parse(header);
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : new Date(nowMs).toISOString();
+}
+
+function responseFileSourceTime(response: FetchResponse, nowMs: number): string {
+  const header = response.headers?.get("last-modified") || response.headers?.get("Last-Modified") || "";
+  const parsed = parseHttpTime(header);
+  if (parsed == null) throw new Error("易刷国服价表缺少更新时间");
+  if (nowMs - parsed > MAX_PRICE_AGE_MS) throw new Error("易刷国服价表已超过 24 小时未更新");
+  return new Date(parsed).toISOString();
 }
 
 async function mapLimited<T, U>(items: readonly T[], limit: number, run: (item: T) => Promise<U>): Promise<U[]> {
@@ -416,6 +538,26 @@ export class PoeCurrencyPriceSource {
   private async fetchChina(signal: AbortSignal, nowMs: number): Promise<PriceSnapshot> {
     const response = await this.requestJson(POE_CURRENCY_SUMMARY_URL, signal, "国服行情接口");
     return parsePriceSummary(await response.json(), nowMs);
+  }
+
+  private async fetchEfarm(signal: AbortSignal, nowMs: number): Promise<PriceSnapshot> {
+    const errors: string[] = [];
+    for (const url of EFARM_PRICE_URLS) {
+      if (signal.aborted) throw new Error("易刷国服价表请求已取消");
+      try {
+        const response = await this.request(url, {
+          signal,
+          headers: { Accept: "text/plain", "User-Agent": USER_AGENT },
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        if (!response.text) throw new Error("响应不支持文本读取");
+        const sourceTime = responseFileSourceTime(response, nowMs);
+        return parseEfarmPriceFile(await response.text(), sourceTime, nowMs);
+      } catch (error) {
+        errors.push(`${url}: ${errorText(error)}`);
+      }
+    }
+    throw new Error(`易刷国服价表不可用：${errors.join("；")}`);
   }
 
   private ninjaJobs(league: string): NinjaJob[] {
@@ -465,28 +607,38 @@ export class PoeCurrencyPriceSource {
       throw new Error(`poe.ninja 没有可用的 POE1 当前赛季价格${detail}`);
     }
     if (errors.length) console.warn(`[price-patch] poe.ninja 部分类别不可用：${errors.join("；")}`);
-    return snapshotFromQuotes(quotes, nowMs);
+    return snapshotFromQuotes(convertHighChaosPricesToDivine(quotes), nowMs);
   }
 
   async fetch(nowMs = Date.now()): Promise<PriceSnapshot> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
     try {
-      const [china, ninja] = await Promise.allSettled([
+      const [efarm, china, ninja] = await Promise.allSettled([
+        this.fetchEfarm(controller.signal, nowMs),
         this.fetchChina(controller.signal, nowMs),
         this.fetchNinja(controller.signal, nowMs),
       ]);
-      if (controller.signal.aborted) throw new Error("行情接口请求超时");
-      if (china.status === "fulfilled") {
-        if (ninja.status === "fulfilled") return mergePriceSnapshots(china.value, ninja.value, nowMs);
-        console.warn(`[price-patch] poe.ninja 兜底行情不可用：${errorText(ninja.reason)}`);
-        return china.value;
+      const timedOut = controller.signal.aborted;
+      const available: PriceSnapshot[] = [];
+      if (efarm.status === "fulfilled") available.push(efarm.value);
+      else console.warn(`[price-patch] 易刷国服价表不可用：${errorText(efarm.reason)}`);
+      if (china.status === "fulfilled") available.push(china.value);
+      else console.warn(`[price-patch] 国服旧行情不可用：${errorText(china.reason)}`);
+      if (ninja.status === "fulfilled") available.push(ninja.value);
+      else console.warn(`[price-patch] poe.ninja 兜底行情不可用：${errorText(ninja.reason)}`);
+      if (!available.length) {
+        if (timedOut) throw new Error("行情接口请求超时");
+        throw new Error(
+          `没有可用行情：${errorText(efarm.status === "rejected" ? efarm.reason : "")}；`
+          + `${errorText(china.status === "rejected" ? china.reason : "")}；`
+          + `${errorText(ninja.status === "rejected" ? ninja.reason : "")}`,
+        );
       }
-      if (ninja.status === "fulfilled") {
-        console.warn(`[price-patch] 国服行情不可用，临时使用 poe.ninja：${errorText(china.reason)}`);
-        return ninja.value;
-      }
-      throw new Error(`没有可用行情：${errorText(china.reason)}；${errorText(ninja.reason)}`);
+      return available.slice(1).reduce(
+        (merged, fallback) => mergePriceSnapshots(merged, fallback, nowMs),
+        available[0],
+      );
     } finally {
       clearTimeout(timer);
     }

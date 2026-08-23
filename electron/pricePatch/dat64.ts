@@ -1,4 +1,4 @@
-import type { PriceQuote } from "./types";
+import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
 const NAME_POINTER_OFFSET = 32;
@@ -6,7 +6,7 @@ const MIN_RECORD_SIZE = NAME_POINTER_OFFSET + 8;
 const MAX_RECORD_SIZE = 2048;
 const MAX_ROWS = 1_000_000;
 const PRICE_SUFFIX =
-  /(?:【\s*\d+(?:\.\d+)?\s*[cde]\s*】|⌈\s*\d+(?:\.\d+)?\s*[cde]\s*⌋|\s+·\s*\d+(?:\.\d+)?\s*[cde])\s*$/iu;
+  /(?:【\s*\d+(?:\.\d+)?\s*[cde]\s*】|⌈\s*\d+(?:\.\d+)?\s*[cde]\s*⌋|\s+[·⁙]\s*\d+(?:\.\d+)?\s*[cde])\s*$/iu;
 
 export interface BaseItemRow {
   index: number;
@@ -143,8 +143,15 @@ function key(value: string): string {
   return value.normalize("NFKC").trim().toLocaleLowerCase("en-US");
 }
 
-function chineseKey(value: string): string {
-  return key(stripPriceSuffix(value)).replace(/^[^\p{L}\p{N}]+/u, "");
+/** 用于匹配中文行情名；只忽略装饰前缀及纯符号方括号后缀，不改写客户端实际显示名。 */
+export function localizedNameKeys(value: string): string[] {
+  const clean = stripPriceSuffix(value).trim();
+  const withoutPrefix = clean.replace(/^[^\p{L}\p{N}]+/u, "");
+  const withoutDecoration = withoutPrefix.replace(
+    /\s*[\[［【(（][^\p{L}\p{N}\]］】)）]{1,24}[\]］】)）]\s*$/u,
+    "",
+  ).trimEnd();
+  return [...new Set([withoutPrefix, withoutDecoration].map(key).filter(Boolean))];
 }
 
 function appendNames(parsed: ParsedBaseItemTypes, updates: Map<number, string>): Buffer {
@@ -168,22 +175,17 @@ function appendNames(parsed: ParsedBaseItemTypes, updates: Map<number, string>):
   return Buffer.concat(chunks);
 }
 
-function sourcePriority(quote: PriceQuote): number {
-  // 未标来源的旧调用按原有国服行情处理，避免升级后改变既有匹配语义。
-  return quote.source === "poe-ninja" ? 1 : 0;
-}
-
 function keepPreferredQuote(map: Map<string, PriceQuote>, name: string, quote: PriceQuote): void {
   const existing = map.get(name);
   // 同一来源延续原有的“后条目生效”；只有低优先级来源不能覆盖国服。
-  if (!existing || sourcePriority(quote) <= sourcePriority(existing)) map.set(name, quote);
+  if (!existing || priceQuoteSourcePriority(quote.source) <= priceQuoteSourcePriority(existing.source)) map.set(name, quote);
 }
 
 function preferredQuote(english: PriceQuote | undefined, chinese: PriceQuote | undefined): PriceQuote | undefined {
   if (!english) return chinese;
   if (!chinese) return english;
-  const englishPriority = sourcePriority(english);
-  const chinesePriority = sourcePriority(chinese);
+  const englishPriority = priceQuoteSourcePriority(english.source);
+  const chinesePriority = priceQuoteSourcePriority(chinese.source);
   // 同一来源仍优先英文名 + 内部 Id；跨来源时国服行情永远优先。
   return chinesePriority < englishPriority ? chinese : english;
 }
@@ -215,20 +217,25 @@ export function patchLocalizedBaseItems(
   const quoteByChinese = new Map<string, PriceQuote>();
   for (const quote of quotes) {
     if (quote.englishName) keepPreferredQuote(quoteByEnglish, key(quote.englishName), quote);
-    if (quote.itemName) keepPreferredQuote(quoteByChinese, chineseKey(quote.itemName), quote);
+    if (quote.itemName) {
+      for (const identity of localizedNameKeys(quote.itemName)) keepPreferredQuote(quoteByChinese, identity, quote);
+    }
   }
 
   const updates = new Map<number, string>();
   const matchedIds: string[] = [];
   for (const [id, localizedRow] of localizedById) {
     const englishRow = englishById.get(id);
+    const chineseQuote = localizedNameKeys(localizedRow.name)
+      .map((identity) => quoteByChinese.get(identity))
+      .find(Boolean);
     const quote = preferredQuote(
       englishRow ? quoteByEnglish.get(key(englishRow.name)) : undefined,
-      quoteByChinese.get(chineseKey(localizedRow.name)),
+      chineseQuote,
     );
     if (!quote) continue;
     const baselineName = stripPriceSuffix(localizedRow.name);
-    updates.set(localizedRow.index, `${baselineName} · ${quote.display}`);
+    updates.set(localizedRow.index, `${baselineName}${priceQuoteSeparator(quote.source)}${quote.display}`);
     matchedIds.push(id);
   }
   return { buffer: appendNames(localized, updates), matchedCount: matchedIds.length, matchedIds };

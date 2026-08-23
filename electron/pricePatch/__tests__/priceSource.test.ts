@@ -1,7 +1,11 @@
 import { describe, expect, it, vi } from "vitest";
+import { gzipSync } from "zlib";
 import {
+  convertHighChaosPricesToDivine,
+  EFARM_PRICE_URLS,
   formatPrice,
   mergePriceSnapshots,
+  parseEfarmPriceFile,
   parseNinjaExchangeOverview,
   parseNinjaItemOverview,
   parseNinjaLeague,
@@ -18,6 +22,7 @@ import {
 import type { PriceSnapshot } from "../types";
 
 const NOW = Date.parse("2026-08-20T12:30:00Z"); // 北京时间 20:30
+const SOURCE_TIME = "2026-08-20T12:20:00.000Z";
 
 function item(patch: Record<string, unknown> = {}) {
   return {
@@ -25,6 +30,7 @@ function item(patch: Record<string, unknown> = {}) {
     engname: "Divine Orb",
     sell_avg: 123.4,
     latest_sell1: 125,
+    latest_buy1: 125,
     latest_datetime: "2026-08-20 20:00:00",
     error: false,
     currency_unit: "c",
@@ -43,15 +49,15 @@ describe("poecurrency.top 行情解析", () => {
     expect(snapshot.quotes[0]).toMatchObject({ itemName: "神圣石", display: "125c", source: "poecurrency" });
   });
 
-  it("异常数据被跳过，且只接受最新卖1", () => {
+  it("异常数据被跳过，且只接受最新买1", () => {
     const snapshot = parsePriceSummary(
       [
         {
           category_label: "通货",
           items: [
             item({ item_name: "异常", error: true }),
-            item({ item_name: "仅有均价", latest_sell1: 0 }),
-            item({ item_name: "崇高石", engname: "Exalted Orb", sell_avg: 999, latest_sell1: 6.66 }),
+            item({ item_name: "仅有均价", latest_buy1: 0 }),
+            item({ item_name: "崇高石", engname: "Exalted Orb", sell_avg: 999, latest_sell1: 500, latest_buy1: 6.66 }),
           ],
         },
       ],
@@ -61,18 +67,45 @@ describe("poecurrency.top 行情解析", () => {
     expect(snapshot.quotes[0].display).toBe("6.7c");
   });
 
+  it("买卖价差很大时仍直接使用最新买1，不做价差算法", () => {
+    const snapshot = parsePriceSummary(
+      [
+        {
+          category_label: "圣甲虫",
+          items: [
+            item({
+              item_name: "幽灵之支配圣甲虫",
+              engname: "Domination Scarab of Apparitions",
+              latest_sell1: 500,
+              latest_buy1: 1.5,
+            }),
+          ],
+        },
+      ],
+      NOW,
+    );
+
+    expect(snapshot.quotes).toHaveLength(1);
+    expect(snapshot.quotes[0]).toMatchObject({
+      englishName: "Domination Scarab of Apparitions",
+      display: "1.5c",
+      source: "poecurrency",
+    });
+  });
+
   it("价格显示保持短小", () => {
     expect(formatPrice(0.91, "d")).toBe("0.9d");
     expect(formatPrice(1, "d")).toBe("1d");
+    expect(formatPrice(10.44, "d")).toBe("10.4d");
     expect(formatPrice(18.7, "c")).toBe("19c");
   });
 
-  it("可解析琪莎拉纪念币的最新卖1", () => {
+  it("可解析琪莎拉纪念币的最新买1", () => {
     const snapshot = parsePriceSummary(
       [
         {
           category_label: "赛季通货",
-          items: [item({ item_name: "琪莎拉纪念币", engname: "Kishara's Ducat", latest_sell1: 5 })],
+          items: [item({ item_name: "琪莎拉纪念币", engname: "Kishara's Ducat", latest_buy1: 5 })],
         },
       ],
       NOW,
@@ -83,11 +116,92 @@ describe("poecurrency.top 行情解析", () => {
       display: "5c",
     });
   });
+
+  it("有神圣石汇率时，把超过 1d 的国服买价换算成 d", () => {
+    const snapshot = parsePriceSummary(
+      [{
+        category_label: "唯一珠宝",
+        items: [
+          item({ item_name: "禁断之火", engname: "Forbidden Flame", latest_buy1: 3830 }),
+          item({ item_name: "神圣石", engname: "Divine Orb", latest_buy1: 388 }),
+        ],
+      }],
+      NOW,
+    );
+
+    expect(snapshot.quotes.find((quote) => quote.itemName === "禁断之火")).toMatchObject({
+      unit: "d",
+      display: "9.9d",
+    });
+    expect(snapshot.quotes.find((quote) => quote.itemName === "神圣石")?.display).toBe("388c");
+  });
+});
+
+describe("易刷国服价表", () => {
+  function encoded(rows: unknown[]): string {
+    return gzipSync(Buffer.from(JSON.stringify(rows), "utf8")).toString("base64");
+  }
+
+  it("直接使用 calculated 混沌石价格，并解析求知为 120c", () => {
+    const snapshot = parseEfarmPriceFile(encoded([
+      {
+        id: 21730,
+        name: "求知",
+        baseType: "瓦尔之相",
+        calculated: 120,
+        frameType: 3,
+        count: 219,
+        leagueType: 2,
+        searchCode: "7XVwpX7t5",
+      },
+      { id: 1, name: "无价格", baseType: "无价格", calculated: 0, frameType: 5, count: 999 },
+    ]), SOURCE_TIME, NOW);
+
+    expect(snapshot.quotes).toEqual([
+      expect.objectContaining({
+        itemName: "求知",
+        englishName: "",
+        value: 120,
+        display: "120c",
+        source: "efarm",
+      }),
+    ]);
+  });
+
+  it("同名变体选择样本数最多的一项，星团珠宝折叠到静态基底名", () => {
+    const snapshot = parseEfarmPriceFile(encoded([
+      { id: 1, name: "动态附魔 A", baseType: "大型星团珠宝", calculated: 50, frameType: 2, count: 3 },
+      { id: 2, name: "动态附魔 B", baseType: "大型星团珠宝", calculated: 8, frameType: 2, count: 80 },
+    ]), SOURCE_TIME, NOW);
+    expect(snapshot.quotes).toEqual([
+      expect.objectContaining({ itemName: "大型星团珠宝", display: "8c" }),
+    ]);
+  });
+
+  it("保留禁断珠宝代表价，并把超过 1d 的价格换算成 d", () => {
+    const snapshot = parseEfarmPriceFile(encoded([
+      { id: 1, name: "禁断之火", baseType: "赤红珠宝", calculated: 3830, frameType: 3, count: 586, variant: "未鉴定" },
+      { id: 2, name: "禁断之火", baseType: "赤红珠宝", calculated: 20, frameType: 3, count: 9, variant: "神圣指引" },
+      { id: 3, name: "禁断之肉", baseType: "钴蓝珠宝", calculated: 2681, frameType: 3, count: 114, variant: "未鉴定" },
+      { id: 4, name: "求知", baseType: "瓦尔之相", calculated: 120, frameType: 3, count: 219 },
+      { id: 5, name: "神圣石", baseType: "神圣石", calculated: 388, frameType: 5, count: 1000 },
+    ]), SOURCE_TIME, NOW);
+
+    expect(snapshot.quotes.find((quote) => quote.itemName === "禁断之火")?.display).toBe("9.9d");
+    expect(snapshot.quotes.find((quote) => quote.itemName === "禁断之肉")?.display).toBe("6.9d");
+    expect(snapshot.quotes.find((quote) => quote.itemName === "求知")?.display).toBe("120c");
+  });
+
+  it("拒绝超过 24 小时未更新的价表", () => {
+    expect(() => parseEfarmPriceFile(
+      encoded([{ name: "求知", calculated: 120, frameType: 3 }]),
+      "2026-08-19T12:29:59.000Z",
+      NOW,
+    )).toThrow("已过期");
+  });
 });
 
 describe("poe.ninja 兜底行情", () => {
-  const SOURCE_TIME = "2026-08-20T12:20:00.000Z";
-
   it("覆盖官方 POE1 的 18 个兑换类别和 28 个仓库类别", () => {
     expect(POE_NINJA_EXCHANGE_TYPES).toHaveLength(18);
     expect(new Set(POE_NINJA_ITEM_TYPES)).toEqual(new Set([
@@ -129,7 +243,7 @@ describe("poe.ninja 兜底行情", () => {
     expect(() => parseNinjaLeague([])).toThrow("当前赛季");
   });
 
-  it("按元数据名称解析兑换行情，并在价格较高时改用神圣石显示", () => {
+  it("按元数据名称解析兑换行情，并始终保留忍者网混沌石基准价", () => {
     const quotes = parseNinjaExchangeOverview(
       {
         core: { primary: "chaos", rates: { divine: 0.005 } },
@@ -148,7 +262,7 @@ describe("poe.ninja 兜底行情", () => {
     expect(quotes).toEqual([
       expect.objectContaining({
         englishName: "Divine Orb",
-        display: "1.3d",
+        display: "250c",
         source: "poe-ninja",
         sourceTime: SOURCE_TIME,
       }),
@@ -169,6 +283,57 @@ describe("poe.ninja 兜底行情", () => {
     );
     expect(quotes).toHaveLength(1);
     expect(quotes[0]).toMatchObject({ englishName: "Ancient Wombgift", display: "15c" });
+  });
+
+  it("不把忍者网国际服神圣石换算值直接标成国服 d", () => {
+    const quotes = parseNinjaItemOverview(
+      {
+        lines: [
+          {
+            name: "Curiosity",
+            baseType: "Vaal Aspect",
+            chaosValue: 390,
+            divineValue: 1.89,
+            listingCount: 285,
+            detailsId: "curiosity-vaal-aspect",
+          },
+        ],
+      },
+      "UniqueJewel",
+      SOURCE_TIME,
+    );
+
+    expect(quotes[0]).toMatchObject({
+      englishName: "Curiosity",
+      value: 390,
+      unit: "c",
+      display: "390c",
+    });
+  });
+
+  it("按同一来源的神圣石行情换算超过 1d 的忍者网价格", () => {
+    const converted = convertHighChaosPricesToDivine([
+      ...parseNinjaExchangeOverview(
+        {
+          core: { primary: "chaos" },
+          items: [{ id: "divine", name: "Divine Orb" }],
+          lines: [{ id: "divine", primaryValue: 200 }],
+        },
+        "Currency",
+        SOURCE_TIME,
+      ),
+      ...parseNinjaItemOverview(
+        { lines: [{ name: "Curiosity", chaosValue: 390, listingCount: 285 }] },
+        "UniqueJewel",
+        SOURCE_TIME,
+      ),
+    ]);
+
+    expect(converted.find((quote) => quote.englishName === "Curiosity")).toMatchObject({
+      value: 1.95,
+      unit: "d",
+      display: "2d",
+    });
   });
 
   it("把动态词缀、地图阶级和禁断珠宝折叠到客户端稳定名称", () => {
@@ -293,14 +458,24 @@ describe("poe.ninja 兜底行情", () => {
     ]);
   });
 
-  it("实际抓取链路动态使用当前赛季，并在入口完成优先级合并", async () => {
+  it("实际抓取链路按易刷、国服旧源、poe.ninja 的优先级合并", async () => {
     const response = (payload: unknown) => ({
       ok: true,
       status: 200,
       headers: { get: (name: string) => (name.toLowerCase() === "date" ? "Thu, 20 Aug 2026 12:20:00 GMT" : null) },
       json: async () => payload,
     });
+    const efarmResponse = (rows: unknown[]) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name: string) => (name.toLowerCase() === "last-modified" ? "Thu, 20 Aug 2026 12:20:00 GMT" : null) },
+      json: async () => null,
+      text: async () => gzipSync(Buffer.from(JSON.stringify(rows), "utf8")).toString("base64"),
+    });
     const request = vi.fn(async (url: string) => {
+      if (url === EFARM_PRICE_URLS[0]) return efarmResponse([
+        { id: 1043, name: "神圣石", baseType: "神圣石", calculated: 388, frameType: 5, count: 11 },
+      ]);
       if (url === POE_CURRENCY_SUMMARY_URL) return response([{ category_label: "通货", items: [item()] }]);
       if (url === POE_NINJA_LEAGUES_URL) return response([{ id: "Allflame", name: "Allflame" }]);
       if (url.includes("/exchange/") && url.includes("type=Currency")) {
@@ -325,6 +500,37 @@ describe("poe.ninja 兜底行情", () => {
     const snapshot = await new PoeCurrencyPriceSource(request).fetch(NOW);
     expect(request.mock.calls.some(([url]) => String(url).includes("league=Allflame"))).toBe(true);
     expect(request.mock.calls.some(([url]) => String(url).includes("type=UniqueAccessory"))).toBe(true);
+    expect(snapshot.quotes.map((quote) => [quote.englishName, quote.itemName, quote.display, quote.source])).toEqual([
+      ["Divine Orb", "神圣石", "388c", "efarm"],
+      ["Chaos Orb", "", "1c", "poe-ninja"],
+    ]);
+  });
+
+  it("易刷价表不可用时仍回退到国服旧源，再由 poe.ninja 补缺", async () => {
+    const response = (payload: unknown) => ({
+      ok: true,
+      status: 200,
+      headers: { get: (name: string) => (name.toLowerCase() === "date" ? "Thu, 20 Aug 2026 12:20:00 GMT" : null) },
+      json: async () => payload,
+    });
+    const request = vi.fn(async (url: string) => {
+      if (EFARM_PRICE_URLS.includes(url)) {
+        return { ok: false, status: 503, json: async (): Promise<unknown> => null, text: async () => "" };
+      }
+      if (url === POE_CURRENCY_SUMMARY_URL) return response([{ category_label: "通货", items: [item()] }]);
+      if (url === POE_NINJA_LEAGUES_URL) return response([{ id: "Allflame" }]);
+      if (url.includes("/exchange/") && url.includes("type=Currency")) {
+        return response({
+          core: { primary: "chaos" },
+          items: [{ id: "chaos", name: "Chaos Orb" }],
+          lines: [{ id: "chaos", primaryValue: 1 }],
+        });
+      }
+      if (url.includes("/exchange/")) return response({ core: { primary: "chaos" }, items: [], lines: [] });
+      return response({ lines: [] });
+    });
+
+    const snapshot = await new PoeCurrencyPriceSource(request).fetch(NOW);
     expect(snapshot.quotes.map((quote) => [quote.englishName, quote.display, quote.source])).toEqual([
       ["Divine Orb", "125c", "poecurrency"],
       ["Chaos Orb", "1c", "poe-ninja"],

@@ -1,6 +1,19 @@
 export type PricePatchPendingAction = "apply" | "update" | "restore" | null;
 export type PricePatchPhase = "idle" | "waiting" | "applying" | "restoring" | "error";
-export type PriceQuoteSource = "poecurrency" | "poe-ninja";
+export type PriceQuoteSource = "efarm" | "poecurrency" | "poe-ninja";
+
+/** 数值越小优先级越高：易刷国服价 > 旧国服价源 > 国际服 poe.ninja。 */
+export function priceQuoteSourcePriority(source: PriceQuoteSource | undefined): number {
+  if (source === "efarm") return 0;
+  if (source === "poe-ninja") return 2;
+  // 未标来源的旧调用继续按国服行情处理。
+  return 1;
+}
+
+/** 国服价格使用普通中点；poe.ninja 兜底价格使用 ⁙，便于在游戏内直接识别来源。 */
+export function priceQuoteSeparator(source: PriceQuoteSource | undefined): " · " | " ⁙ " {
+  return source === "poe-ninja" ? " ⁙ " : " · ";
+}
 
 export interface PriceQuote {
   itemName: string;

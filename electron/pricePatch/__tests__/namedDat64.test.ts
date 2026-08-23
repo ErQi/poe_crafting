@@ -42,16 +42,21 @@ function references(values: number[]): Buffer {
   });
 }
 
-function quote(englishName: string, display: string): PriceQuote {
+function quote(
+  englishName: string,
+  display: string,
+  itemName = "",
+  source: PriceQuote["source"] = "poe-ninja",
+): PriceQuote {
   return {
     englishName,
-    itemName: "",
+    itemName,
     category: "poe.ninja Beast",
     value: 10,
     unit: "c",
     display,
     sourceTime: "2026-08-23T04:00:00.000Z",
-    source: "poe-ninja",
+    source,
   };
 }
 
@@ -65,7 +70,7 @@ describe("扩展名称 DAT 标价", () => {
     expect(patched.matchedRows).toEqual([1]);
     expect(parseNamedDatRows(patched.buffer, { namePointerOffset: NAME_OFFSET }).map((row) => row.name)).toEqual([
       "未使用",
-      "巨型深海奇美拉 · 3d",
+      "巨型深海奇美拉 ⁙ 3d",
     ]);
   });
 
@@ -86,6 +91,18 @@ describe("扩展名称 DAT 标价", () => {
       rowIndexes: rows,
     });
     expect(patched.matchedCount).toBe(0);
+  });
+
+  it("扩展 DAT 可按易刷中文名匹配，并优先于 poe.ninja 英文价", () => {
+    const english = names(["Unused", "Craicic Chimeral"]);
+    const localized = names(["未使用", "巨型深海奇美拉"]);
+    const patched = patchLocalizedNamedDat(english, localized, [
+      quote("Craicic Chimeral", "3d"),
+      quote("", "80c", "巨型深海奇美拉", "efarm"),
+    ], { namePointerOffset: NAME_OFFSET });
+
+    expect(parseNamedDatRows(patched.buffer, { namePointerOffset: NAME_OFFSET })[1].name)
+      .toBe("巨型深海奇美拉 · 80c");
   });
 
   it("只接受已选名称行的价格后缀变化", () => {
