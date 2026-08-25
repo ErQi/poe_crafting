@@ -5,10 +5,12 @@ import { clipboard, nativeImage, shell } from "electron";
 import { AutomationConfig, CraftAutomation } from "./automation";
 import { getClipboard } from "./clipboard";
 import {
+  loadJson,
   loadLibrary,
   loadRuleset,
   loadSettings,
   resolvePath,
+  saveJson,
   saveLibrary,
   saveRuleset,
   saveSettings,
@@ -17,6 +19,14 @@ import {
 import { CURRENCIES, CURRENCY_BY_TEMPLATE, currencyLabel } from "./currencies";
 import { hasCurrencyCell } from "./stashGrid";
 import { focusGameWindow } from "./input";
+import {
+  defaultMapWashConfig,
+  MapFilter,
+  MapWasher,
+  type MapGrid,
+  type MapWashConfig,
+  type MapWasherTiming,
+} from "./mapWasher";
 import { formatItemPreview, ItemParseError, parseItemText } from "./itemParser";
 import { matchRuleset, normalizeOperator, parseThresholdText } from "./matcher";
 import {
@@ -53,15 +63,17 @@ export const UI_TEMPLATES = "templates";
 export const UI_SETTINGS = "settings";
 export const UI_PRICE_PATCH = "price_patch";
 export const UI_CLIENT_ENHANCEMENTS = "client_enhancements";
-const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_PRICE_PATCH, UI_CLIENT_ENHANCEMENTS, UI_SETTINGS];
+export const UI_MAPWASH = "mapwash";
+const UI_PAGES = [UI_HELP, UI_GARDEN, UI_NORMAL, UI_TEMPLATES, UI_PRICE_PATCH, UI_CLIENT_ENHANCEMENTS, UI_MAPWASH, UI_SETTINGS];
 const UI_PAGE_LABELS: Record<string, string> = {
   [UI_HELP]: "使用说明",
   [UI_SETTINGS]: "设置",
   [UI_TEMPLATES]: "模板",
   [UI_PRICE_PATCH]: "标价补丁",
   [UI_CLIENT_ENHANCEMENTS]: "游戏增强",
+  [UI_MAPWASH]: "洗地图",
 };
-const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES, UI_PRICE_PATCH, UI_CLIENT_ENHANCEMENTS];
+const IDLE_START_PAGES = [UI_HELP, UI_SETTINGS, UI_TEMPLATES, UI_PRICE_PATCH, UI_CLIENT_ENHANCEMENTS, UI_MAPWASH];
 
 const TEMPLATE_SLOTS: [string, string, boolean][] = [
   ["craft_button", "执行工艺按钮", true],
@@ -163,6 +175,9 @@ export class AppHost {
   automation: CraftAutomation;
   private readonly pricePatch: PricePatchController;
   private readonly clientEnhancements: ClientEnhancementController;
+  private readonly mapWasher = new MapWasher((m) => this.onLog(m), () => this.push());
+  private mapWashConfig: MapWashConfig = defaultMapWashConfig();
+  private calibrationListener: ((enabled: boolean) => void) | null = null;
   private uiPage = UI_NORMAL;
   private lastCraftPage = UI_NORMAL;
   private pushFn: ((rt: Record<string, unknown>) => void) | null = null;
@@ -192,6 +207,9 @@ export class AppHost {
     );
     this.uiPage = UI_HELP;
     this.lastCraftPage = this.settings.craftMode === CraftMode.WORKFLOW ? UI_NORMAL : UI_GARDEN;
+    this.mapWashConfig = this.loadMapWashConfig();
+    // 把磁盘上的已存洗地图配置（含已校准格位）应用进 mapWasher，避免重启后格位/词条被默认值覆盖成「未校准」
+    this.mapWasher.applyConfig(this.mapWashConfig);
     const configErrors = takeLoadErrors();
     if (configErrors.length) {
       this.configError = configErrors.join("；");
@@ -253,6 +271,7 @@ export class AppHost {
 
   shutdown(): void {
     this.automation.requestStop(StopReason.USER_STOP);
+    this.mapWasher.requestStop();
     this.pricePatch.shutdown();
     this.clientEnhancements.shutdown();
   }
@@ -276,6 +295,16 @@ export class AppHost {
   async onHotkeyStart(): Promise<{ ok: boolean; error?: string }> {
     try {
       if (this.busy()) return ok();
+      if (this.mapWasher.isRunning()) return ok();
+      // 洗地图页：开始热键直接启动洗地图
+      if (this.uiPage === UI_MAPWASH) {
+        this.log(`热键 ${this.hotkeyLabel("start")}：开始洗地图`);
+        const result = this.mapWashStart();
+        if (result && result.ok === false) {
+          this.notifyError("启动洗地图失败", String(result.error || "启动失败"));
+        }
+        return result;
+      }
       if (IDLE_START_PAGES.includes(this.uiPage)) {
         this.log(`热键 ${this.hotkeyLabel("start")}：${UI_PAGE_LABELS[this.uiPage] || this.uiPage}页不启动工艺`);
         return ok();
@@ -300,6 +329,10 @@ export class AppHost {
         this.automation.requestStop(StopReason.USER_STOP);
         this.log(`热键 ${this.hotkeyLabel("stop")}：请求停止`);
       }
+      if (this.mapWasher.isRunning()) {
+        this.mapWasher.requestStop();
+        this.log(`热键 ${this.hotkeyLabel("stop")}：请求停止洗地图`);
+      }
     } catch (e) {
       console.error("[hotkey] stop fail:", e);
     }
@@ -317,6 +350,7 @@ export class AppHost {
       templates: this.templateRows(),
       price_patch: this.pricePatch.view(),
       client_enhancements: this.clientEnhancements.view(),
+      mapwash_config: this.mapWashConfig,
     };
   }
 
@@ -345,6 +379,7 @@ export class AppHost {
       init_error: this.initError,
       price_patch: this.pricePatch.view(),
       client_enhancements: this.clientEnhancements.view(),
+      mapwash: this.mapWasherView(),
     };
   }
 
@@ -475,6 +510,14 @@ export class AppHost {
       client_enhancements_apply: () => this.clientEnhancements.apply(),
       client_enhancements_restore: () => this.clientEnhancements.restore(),
       client_enhancements_retry: () => this.clientEnhancements.retry(),
+      mapwash_get_state: () => this.mapWashGetState(),
+      mapwash_update: (cfg) => this.mapWashUpdate((cfg as Record<string, unknown>) || {}),
+      mapwash_start: () => this.mapWashStart(),
+      mapwash_stop: () => this.mapWashStop(),
+      mapwash_read_slot: (index) => this.mapWashReadSlot(Number(index || 1)),
+      mapwash_test_filter: (text) => this.mapWashTestFilter(String(text || "")),
+      mapwash_begin_calibrate: (kind) => this.mapWashBeginCalibrate(String(kind || "")),
+      mapwash_cancel_calibrate: () => this.mapWashCancelCalibrate(),
     };
     const fn = map[name];
     if (!fn) return err(`未知接口: ${name}`);
@@ -673,6 +716,10 @@ export class AppHost {
     let next = (page || "").trim() || UI_HELP;
     if (!UI_PAGES.includes(next)) next = UI_HELP;
     this.uiPage = next;
+    if (this.mapWasher.calibrating) {
+      this.mapWasher.setCalibrating("");
+      this.setCalibrationEnabled();
+    }
     if (next === UI_GARDEN || next === UI_NORMAL) {
       this.lastCraftPage = next;
       this.applyKind(next);
@@ -1029,5 +1076,191 @@ export class AppHost {
     this.templateTest = { status: `完成：${okN}/${results.length} 命中`, color: okN ? "#6a994e" : "#e5383b", testing: false };
     this.setAlert("测试模板匹配", lines.join("\n"));
     this.push();
+  }
+
+  // ---------------- 洗地图 ----------------
+
+  private mapWasherConfigFile(): string {
+    return resolvePath("config/mapwasher.json");
+  }
+
+  private loadMapWashConfig(): MapWashConfig {
+    const data = loadJson(this.mapWasherConfigFile(), {}) as Record<string, unknown>;
+    const raw = data && typeof data === "object" ? data : {};
+    const num = (v: unknown, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : d;
+    };
+    const gridRaw = (raw.grid as Record<string, unknown>) || {};
+    const config: MapWashConfig = defaultMapWashConfig({
+      mode: raw.mode === "chaos" ? "chaos" : "alch",
+      startSlot: Math.max(1, Math.min(60, Math.round(num(raw.start_slot, 1)))),
+      endSlot: Math.max(1, Math.min(60, Math.round(num(raw.end_slot, 60)))),
+      exaltFill: Boolean(raw.exalt_fill),
+      doVaal: Boolean(raw.do_vaal),
+      filter: String(raw.filter || ""),
+      grid: {
+        startX: num(gridRaw.startX, 0),
+        startY: num(gridRaw.startY, 0),
+        endX: num(gridRaw.endX, 0),
+        endY: num(gridRaw.endY, 0),
+      },
+      windowTitleKeywords: Array.isArray(raw.window_title_keywords)
+        ? raw.window_title_keywords.map(String).filter(Boolean)
+        : this.settings.windowTitleKeywords,
+    });
+    return config;
+  }
+
+  private saveMapWashConfig(): void {
+    saveJson(this.mapWasherConfigFile(), {
+      mode: this.mapWashConfig.mode,
+      start_slot: this.mapWashConfig.startSlot,
+      end_slot: this.mapWashConfig.endSlot,
+      exalt_fill: this.mapWashConfig.exaltFill,
+      do_vaal: this.mapWashConfig.doVaal,
+      filter: this.mapWashConfig.filter,
+      grid: { ...this.mapWashConfig.grid },
+      window_title_keywords: this.mapWashConfig.windowTitleKeywords,
+    });
+  }
+
+  private mapWasherView() {
+    return this.mapWasher.view();
+  }
+
+  mapWashGetState() {
+    return ok({ config: this.mapWasher.config, status: this.mapWasherView() });
+  }
+
+  mapWashUpdate(raw: Record<string, unknown>) {
+    if (this.mapWasher.isRunning()) return err("洗地图运行中不能修改配置");
+    const num = (v: unknown, d: number) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? n : d;
+    };
+    const gridRaw = (raw.grid as Record<string, unknown>) || {};
+    const prev = this.mapWashConfig;
+    const next: MapWashConfig = defaultMapWashConfig({
+      ...prev,
+      mode: raw.mode === "chaos" ? "chaos" : raw.mode === "alch" ? "alch" : prev.mode,
+      startSlot: Math.max(1, Math.min(60, Math.round(num(raw.start_slot, prev.startSlot)))),
+      endSlot: Math.max(1, Math.min(60, Math.round(num(raw.end_slot, prev.endSlot)))),
+      exaltFill: Boolean(raw.exalt_fill ?? prev.exaltFill),
+      doVaal: Boolean(raw.do_vaal ?? prev.doVaal),
+      filter: typeof raw.filter === "string" ? raw.filter : prev.filter,
+      grid: {
+        startX: num(gridRaw.startX, prev.grid.startX),
+        startY: num(gridRaw.startY, prev.grid.startY),
+        endX: num(gridRaw.endX, prev.grid.endX),
+        endY: num(gridRaw.endY, prev.grid.endY),
+      },
+    });
+    this.mapWashConfig = next;
+    this.mapWasher.applyConfig(next);
+    this.saveMapWashConfig();
+    this.log("洗地图配置已保存");
+    return ok({ config: this.mapWasher.config });
+  }
+
+  mapWashStart() {
+    try {
+      if (this.mapWasher.isRunning()) return err("洗地图已在运行");
+      const cfg = this.mapWasher.config;
+      const g = cfg.grid;
+      if (!g.startX && !g.startY && !g.endX && !g.endY) {
+        return err("尚未校准背包起始格/结束格。请先在「洗地图」页校准起始格与结束格。");
+      }
+      // 实际加载通用设置：操作间隔、剪贴板超时、窗口标题关键字等
+      const timing: MapWasherTiming = {
+        actionDelayMs: this.settings.actionDelayMs,
+        craftWaitMs: this.settings.craftWaitMs,
+        clipboardTimeoutMs: this.settings.clipboardTimeoutMs,
+        windowTitleKeywords: this.settings.windowTitleKeywords,
+      };
+      this.mapWasher.start(cfg, timing);
+      return ok({ status: this.mapWasherView() });
+    } catch (e) {
+      const message = e instanceof Error ? e.message : String(e);
+      this.notifyError("启动洗地图失败", message);
+      return err(message);
+    }
+  }
+
+  mapWashStop() {
+    if (this.mapWasher.isRunning()) this.mapWasher.requestStop();
+    this.mapWasher.setCalibrating("");
+    this.setCalibrationEnabled();
+    this.log("已请求停止洗地图");
+    return ok({ status: this.mapWasherView() });
+  }
+
+  async mapWashReadSlot(index: number) {
+    try {
+      const result = await this.mapWasher.readSlotOnce(index);
+      if (!result.ok) return err(result.error || "读取失败");
+      const [ok, why] = MapFilter.matches(result.text, this.mapWashConfig.filter);
+      this.log(`格${result.slot}: 稀有度=${result.rarity} | ${ok ? "成功✓" : "失败✗"} (${why})`);
+      return { ok: true, slot: result.slot, text: result.text, rarity: result.rarity, match: ok, why };
+    } catch (e) {
+      return err(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  mapWashTestFilter(text: string) {
+    const [ok, why] = MapFilter.matches(text, this.mapWashConfig.filter);
+    return { ok: true, match: ok, why };
+  }
+
+  mapWashBeginCalibrate(kind: string) {
+    if (this.mapWasher.isRunning()) return err("运行中不能校准");
+    if (kind !== "start" && kind !== "end") return err("校准类型必须是 start 或 end");
+    this.mapWasher.setCalibrating(kind);
+    this.setCalibrationEnabled();
+    const label = kind === "start" ? "起始格" : "结束格";
+    this.log(`校准模式：${label}。请把鼠标移到游戏中背包的${label}上，然后按键盘 F5(${label})`);
+    return ok({ status: this.mapWasherView() });
+  }
+
+  mapWashCancelCalibrate() {
+    this.mapWasher.setCalibrating("");
+    this.setCalibrationEnabled();
+    this.log("已退出校准模式");
+    return ok({ status: this.mapWasherView() });
+  }
+
+  /** main.ts 注册的 F5/F6 热键回调 */
+  captureMapWashCalibrate(kind: string): void {
+    if (this.mapWasher.calibrating !== kind) return;
+    const result = this.mapWasher.captureCalibration(kind as "start" | "end");
+    if (result.ok) {
+      this.mapWashConfig = this.mapWasher.config;
+      this.saveMapWashConfig();
+      this.log("校准已保存");
+    } else {
+      this.notifyError("校准失败", result.error || "校准失败");
+    }
+    this.setCalibrationEnabled();
+  }
+
+  /** F6 单一校准热键：按当前处于「起始格」还是「结束格」校准模式来决定捕获哪个格位 */
+  captureMapWashCalibrateActive(): void {
+    const kind = this.mapWasher.calibrating;
+    if (kind !== "start" && kind !== "end") return;
+    this.captureMapWashCalibrate(kind);
+  }
+
+  /** 进入/退出校准模式时通知 main 注册/注销 F6 全局热键 */
+  onMapWashCalibration(listener: (enabled: boolean) => void): void {
+    this.calibrationListener = listener;
+  }
+
+  private setCalibrationEnabled(): void {
+    const on = this.mapWasher.calibrating !== "";
+    try {
+      this.calibrationListener?.(on);
+    } catch {
+      /* ignore */
+    }
   }
 }

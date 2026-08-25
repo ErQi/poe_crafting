@@ -69,7 +69,7 @@ describe("validateWorkflow", () => {
   });
 
   it("没有仓库格的内置通货报错", () => {
-    for (const currency of ["currency_divine", "currency_vaal", "currency_mirror"]) {
+    for (const currency of ["currency_divine", "currency_mirror"]) {
       const wf = new CraftWorkflow({ steps: [step({ id: "a", name: "一", currencyTemplate: currency })] });
       expect(validateWorkflow(wf).join()).toMatch(/选择了没有仓库格的通货/);
     }

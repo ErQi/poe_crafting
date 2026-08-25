@@ -39,6 +39,7 @@ const CURRENCY_CELLS: Record<string, readonly [number, number]> = {
   currency_fusing: [2, 2],
   currency_chromatic: [2, 3],
   currency_scouring: [2, 7],
+  currency_vaal: [2, 8],
   currency_exalted: [2, 9],
   currency_regret: [3, 7],
 };
