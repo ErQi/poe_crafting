@@ -18,6 +18,7 @@ import {
   cleanMinimapVisibilityResource,
   patchCameraResource,
   patchMinimapBlendingResource,
+  patchMinimapVisibilityResource,
 } from "../transform";
 import { defaultClientEnhancementState } from "../types";
 
@@ -102,9 +103,11 @@ describe("客户端增强旧基线迁移", () => {
     const cleanCamera = cleanCameraResource(cameraOriginal);
     const cleanVisibility = cleanMinimapVisibilityResource(visibilityOriginal);
     const cleanBlending = cleanMinimapBlendingResource(blendingOriginal);
+    // minimapEnabled=true 时可见度着色器会被真正全开，这里让“当前资源”与之保持一致
+    const revealVisibility = patchMinimapVisibilityResource(cleanVisibility, true);
     const currentResources: Record<string, Buffer> = {
       [CAMERA_RESOURCE]: patchCameraResource(cleanCamera, true, 2),
-      [MINIMAP_VISIBILITY_RESOURCE]: cleanVisibility,
+      [MINIMAP_VISIBILITY_RESOURCE]: revealVisibility,
       [MINIMAP_BLENDING_RESOURCE]: patchMinimapBlendingResource(cleanBlending, true, "default"),
       [ENVIRONMENT_FOG_RESOURCE]: fogOriginal,
     };
