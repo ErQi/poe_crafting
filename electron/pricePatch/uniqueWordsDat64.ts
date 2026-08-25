@@ -1,4 +1,4 @@
-import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
+import { priceQuoteSourcePriority, priceSuffix, type PriceQuote } from "./types";
 import { localizedNameKeys, stripPriceSuffix } from "./dat64";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
@@ -276,7 +276,7 @@ export function patchLocalizedUniqueWords(
     const quote = preferredQuote(englishQuote, chineseQuote);
     if (!quote) continue;
     const baselineName = stripPriceSuffix(row.localizedName);
-    updates.set(row.index, `${baselineName}${priceQuoteSeparator(quote.source)}${quote.display}`);
+    updates.set(row.index, `${baselineName}${priceSuffix(quote.display)}`);
     matchedRows.push(row.index);
   }
   return {

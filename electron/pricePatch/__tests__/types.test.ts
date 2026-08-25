@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { defaultPricePatchState, pricePatchView, priceQuoteSeparator } from "../types";
+import { defaultPricePatchState, pricePatchView, priceSuffix } from "../types";
 
 describe("标价补丁界面状态", () => {
-  it("只为 poe.ninja 兜底价使用非国服来源分隔符", () => {
-    expect(priceQuoteSeparator("efarm")).toBe(" · ");
-    expect(priceQuoteSeparator("poecurrency")).toBe(" · ");
-    expect(priceQuoteSeparator("poe-ninja")).toBe(" ⁙ ");
+  it("价格后缀以易刷可剥离的 [价] 形式紧贴名字", () => {
+    expect(priceSuffix("1c")).toBe("[1c]");
+    expect(priceSuffix("1.18d")).toBe("[1.18d]");
+    expect(priceSuffix("0.9d")).toBe("[0.9d]");
   });
 
   it("暴露客户端路径，并在补丁已应用时锁定修改", () => {

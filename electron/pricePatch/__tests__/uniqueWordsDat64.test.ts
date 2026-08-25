@@ -81,7 +81,7 @@ describe("唯一装备 Words 标价", () => {
 
     const patched = patchLocalizedUniqueWords(english, localized, layout, [quote("Uzaza's Mountain", "90c")]);
     expect(patched.matchedRows).toEqual([1]);
-    expect(parseUniqueWordRows(english, patched.buffer, layout)[0].localizedName).toBe("乌扎萨的高山 ⁙ 90c");
+    expect(parseUniqueWordRows(english, patched.buffer, layout)[0].localizedName).toBe("乌扎萨的高山[90c]");
   });
 
   it("扩展到 Words 全部唯一物品词条，并以改名后的 Text2 匹配", () => {
@@ -108,7 +108,7 @@ describe("唯一装备 Words 标价", () => {
       [quote("Binds of Bloody Vengeance", "12d")],
     );
     expect(patched.matchedRows).toEqual([1]);
-    expect(parseUniqueWordRows(english, patched.buffer, layout)[1].localizedName).toBe("鲜血复仇之缚 ⁙ 12d");
+    expect(parseUniqueWordRows(english, patched.buffer, layout)[1].localizedName).toBe("鲜血复仇之缚[12d]");
   });
 
   it("当普通唯一名缺价时，可用 Foulborn API 前缀名回退匹配", () => {
@@ -123,7 +123,7 @@ describe("唯一装备 Words 标价", () => {
     const layout = uniqueLayout([0]);
     const patched = patchLocalizedUniqueWords(english, localized, layout, [quote("Foulborn Al Dhih", "30c")]);
     expect(patched.matchedRows).toEqual([1]);
-    expect(parseUniqueWordRows(english, patched.buffer, layout)[1].localizedName).toBe("艾尔迪赫 ⁙ 30c");
+    expect(parseUniqueWordRows(english, patched.buffer, layout)[1].localizedName).toBe("艾尔迪赫[30c]");
   });
 
   it("易刷中文唯一名优先于 poe.ninja 英文价，并兼容纯符号装饰后缀", () => {
@@ -136,7 +136,7 @@ describe("唯一装备 Words 标价", () => {
     ]);
 
     expect(patched.matchedRows).toEqual([0]);
-    expect(parseUniqueWordRows(english, patched.buffer, layout)[0].localizedName).toBe("求知[※ ※] · 120c");
+    expect(parseUniqueWordRows(english, patched.buffer, layout)[0].localizedName).toBe("求知[※ ※][120c]");
   });
 
   it("清理历史价格后缀且不改非价格文本", () => {

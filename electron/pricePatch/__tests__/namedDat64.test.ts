@@ -70,7 +70,7 @@ describe("扩展名称 DAT 标价", () => {
     expect(patched.matchedRows).toEqual([1]);
     expect(parseNamedDatRows(patched.buffer, { namePointerOffset: NAME_OFFSET }).map((row) => row.name)).toEqual([
       "未使用",
-      "巨型深海奇美拉 ⁙ 3d",
+      "巨型深海奇美拉[3d]",
     ]);
   });
 
@@ -102,7 +102,7 @@ describe("扩展名称 DAT 标价", () => {
     ], { namePointerOffset: NAME_OFFSET });
 
     expect(parseNamedDatRows(patched.buffer, { namePointerOffset: NAME_OFFSET })[1].name)
-      .toBe("巨型深海奇美拉 · 80c");
+      .toBe("巨型深海奇美拉[80c]");
   });
 
   it("只接受已选名称行的价格后缀变化", () => {

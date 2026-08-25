@@ -82,7 +82,7 @@ function displayTime(value) {
         </div>
         <div>
           <span>符号说明</span>
-          <p><b>·</b> 表示国服价格（易刷或国服备用源）；<b>⁙</b> 表示非国服价格（poe.ninja 兜底）。</p>
+          <p>价格以易刷可剥离的形式缀在物品名后（如 <b>[1.2c]</b>），复制出的物品名可直接被易刷等查价工具识别为纯名，查价不失败。</p>
         </div>
         <div>
           <span>显示规则</span>

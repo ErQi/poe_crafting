@@ -10,9 +10,10 @@ export function priceQuoteSourcePriority(source: PriceQuoteSource | undefined): 
   return 1;
 }
 
-/** 国服价格使用普通中点；poe.ninja 兜底价格使用 ⁙，便于在游戏内直接识别来源。 */
-export function priceQuoteSeparator(source: PriceQuoteSource | undefined): " · " | " ⁙ " {
-  return source === "poe-ninja" ? " ⁙ " : " · ";
+/** 把价格以易刷可剥离的 `名称[价]` 形式追加到物品名后，兼容易刷按纯名查价；
+ *  半角方括号紧贴名字、无空格，复制出的物品名可直接被易刷解析成纯名再查价。 */
+export function priceSuffix(display: string): string {
+  return `[${display}]`;
 }
 
 export interface PriceQuote {
