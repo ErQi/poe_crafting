@@ -423,6 +423,7 @@ async function removeStep(id) {
         @update="(values) => applyCall(() => call('client_enhancements_update', values))"
         @apply="applyCall(() => call('client_enhancements_apply'))"
         @restore="applyCall(() => call('client_enhancements_restore'))"
+        @reset-baseline="applyCall(() => call('client_enhancements_reset_baseline'))"
         @retry="applyCall(() => call('client_enhancements_retry'))"
       />
       <SettingsPage

@@ -565,6 +565,18 @@ export class ClientEnhancementPatcher {
     return result;
   }
 
+  /**
+   * 强制以「当前客户端」为基准重建只读基线备份（重置增强基线）。
+   * 用于初始备份有问题、或想重新以现在状态为还原基准时。把当前资源存为 original，
+   * 并由此生成去掉增强的 clean 版本；旧的基线目录保留，不会被删除覆盖。
+   */
+  async resetBaseline(clientRoot: string): Promise<{ baselineId: string; baselineDir: string; executableSha256: string }> {
+    await this.assertClientSafe(clientRoot);
+    const current = await this.currentResources(clientRoot);
+    const created = await this.createBaseline(clientRoot, current);
+    return { baselineId: created.manifest.id, baselineDir: created.dir, executableSha256: current.executableSha256 };
+  }
+
   async restore(clientRoot: string, state: ClientEnhancementState): Promise<EnhancementPatchResult> {
     const prepared = await this.prepareBaseline(clientRoot, state);
     const original = await this.baselineBuffers(prepared, "original");

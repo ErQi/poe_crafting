@@ -5,7 +5,7 @@ const props = defineProps({
   state: { type: Object, required: true },
   runtime: { type: Object, required: true },
 });
-const emit = defineEmits(["update", "apply", "restore", "retry"]);
+const emit = defineEmits(["update", "apply", "restore", "reset-baseline", "retry"]);
 
 const enhancement = computed(() => props.runtime.client_enhancements || props.state.client_enhancements || {});
 const busy = computed(() => Boolean(enhancement.value.busy));
@@ -32,6 +32,17 @@ const colors = [
 
 function update(values) {
   if (!busy.value) emit("update", values);
+}
+
+function resetBaseline() {
+  if (
+    !window.confirm(
+      "重置增强基线备份：将以当前客户端的增强目标资源作为新的还原基准。\n\n旧基线不会被删除，但仍建议先确认无误再重置。确定继续？",
+    )
+  ) {
+    return;
+  }
+  emit("reset-baseline");
 }
 
 function displayTime(value) {
@@ -178,9 +189,17 @@ function displayTime(value) {
           >
             恢复首次修改前资源
           </button>
+          <button
+            type="button"
+            class="btn"
+            :disabled="busy"
+            @click="resetBaseline"
+          >
+            重置增强基线备份
+          </button>
         </div>
         <p class="warning">客户端资源修改可能违反游戏规则，存在账号风险，请自行判断使用。</p>
-        <p class="tiny">首次应用会备份当时的四个目标资源；若易刷已应用同类补丁，建议先在易刷还原，再由 POE Tools 接管。</p>
+        <p class="tiny">首次应用会备份当时的四个目标资源；若易刷已应用同类补丁，建议先在易刷还原，再由 POE Tools 接管。目标资源被其他程序改动而无法恢复时，可用「重置增强基线备份」以当前状态为新的基准。</p>
       </section>
     </div>
   </div>

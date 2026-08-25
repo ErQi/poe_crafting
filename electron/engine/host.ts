@@ -510,6 +510,7 @@ export class AppHost {
         this.clientEnhancements.update((values as Record<string, unknown>) || {}),
       client_enhancements_apply: () => this.clientEnhancements.apply(),
       client_enhancements_restore: () => this.clientEnhancements.restore(),
+      client_enhancements_reset_baseline: () => this.clientEnhancements.resetBaseline(),
       client_enhancements_retry: () => this.clientEnhancements.retry(),
       mapwash_get_state: () => this.mapWashGetState(),
       mapwash_update: (cfg) => this.mapWashUpdate((cfg as Record<string, unknown>) || {}),
