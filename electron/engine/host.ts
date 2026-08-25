@@ -503,6 +503,7 @@ export class AppHost {
       test_templates: () => this.testTemplates(),
       price_patch_apply: () => this.pricePatch.apply(),
       price_patch_restore: () => this.pricePatch.restore(),
+      price_patch_reset_baseline: () => this.pricePatch.resetBaseline(),
       price_patch_set_auto: (enabled) => this.pricePatch.setAutoUpdate(Boolean(enabled)),
       price_patch_set_client_root: (value) => this.pricePatch.setClientRoot(String(value || "")),
       client_enhancements_update: (values) =>

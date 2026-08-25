@@ -5,7 +5,7 @@ const props = defineProps({
   state: { type: Object, required: true },
   runtime: { type: Object, required: true },
 });
-const emit = defineEmits(["apply", "restore", "auto", "client-root", "choose-client-root"]);
+const emit = defineEmits(["apply", "restore", "reset-baseline", "auto", "client-root", "choose-client-root"]);
 
 const patch = computed(() => props.runtime.price_patch || props.state.price_patch || {});
 const applied = computed(() => Boolean(patch.value.applied));
@@ -36,6 +36,17 @@ function saveClientRoot() {
 function chooseClientRoot() {
   if (clientRootLocked.value) return;
   emit("choose-client-root", clientRootDraft.value, completeClientRoot);
+}
+
+function resetBaseline() {
+  if (
+    !window.confirm(
+      "重置基线备份：将以当前客户端的标价资源作为新的还原基准。\n\n旧基线不会被删除，但仍建议先确认无误再重置。确定继续？",
+    )
+  ) {
+    return;
+  }
+  emit("reset-baseline");
 }
 
 function displayTime(value) {
@@ -151,6 +162,18 @@ function displayTime(value) {
         </button>
       </div>
 
+      <div class="reset-row">
+        <button
+          type="button"
+          class="btn ghost"
+          :disabled="busy"
+          @click="resetBaseline"
+        >
+          重置基线备份
+        </button>
+        <small>以当前客户端状态作为新的还原基准（初始备份有问题时使用；旧备份保留）。</small>
+      </div>
+
       <label class="auto-row">
         <span>
           <b>闲置时自动更新</b>
@@ -247,6 +270,8 @@ function displayTime(value) {
 .client-path-row .ctrl[readonly] { opacity: 0.6; cursor: default; }
 .primary { width: 100%; height: 40px; font-size: 14px; font-weight: 700; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.reset-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.reset-row small { color: var(--muted); }
 .auto-row {
   display: flex;
   align-items: center;

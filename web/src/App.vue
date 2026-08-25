@@ -411,6 +411,7 @@ async function removeStep(id) {
         :runtime="runtime"
         @apply="applyCall(() => call('price_patch_apply'))"
         @restore="applyCall(() => call('price_patch_restore'))"
+        @reset-baseline="applyCall(() => call('price_patch_reset_baseline'))"
         @auto="(enabled) => applyCall(() => call('price_patch_set_auto', enabled))"
         @client-root="setPricePatchClientRoot"
         @choose-client-root="choosePricePatchClientRoot"

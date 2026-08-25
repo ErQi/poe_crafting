@@ -245,6 +245,66 @@ export class PricePatchController {
     }
   }
 
+  /** 重置基线备份：以当前客户端状态为新的还原基准 */
+  async resetBaseline(): Promise<Record<string, unknown>> {
+    if (this.operation) return { ok: false, error: "标价补丁正在处理中", price_patch: this.view() };
+    if (await this.gameRunning()) {
+      return { ok: false, error: "请先退出游戏再重置基线备份", price_patch: this.view() };
+    }
+    try {
+      await this.startOperation(() => this.runResetBaseline());
+      return { ok: true, price_patch: this.view() };
+    } catch (error) {
+      return { ok: false, error: errorText(error), price_patch: this.view() };
+    }
+  }
+
+  private async runResetBaseline(): Promise<void> {
+    this.patch(
+      {
+        pendingAction: null,
+        phase: "idle",
+        statusText: "正在重置标价基线备份…",
+        error: "",
+      },
+      false,
+    );
+    try {
+      const clientRoot = await this.patcher.clientRoot(this.state.clientRoot);
+      const result = await this.patcher.resetBaseline(clientRoot);
+      this.patch({
+        clientRoot,
+        baselineId: result.baselineId,
+        applied: false,
+        pendingAction: null,
+        phase: "idle",
+        statusText: "已重置基线备份，以当前客户端为基准",
+        nextRetryAt: "",
+        lastPriceDigest: "",
+        lastPatchedResourceSha256: "",
+        lastPatchedUniqueWordsSha256: "",
+        lastPatchedAuxiliarySha256: "",
+        appliedFiles: [],
+        appliedCustomFiles: [],
+        updatedItemCount: 0,
+        lastUpdatedAt: "",
+        lastCheckedAt: "",
+        sourceUpdatedAt: "",
+        error: "",
+      });
+    } catch (error) {
+      if (error instanceof GameRunningError) return;
+      const message = errorText(error);
+      this.patch({
+        pendingAction: null,
+        phase: "error",
+        statusText: `重置基线失败：${message}`,
+        error: message,
+      });
+      throw error;
+    }
+  }
+
   setAutoUpdate(enabled: boolean): Record<string, unknown> {
     const pendingAction = !enabled && this.state.pendingAction === "update" ? null : this.state.pendingAction;
     this.patch({
