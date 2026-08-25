@@ -12,6 +12,10 @@ const GEOMETRY_BLEND = /res_color\s*=\s*Uberblend\(\s*res_color\s*,\s*geometry_s
 const ORIGINAL_GEOMETRY_BLEND = "res_color = Uberblend(res_color, geometry_sample * float4(1.0f, 1.0f, 1.0f, visibility));";
 const ORIGINAL_FOG_RETURN = "return oColour;";
 
+// 小地图全开：强开可见度下限，让客户端把全图地形(含未探索区)都光栅化出来。
+// floor 会把原生未探索阴影一起抹平，故本功能不再用阴影区分探索/未探索。
+const MINIMAP_REVEAL_FLOOR = "0.5f";
+
 interface TextBuffer {
   text: string;
   encode(value: string): Buffer;
@@ -141,13 +145,10 @@ export function patchMinimapVisibilityResource(buffer: Buffer, enabled: boolean)
   }
   const indent = ret[2] || "\t";
   const at = open + 1 + ret.index + (ret[1] ? ret[1].length : 0);
-  // 全开：强制可见度下限，让客户端把整图当成已探索来光栅化地图地形(geometry)，
-  // 未探索区才有真实地形线可读。阴影不再由可见度涨跌产生，改用混色着色器的 .b 通道另判。
+  // floor 使全图按已探索光栅化地形线；原生阴影随之抹平(目标=未探索阴影透明)。
   const injection = [
     `${indent}// POE Tools minimap reveal begin`,
-    `${indent}float poe_tools_true = max(ratio, prev_ratio); // floor 前抓住真已探索量`,
-    `${indent}res_color.r = max(poe_tools_true, 0.5f); // 整图强开下限，让客户端把全图地形光栅化`,
-    `${indent}res_color.b = 1.0f - poe_tools_true; // 真未探索量写入蓝通道，供混色做阴影`,
+    `${indent}res_color.r = max(res_color.r, ${MINIMAP_REVEAL_FLOOR});`,
     `${indent}// POE Tools minimap reveal end`,
     "",
   ].join(newline);
@@ -194,29 +195,8 @@ export function patchMinimapBlendingResource(buffer: Buffer, enabled: boolean, c
   let text = cleanBlendingText(decoded.text);
   if (!enabled) return decoded.encode(text);
   const newline = newlineOf(text);
-  // 全开：把地图图层(geometry)在“黑底阴影”之后叠回，但只在被 line90 抹成黑的未探索像素叠加，
-  // 门控与阴影同源(walkability_sample.b)，alpha 用 geometry_opacity 尊重「地形透明度」设置。
-  // 结果：未探索区=黑色阴影 + 可见的地形轮廓/道路线；已探索区=正常。
-  const { open, close } = functionBlockRange(text, "BlendMinimap");
-  const body = text.slice(open + 1, close);
-  const ret = /(^|\r?\n)([\t ]*)return\s+(?:OutputSDR\s*\(\s*res_color|res_color\s*;)/im.exec(body);
-  if (!ret || ret.index === undefined) {
-    throw new Error("小地图混色着色器缺少最终返回点，已拒绝盲目修改");
-  }
-  const indent = ret[2] || "\t\t";
-  const at = open + 1 + ret.index + (ret[1] ? ret[1].length : 0);
-  const overlay = [
-    `${indent}// POE Tools minimap layout begin`,
-    `${indent}// 门控与 line90 阴影抹黑同源(walkability_sample.b)：未探索黑阴影处叠回地形轮廓`,
-    `${indent}float poe_tools_reveal = saturate(walkability_sample.b * 2.0f);`,
-    `${indent}float4 poe_geo = SAMPLE_TEX2D( geometry_sampler, SamplerLinearClampOffsetNoBias, screen_coord );`,
-    `${indent}poe_geo.rgb = max(poe_geo.rgb, float3(0.25f, 0.25f, 0.25f)); // 抬亮未探索区的暗地形，使其在黑阴影上可见`,
-    `${indent}poe_geo.a *= saturate(length(poe_geo.rgb - float3(0.0f, 0.0f, 0.0f)) * 50.0f);`,
-    `${indent}res_color = Uberblend(res_color, poe_geo * float4(1.0f, 1.0f, 1.0f, saturate(geometry_opacity * 1.3f) * poe_tools_reveal));`,
-    `${indent}// POE Tools minimap layout end`,
-    "",
-  ].join(newline);
-  text = `${text.slice(0, at)}${overlay}${text.slice(at)}`;
+  // 全开只由可见度 floor 完成(未探索区同样渲染地形线)；这里不再叠加任何阴影/灰蒙层，
+  // 未探索阴影保持透明(目标2)，也不再区分探索与未探索。
   if (color === "default") return decoded.encode(text);
   const rgb = COLOR_RGB[color];
   const colorRange = functionBlockRange(text, "BlendMinimap");
