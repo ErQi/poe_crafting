@@ -1,4 +1,5 @@
 import {
+  Affix,
   CompareOp,
   GroupMatchResult,
   Item,
@@ -40,10 +41,10 @@ export function splitPatternKeywords(pattern: string): string[] {
   return keywords;
 }
 
-function affixHasKeywords(text: string, keywords: string[]): boolean {
-  if (!keywords.every((k) => text.includes(k))) return false;
+function affixHasKeywords(affix: Affix, keywords: string[]): boolean {
+  if (!keywords.every((k) => affix.searchText.includes(k))) return false;
   // 「元素伤害提高」是「攻击技能的元素伤害提高」的子串，泛匹配时排除后者。
-  if (keywords.length === 1 && keywords[0] === "元素伤害提高" && text.includes("攻击技能")) return false;
+  if (keywords.length === 1 && keywords[0] === "元素伤害提高" && affix.text.includes("攻击技能")) return false;
   return true;
 }
 
@@ -67,12 +68,12 @@ export function matchRule(item: Item, rule: MatchRule): RuleHit {
   const candidates: RuleHit[] = [];
 
   for (const affix of item.affixes) {
-    if (!affixHasKeywords(affix.text, keywords)) continue;
+    if (!affixHasKeywords(affix, keywords)) continue;
     if (!needValue) {
       return new RuleHit({
         rule,
         matched: true,
-        matchedAffix: affix.text,
+        matchedAffix: affix.displayText,
         actualValue: affix.firstValue,
         actualValues: [...affix.values],
         reason: "文本匹配",
@@ -94,7 +95,7 @@ export function matchRule(item: Item, rule: MatchRule): RuleHit {
       new RuleHit({
         rule,
         matched: ok,
-        matchedAffix: affix.text,
+        matchedAffix: affix.displayText,
         actualValue: affix.firstValue,
         actualValues: [...affix.values],
         reason: ok ? "数值匹配" : "数值未达标",

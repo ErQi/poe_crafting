@@ -31,7 +31,7 @@ import {
   sha256File,
   type ReplacementFile,
 } from "./fileSafety";
-import type { AppliedFileFingerprint, PricePatchState, PriceSnapshot } from "./types";
+import type { AppliedFileFingerprint, PriceLabelMode, PricePatchState, PriceSnapshot } from "./types";
 
 const INDEX_RELATIVE = "Bundles2/_.index.bin";
 const ENGLISH_RESOURCE = "Data/BaseItemTypes.datc64";
@@ -1014,7 +1014,12 @@ export class ClientPricePatcher {
     if (await this.gameRunning()) throw new GameRunningError();
   }
 
-  async apply(clientRoot: string, state: PricePatchState, prices: PriceSnapshot): Promise<ApplyPatchResult> {
+  async apply(
+    clientRoot: string,
+    state: PricePatchState,
+    prices: PriceSnapshot,
+    labelMode: PriceLabelMode = state.labelMode,
+  ): Promise<ApplyPatchResult> {
     const prepared = await this.prepareBaseline(clientRoot, state);
     const uniqueResources = uniqueWordBaseline(prepared.manifest);
     const auxiliaryResources = auxiliaryBaseline(prepared.manifest);
@@ -1025,12 +1030,13 @@ export class ClientPricePatcher {
       fs.promises.readFile(backupAbsolute(prepared.baselineDir, uniqueResources.localizedWords)),
       fs.promises.readFile(backupAbsolute(prepared.baselineDir, uniqueResources.uniqueStashLayout)),
     ]);
-    const patchedBaseItems = patchLocalizedBaseItems(english, localized, prices.quotes);
+    const patchedBaseItems = patchLocalizedBaseItems(english, localized, prices.quotes, labelMode);
     const patchedUniqueWords = patchLocalizedUniqueWords(
       englishWords,
       localizedWords,
       uniqueStashLayout,
       prices.quotes,
+      labelMode,
     );
     const patchedAuxiliary = Object.fromEntries(await Promise.all(AUXILIARY_RESOURCE_SPECS.map(async (spec) => {
       const baselineResource = auxiliaryResources[spec.id];
@@ -1047,7 +1053,7 @@ export class ClientPricePatcher {
           ? referencedRowIndexes(reference, namedDatRowCount(englishAuxiliary, spec.namePointerOffset))
           : undefined,
       };
-      return [spec.id, patchLocalizedNamedDat(englishAuxiliary, localizedAuxiliary, prices.quotes, options)];
+      return [spec.id, patchLocalizedNamedDat(englishAuxiliary, localizedAuxiliary, prices.quotes, options, labelMode)];
     }))) as Record<AuxiliaryResourceId, ReturnType<typeof patchLocalizedNamedDat>>;
     const auxiliaryMatchedCount = Object.values(patchedAuxiliary)
       .reduce((total, result) => total + result.matchedCount, 0);

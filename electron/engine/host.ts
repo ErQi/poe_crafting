@@ -469,6 +469,7 @@ export class AppHost {
       price_patch_apply: () => this.pricePatch.apply(),
       price_patch_restore: () => this.pricePatch.restore(),
       price_patch_set_auto: (enabled) => this.pricePatch.setAutoUpdate(Boolean(enabled)),
+      price_patch_set_mode: (value) => this.pricePatch.setLabelMode(String(value || "")),
       price_patch_set_client_root: (value) => this.pricePatch.setClientRoot(String(value || "")),
       client_enhancements_update: (values) =>
         this.clientEnhancements.update((values as Record<string, unknown>) || {}),

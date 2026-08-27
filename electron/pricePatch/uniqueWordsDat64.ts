@@ -1,4 +1,4 @@
-import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
+import { priceQuoteSourcePriority, priceQuoteSuffix, type PriceLabelMode, type PriceQuote } from "./types";
 import { localizedNameKeys, stripPriceSuffix } from "./dat64";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
@@ -245,6 +245,7 @@ export function patchLocalizedUniqueWords(
   localizedInput: Buffer,
   uniqueLayoutInput: Buffer,
   quotes: PriceQuote[],
+  labelMode: PriceLabelMode = "source",
 ): PatchedUniqueWords {
   const localizedLayout = findLayout(localizedInput, MIN_WORD_RECORD_SIZE);
   const quoteByEnglish = new Map<string, PriceQuote>();
@@ -276,7 +277,7 @@ export function patchLocalizedUniqueWords(
     const quote = preferredQuote(englishQuote, chineseQuote);
     if (!quote) continue;
     const baselineName = stripPriceSuffix(row.localizedName);
-    updates.set(row.index, `${baselineName}${priceQuoteSeparator(quote.source)}${quote.display}`);
+    updates.set(row.index, `${baselineName}${priceQuoteSuffix(quote, labelMode)}`);
     matchedRows.push(row.index);
   }
   return {

@@ -1,11 +1,33 @@
 import { describe, expect, it } from "vitest";
-import { defaultPricePatchState, pricePatchView, priceQuoteSeparator } from "../types";
+import {
+  defaultPricePatchState,
+  pricePatchStateFrom,
+  pricePatchView,
+  priceQuoteSeparator,
+  priceQuoteSuffix,
+} from "../types";
 
 describe("标价补丁界面状态", () => {
   it("只为 poe.ninja 兜底价使用非国服来源分隔符", () => {
     expect(priceQuoteSeparator("efarm")).toBe(" · ");
     expect(priceQuoteSeparator("poecurrency")).toBe(" · ");
     expect(priceQuoteSeparator("poe-ninja")).toBe(" ⁙ ");
+  });
+
+  it("默认使用易刷模式，并生成易刷查价可清理的方括号后缀", () => {
+    const state = defaultPricePatchState();
+    expect(state.labelMode).toBe("efarm");
+    expect(priceQuoteSuffix({ display: "1.2d", source: "efarm" }, "efarm")).toBe("[1.2d]");
+    expect(priceQuoteSuffix({ display: "390c", source: "poe-ninja" }, "efarm")).toBe("[390c]");
+    expect(priceQuoteSuffix({ display: "390c", source: "poe-ninja" }, "source")).toBe(" ⁙ 390c");
+  });
+
+  it("旧版已应用状态迁移后默认选择易刷模式，并提示需要重新应用", () => {
+    const state = pricePatchStateFrom({ schemaVersion: 2, applied: true, autoUpdate: true });
+    expect(state.schemaVersion).toBe(3);
+    expect(state.labelMode).toBe("efarm");
+    expect(state.appliedLabelMode).toBe("source");
+    expect(pricePatchView(state).label_mode_dirty).toBe(true);
   });
 
   it("暴露客户端路径，并在补丁已应用时锁定修改", () => {

@@ -466,7 +466,7 @@ export class CraftAutomation {
   ): Promise<void> {
     let reason: StopReasonValue = StopReason.MAX_ATTEMPTS;
     let message = `已达最大动作数 ${s.maxAttempts}`;
-    let lastRaw = `${currentItem.rarity}|${currentItem.affixTexts().join("|")}`;
+    let lastRaw = `${currentItem.rarity}|${currentItem.affixSignatures().join("|")}`;
     let lastActionStepId = "";
     let unchanged = 0;
     let applied = 0;
@@ -546,7 +546,7 @@ export class CraftAutomation {
         success = evaluation.success;
         this.update({ lastItem: item, lastMatch: evaluation.match });
         this.log(`#${attempt} ${Date.now() - t0}ms | ${evaluation.success ? "命中" : "未命中"} | ${evaluation.summary}`);
-        const rawKey = `${item.rarity}|${item.affixTexts().join("|")}`;
+        const rawKey = `${item.rarity}|${item.affixSignatures().join("|")}`;
         if (rawKey && rawKey === lastRaw && step.id === lastActionStepId) {
           unchanged += 1;
           this.update({ unchangedStreak: unchanged });
@@ -573,7 +573,7 @@ export class CraftAutomation {
       if (route.kind === ROUTE_FINISH) {
         reason = StopReason.SUCCESS;
         message = `流程完成：步骤「${step.name}」命中`;
-        for (const affix of item.affixes) this.log(`  • ${affix.text}`);
+        for (const affix of item.affixes) this.log(`  • ${affix.displayText}`);
         break;
       }
       if (route.kind === ROUTE_STOP) {
@@ -683,10 +683,10 @@ export class CraftAutomation {
         reason = StopReason.SUCCESS;
         message = "已命中目标词缀";
         this.log(message);
-        for (const a of parsed.affixes) this.log(`  • ${a.text}`);
+        for (const a of parsed.affixes) this.log(`  • ${a.displayText}`);
         break;
       }
-      const rawKey = `${parsed.rarity}|${parsed.affixTexts().join("|")}`;
+      const rawKey = `${parsed.rarity}|${parsed.affixSignatures().join("|")}`;
       if (rawKey === lastRaw) {
         unchanged += 1;
         this.update({ unchangedStreak: unchanged });

@@ -283,6 +283,16 @@ describe("Item / Affix", () => {
     expect(new Affix("x", [6, 12]).secondValue).toBe(12);
   });
 
+  it("词缀名称参与搜索、展示和变化签名，但不改变原效果文本", () => {
+    const affix = new Affix("效果提高 25%", [25], "炼金的");
+    const item = new Item();
+    item.affixes = [affix];
+    expect(affix.searchText).toContain("炼金的");
+    expect(affix.displayText).toBe("“炼金的” 效果提高 25%");
+    expect(item.affixTexts()).toEqual(["效果提高 25%"]);
+    expect(item.affixSignatures()).toEqual(["炼金的\u0000效果提高 25%"]);
+  });
+
   it("explicitModCount 为空时 craftAffixCount 退回词缀行数", () => {
     const item = new Item();
     item.affixes = [new Affix("a", []), new Affix("b", [])];

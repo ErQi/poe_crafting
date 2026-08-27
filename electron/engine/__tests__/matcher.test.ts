@@ -95,6 +95,28 @@ describe("同名词缀取最优值", () => {
   });
 });
 
+describe("词缀名称匹配", () => {
+  const flask = parseItemText(readSample("item_magic_flask_cn.txt"));
+
+  it("支持只按高级词缀名称匹配", () => {
+    const hit = matchItem(flask, [rule("炼金的")]).hits[0];
+    expect(hit.matched).toBe(true);
+    expect(hit.matchedAffix).toContain("“炼金的”");
+  });
+
+  it("名称和效果关键字必须属于同一条词缀，数值取对应效果行", () => {
+    const prefix = matchItem(flask, [rule("炼金的 效果提高", ">=", 25)]).hits[0];
+    expect(prefix.matched).toBe(true);
+    expect(prefix.actualValue).toBe(25);
+    expect(prefix.matchedAffix).toBe("“炼金的” 效果提高 25%");
+
+    const suffix = matchItem(flask, [rule("泥藓之 感电", ">=", 52)]).hits[0];
+    expect(suffix.matched).toBe(true);
+    expect(suffix.actualValue).toBe(52);
+    expect(matchItem(flask, [rule("炼金的 感电")]).success).toBe(false);
+  });
+});
+
 describe("规则组的 ANY / ALL 与 min_matches", () => {
   let item: Item;
   beforeEach(() => {

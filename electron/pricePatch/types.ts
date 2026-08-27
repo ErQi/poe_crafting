@@ -1,6 +1,7 @@
 export type PricePatchPendingAction = "apply" | "update" | "restore" | null;
 export type PricePatchPhase = "idle" | "waiting" | "applying" | "restoring" | "error";
 export type PriceQuoteSource = "efarm" | "poecurrency" | "poe-ninja";
+export type PriceLabelMode = "efarm" | "source";
 
 /** 数值越小优先级越高：易刷国服价 > 旧国服价源 > 国际服 poe.ninja。 */
 export function priceQuoteSourcePriority(source: PriceQuoteSource | undefined): number {
@@ -13,6 +14,11 @@ export function priceQuoteSourcePriority(source: PriceQuoteSource | undefined): 
 /** 国服价格使用普通中点；poe.ninja 兜底价格使用 ⁙，便于在游戏内直接识别来源。 */
 export function priceQuoteSeparator(source: PriceQuoteSource | undefined): " · " | " ⁙ " {
   return source === "poe-ninja" ? " ⁙ " : " · ";
+}
+
+/** 易刷模式使用其原生可清理的 [价格] 后缀；来源模式保留国服/国际服符号。 */
+export function priceQuoteSuffix(quote: Pick<PriceQuote, "display" | "source">, mode: PriceLabelMode): string {
+  return mode === "efarm" ? `[${quote.display}]` : `${priceQuoteSeparator(quote.source)}${quote.display}`;
 }
 
 export interface PriceQuote {
@@ -40,11 +46,13 @@ export interface AppliedFileFingerprint {
 }
 
 export interface PricePatchState {
-  schemaVersion: 2;
+  schemaVersion: 3;
   clientRoot: string;
   baselineId: string;
   applied: boolean;
   autoUpdate: boolean;
+  labelMode: PriceLabelMode;
+  appliedLabelMode: PriceLabelMode | "";
   pendingAction: PricePatchPendingAction;
   phase: PricePatchPhase;
   statusText: string;
@@ -67,6 +75,9 @@ export interface PricePatchView {
   client_root_locked: boolean;
   applied: boolean;
   auto_update: boolean;
+  label_mode: PriceLabelMode;
+  applied_label_mode: PriceLabelMode | "";
+  label_mode_dirty: boolean;
   pending: boolean;
   pending_action: PricePatchPendingAction;
   phase: PricePatchPhase;
@@ -80,11 +91,13 @@ export interface PricePatchView {
 
 export function defaultPricePatchState(): PricePatchState {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     clientRoot: "",
     baselineId: "",
     applied: false,
     autoUpdate: true,
+    labelMode: "efarm",
+    appliedLabelMode: "",
     pendingAction: null,
     phase: "idle",
     statusText: "尚未应用",
@@ -123,12 +136,20 @@ export function pricePatchStateFrom(value: unknown): PricePatchState {
         }))
         .filter((item) => item.relativePath && item.sha256)
     : [];
+  const labelMode: PriceLabelMode = raw.labelMode === "source" ? "source" : "efarm";
+  const appliedLabelMode: PriceLabelMode | "" = raw.appliedLabelMode === "efarm" || raw.appliedLabelMode === "source"
+    ? raw.appliedLabelMode
+    // 旧版本只有来源标识格式；升级后默认选择易刷模式，但必须等待用户重新应用。
+    : Boolean(raw.applied) ? "source" : "";
   return {
     ...fallback,
+    schemaVersion: 3,
     clientRoot: text(raw.clientRoot),
     baselineId: text(raw.baselineId),
     applied: Boolean(raw.applied),
     autoUpdate: raw.autoUpdate === undefined ? true : Boolean(raw.autoUpdate),
+    labelMode,
+    appliedLabelMode,
     pendingAction: pending === "apply" || pending === "update" || pending === "restore" ? pending : null,
     // 进程退出时不可能仍在写文件；重启后把瞬时状态折叠成可恢复状态。
     phase: phase === "waiting" ? "waiting" : phase === "error" ? "error" : "idle",
@@ -157,6 +178,9 @@ export function pricePatchView(state: PricePatchState): PricePatchView {
     client_root_locked: state.applied || state.pendingAction !== null || busy,
     applied: state.applied,
     auto_update: state.autoUpdate,
+    label_mode: state.labelMode,
+    applied_label_mode: state.appliedLabelMode,
+    label_mode_dirty: state.applied && state.labelMode !== state.appliedLabelMode,
     pending: state.pendingAction !== null,
     pending_action: state.pendingAction,
     phase: state.phase,

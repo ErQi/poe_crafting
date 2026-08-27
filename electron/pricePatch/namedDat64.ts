@@ -1,4 +1,4 @@
-import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
+import { priceQuoteSourcePriority, priceQuoteSuffix, type PriceLabelMode, type PriceQuote } from "./types";
 import { localizedNameKeys, stripPriceSuffix } from "./dat64";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
@@ -215,6 +215,7 @@ export function patchLocalizedNamedDat(
   localizedInput: Buffer,
   quotes: PriceQuote[],
   options: NamedDatOptions,
+  labelMode: PriceLabelMode = "source",
 ): PatchedNamedDat {
   const english = findLayout(englishInput, options.namePointerOffset + 8);
   const localized = findLayout(localizedInput, options.namePointerOffset + 8);
@@ -240,7 +241,7 @@ export function patchLocalizedNamedDat(
       .find(Boolean);
     const quote = preferredQuote(englishQuote, chineseQuote);
     if (!quote) continue;
-    updates.set(index, `${stripPriceSuffix(localizedName)}${priceQuoteSeparator(quote.source)}${quote.display}`);
+    updates.set(index, `${stripPriceSuffix(localizedName)}${priceQuoteSuffix(quote, labelMode)}`);
     matchedRows.push(index);
   }
   return {

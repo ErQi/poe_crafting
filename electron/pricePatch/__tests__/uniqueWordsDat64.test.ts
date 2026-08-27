@@ -79,9 +79,15 @@ describe("唯一装备 Words 标价", () => {
       { index: 1, englishName: "Uzaza's Mountain", localizedName: "乌扎萨的高山" },
     ]);
 
-    const patched = patchLocalizedUniqueWords(english, localized, layout, [quote("Uzaza's Mountain", "90c")]);
+    const patched = patchLocalizedUniqueWords(
+      english,
+      localized,
+      layout,
+      [quote("Uzaza's Mountain", "90c")],
+      "efarm",
+    );
     expect(patched.matchedRows).toEqual([1]);
-    expect(parseUniqueWordRows(english, patched.buffer, layout)[0].localizedName).toBe("乌扎萨的高山 ⁙ 90c");
+    expect(parseUniqueWordRows(english, patched.buffer, layout)[0].localizedName).toBe("乌扎萨的高山[90c]");
   });
 
   it("扩展到 Words 全部唯一物品词条，并以改名后的 Text2 匹配", () => {
@@ -141,7 +147,7 @@ describe("唯一装备 Words 标价", () => {
 
   it("清理历史价格后缀且不改非价格文本", () => {
     const localized = words([
-      { text: "Uzaza's Mountain", localized: "乌扎萨的高山 ⁙ 90c" },
+      { text: "Uzaza's Mountain", localized: "乌扎萨的高山[90c]" },
       { text: "Not a unique", localized: "保留文字 · 10c" },
     ]);
     const cleaned = cleanLocalizedUniqueWords(localized, uniqueLayout([0]));

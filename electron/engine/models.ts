@@ -50,15 +50,23 @@ function optionalInt(value: unknown): number | null {
 export class Affix {
   text: string;
   values: number[];
-  constructor(text: string, values: number[] = []) {
+  name: string;
+  constructor(text: string, values: number[] = [], name = "") {
     this.text = text;
     this.values = values;
+    this.name = name;
   }
   get firstValue(): number | null {
     return this.values[0] ?? null;
   }
   get secondValue(): number | null {
     return this.values.length > 1 ? this.values[1] : null;
+  }
+  get searchText(): string {
+    return this.name ? `${this.name}\n${this.text}` : this.text;
+  }
+  get displayText(): string {
+    return this.name ? `“${this.name}” ${this.text}` : this.text;
   }
 }
 
@@ -75,6 +83,10 @@ export class Item {
 
   affixTexts(): string[] {
     return this.affixes.map((a) => a.text);
+  }
+
+  affixSignatures(): string[] {
+    return this.affixes.map((a) => `${a.name}\u0000${a.text}`);
   }
 
   get craftAffixCount(): number {

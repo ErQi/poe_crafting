@@ -64,19 +64,23 @@ describe("扩展名称 DAT 标价", () => {
   it("按英文行名匹配并修改对应的国服名称", () => {
     const english = names(["Unused", "Craicic Chimeral"]);
     const localized = names(["未使用", "巨型深海奇美拉"]);
-    const patched = patchLocalizedNamedDat(english, localized, [quote("Craicic Chimeral", "3d")], {
-      namePointerOffset: NAME_OFFSET,
-    });
+    const patched = patchLocalizedNamedDat(
+      english,
+      localized,
+      [quote("Craicic Chimeral", "3d")],
+      { namePointerOffset: NAME_OFFSET },
+      "efarm",
+    );
     expect(patched.matchedRows).toEqual([1]);
     expect(parseNamedDatRows(patched.buffer, { namePointerOffset: NAME_OFFSET }).map((row) => row.name)).toEqual([
       "未使用",
-      "巨型深海奇美拉 ⁙ 3d",
+      "巨型深海奇美拉[3d]",
     ]);
   });
 
   it("外键限定行不会清理或修改其他怪物名", () => {
     const english = names(["Ordinary Monster", "Fenumal Plagued Arachnid"]);
-    const localized = names(["普通怪物 · 10c", "芬姆疫病蜘蛛 · 20c"]);
+    const localized = names(["普通怪物 · 10c", "芬姆疫病蜘蛛[20c]"]);
     const rows = referencedRowIndexes(references([1, 1, 1, 1]), 2);
     expect(rows).toEqual([1]);
     const cleaned = cleanLocalizedNamedDat(localized, { namePointerOffset: NAME_OFFSET, rowIndexes: rows });

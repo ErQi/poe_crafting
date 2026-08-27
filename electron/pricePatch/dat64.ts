@@ -1,4 +1,4 @@
-import { priceQuoteSeparator, priceQuoteSourcePriority, type PriceQuote } from "./types";
+import { priceQuoteSourcePriority, priceQuoteSuffix, type PriceLabelMode, type PriceQuote } from "./types";
 
 const DAT_MAGIC = Buffer.alloc(8, 0xbb);
 const NAME_POINTER_OFFSET = 32;
@@ -6,7 +6,7 @@ const MIN_RECORD_SIZE = NAME_POINTER_OFFSET + 8;
 const MAX_RECORD_SIZE = 2048;
 const MAX_ROWS = 1_000_000;
 const PRICE_SUFFIX =
-  /(?:【\s*\d+(?:\.\d+)?\s*[cde]\s*】|⌈\s*\d+(?:\.\d+)?\s*[cde]\s*⌋|\s+[·⁙]\s*\d+(?:\.\d+)?\s*[cde])\s*$/iu;
+  /(?:【\s*\d+(?:\.\d+)?\s*[cde]\s*】|⌈\s*\d+(?:\.\d+)?\s*[cde]\s*⌋|\[\s*(?:\d+(?:\.\d+)?|\.\d+)\s*[cde]\s*\]|\s+[·⁙]\s*\d+(?:\.\d+)?\s*[cde])\s*$/iu;
 
 export interface BaseItemRow {
   index: number;
@@ -204,6 +204,7 @@ export function patchLocalizedBaseItems(
   englishInput: Buffer,
   localizedInput: Buffer,
   quotes: PriceQuote[],
+  labelMode: PriceLabelMode = "source",
 ): PatchedBaseItemTypes {
   const english = parseBaseItemTypes(englishInput);
   const localized = parseBaseItemTypes(localizedInput);
@@ -235,7 +236,7 @@ export function patchLocalizedBaseItems(
     );
     if (!quote) continue;
     const baselineName = stripPriceSuffix(localizedRow.name);
-    updates.set(localizedRow.index, `${baselineName}${priceQuoteSeparator(quote.source)}${quote.display}`);
+    updates.set(localizedRow.index, `${baselineName}${priceQuoteSuffix(quote, labelMode)}`);
     matchedIds.push(id);
   }
   return { buffer: appendNames(localized, updates), matchedCount: matchedIds.length, matchedIds };

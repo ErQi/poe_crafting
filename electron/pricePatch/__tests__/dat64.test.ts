@@ -113,26 +113,41 @@ describe("BaseItemTypes 基线重建", () => {
     expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("神圣石 ⁙ 1d");
   });
 
+  it("易刷模式使用查价器可识别的方括号价格后缀", () => {
+    const english = dat([{ id: "Metadata/Divine", name: "Divine Orb" }]);
+    const localized = dat([{ id: "Metadata/Divine", name: "神圣石" }]);
+    const patched = patchLocalizedBaseItems(
+      english,
+      localized,
+      [quote("Divine Orb", "神圣石", "1.2d", "efarm")],
+      "efarm",
+    );
+
+    expect(parseBaseItemTypes(patched.buffer).rows[0].name).toBe("神圣石[1.2d]");
+  });
+
   it("建立新版本基线时可清理本功能留下的价格后缀", () => {
     const localized = dat([
       { id: "a", name: "神圣石【1d】" },
       { id: "b", name: "崇高石⌈6.6c⌋" },
       { id: "c", name: "混沌石 · 1c" },
       { id: "d", name: "机会石 ⁙ 2c" },
-      { id: "e", name: "普通物品" },
+      { id: "e", name: "点金石[.5c]" },
+      { id: "f", name: "普通物品" },
     ]);
     const cleaned = cleanLocalizedBaseItems(localized);
-    expect(cleaned.changedCount).toBe(4);
+    expect(cleaned.changedCount).toBe(5);
     expect(parseBaseItemTypes(cleaned.buffer).rows.map((row) => row.name)).toEqual([
       "神圣石",
       "崇高石",
       "混沌石",
       "机会石",
+      "点金石",
       "普通物品",
     ]);
   });
 
-  it("可严格识别另一份 POE Tools 从同一基线生成的价格版本", () => {
+  it("可严格识别从同一基线生成的易刷格式价格版本", () => {
     const baseline = dat([
       { id: "Metadata/Chaos", name: "混沌石" },
       { id: "Metadata/Divine", name: "神圣石" },
@@ -140,7 +155,7 @@ describe("BaseItemTypes 基线重建", () => {
     const candidate = patchLocalizedBaseItems(baseline, baseline, [
       quote("混沌石", "混沌石", "1c"),
       quote("神圣石", "神圣石", "125c"),
-    ]).buffer;
+    ], "efarm").buffer;
 
     expect(isPriceSuffixOnlyBaseItemVariant(baseline, candidate)).toBe(true);
 

@@ -77,6 +77,19 @@ describe("parseItemText 基本字段", () => {
     expect(item.craftAffixCount).toBe(2);
   });
 
+  it("读取高级词缀说明中的前后缀名称，并关联同一词缀的所有效果行", () => {
+    const item = parseItemText(readSample("item_magic_flask_cn.txt"));
+    const alchemist = item.affixes.filter((a) => a.name === "炼金的");
+    const moss = item.affixes.filter((a) => a.name === "泥藓之");
+
+    expect(alchemist.map((a) => a.text)).toEqual(["生效时间缩短 25(27-23)%", "效果提高 25%"]);
+    expect(moss.map((a) => a.text)).toEqual(["生效期间，有 52(51-55)% 几率避免被感电"]);
+    expect(item.affixes.find((a) => a.text === "效果提高 70%")?.name).toBe("");
+    expect(item.affixes.some((a) => a.text.includes("点击右键"))).toBe(false);
+    expect(item.itemLevel).toBe(87);
+    expect(item.craftAffixCount).toBe(2);
+  });
+
   it("影响力标记与出售绑定信息不计入词缀", () => {
     const item = parseItemText(
       [

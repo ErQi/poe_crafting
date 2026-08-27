@@ -409,6 +409,7 @@ async function removeStep(id) {
         @apply="applyCall(() => call('price_patch_apply'))"
         @restore="applyCall(() => call('price_patch_restore'))"
         @auto="(enabled) => applyCall(() => call('price_patch_set_auto', enabled))"
+        @mode="(value) => applyCall(() => call('price_patch_set_mode', value))"
         @client-root="setPricePatchClientRoot"
         @choose-client-root="choosePricePatchClientRoot"
       />

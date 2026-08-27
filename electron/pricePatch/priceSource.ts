@@ -78,7 +78,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const NINJA_REQUEST_CONCURRENCY = 6;
 const MAX_EFARM_ENCODED_BYTES = 4 * 1024 * 1024;
 const MAX_EFARM_DECODED_BYTES = 64 * 1024 * 1024;
-const USER_AGENT = "POE-Tools/0.4.6 price-patch";
+const USER_AGENT = "POE-Tools/0.4.7 price-patch";
 
 interface FetchHeaders {
   get(name: string): string | null;

@@ -30,6 +30,8 @@ const SKIP_LINE_PREFIXES = [
   "物品稀有度:",
   "等级需求:",
   "出售获得通货:",
+  "点击右键以喝下药剂",
+  "Right click to drink",
 ];
 const SKIP_EXACT = new Set([
   "已鉴定",
@@ -59,7 +61,7 @@ const BASE_STAT_LINE_RE =
   /^(?:护甲|闪避|闪避值|能量护盾|能量盾|物理伤害|元素伤害|暴击率|每秒攻击次数|武器范围|格挡几率|法术格挡|品质|有机物|无机物|Armour|Evasion|Energy Shield|Physical Damage|Critical Strike Chance|Attacks per Second|Weapon Range)\s*:/;
 
 function normalizeMetadataLine(line: string): string {
-  const s = line.trim().replace(/：/g, ":");
+  const s = line.trim().replace(/^#+\s*/, "").replace(/：/g, ":");
   if (!s.includes(":")) return s;
   const [label, ...rest] = s.split(":");
   return `${label.replace(/\s+/g, "")}:${rest.join(":").replace(/^\s+/, "")}`;
@@ -82,6 +84,11 @@ function isExplicitModifierDescriptor(line: string): boolean {
   return ["前缀词缀", "后缀词缀", "前缀属性", "后缀属性", "Prefix Modifier", "Suffix Modifier"].some((m) =>
     line.includes(m),
   );
+}
+
+function explicitModifierName(line: string): string {
+  if (!isExplicitModifierDescriptor(line)) return "";
+  return line.match(/[“"]([^“”"]+)[”"]/)?.[1]?.trim() ?? "";
 }
 
 function taggedModKind(line: string): "implicit" | "enchant" | null {
@@ -254,15 +261,20 @@ export function parseItemText(text: string): Item {
   if (item.flags.includes("unidentified")) return item;
 
   const affixBySection: string[][] = [];
+  const affixEntries: { line: string; name: string }[] = [];
   sections.forEach((sec, idx) => {
     if (idx === 0) return;
     const first = sec.map((x) => x.trim()).find(Boolean) || "";
     const normalizedFirst = normalizeMetadataLine(first);
     if (["需求:", "插槽:", "品质:", "堆叠数量:", "地图等级:"].some((p) => normalizedFirst.startsWith(p))) return;
-    if (normalizedFirst.startsWith("物品等级:")) return;
     const secAffixes: string[] = [];
+    let currentModifierName = "";
     for (const ln of sec) {
       const s = ln.trim();
+      if (isModifierDescriptorLine(s)) {
+        currentModifierName = explicitModifierName(s);
+        continue;
+      }
       if (!isAffixLine(s)) continue;
       if (s.length > 80 && !extractNumbers(s).length && !s.includes("+") && !s.includes("%")) continue;
       if (SKIP_EXACT.has(s)) {
@@ -270,16 +282,19 @@ export function parseItemText(text: string): Item {
         continue;
       }
       secAffixes.push(s);
+      const name = taggedModKind(s) == null ? currentModifierName : "";
+      affixEntries.push({ line: s, name });
     }
     if (secAffixes.length) affixBySection.push(secAffixes);
   });
 
   const seen = new Set<string>();
-  for (const line of affixBySection.flat()) {
-    if (seen.has(line)) continue;
-    seen.add(line);
+  for (const { line, name } of affixEntries) {
+    const key = `${name}\u0000${line}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
     const clean = stripAffixTags(line);
-    item.affixes.push(new Affix(clean, extractNumbers(clean)));
+    item.affixes.push(new Affix(clean, extractNumbers(clean), name));
   }
   if (!item.rarity && item.itemLevel != null) item.rarity = "普通";
   if (item.explicitModCount == null) {
@@ -304,7 +319,7 @@ export function formatItemPreview(item: Item): string {
   else {
     for (const a of item.affixes) {
       const val = a.values.length ? `  [values=${JSON.stringify(a.values)}]` : "";
-      lines.push(`  • ${a.text}${val}`);
+      lines.push(`  • ${a.displayText}${val}`);
     }
   }
   return lines.join("\n");

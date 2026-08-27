@@ -5,11 +5,14 @@ const props = defineProps({
   state: { type: Object, required: true },
   runtime: { type: Object, required: true },
 });
-const emit = defineEmits(["apply", "restore", "auto", "client-root", "choose-client-root"]);
+const emit = defineEmits(["apply", "restore", "auto", "mode", "client-root", "choose-client-root"]);
 
 const patch = computed(() => props.runtime.price_patch || props.state.price_patch || {});
 const applied = computed(() => Boolean(patch.value.applied));
 const busy = computed(() => Boolean(patch.value.busy));
+const pending = computed(() => Boolean(patch.value.pending));
+const labelMode = computed(() => patch.value.label_mode === "source" ? "source" : "efarm");
+const labelModeDirty = computed(() => Boolean(patch.value.label_mode_dirty));
 const clientRootLocked = computed(() => Boolean(patch.value.client_root_locked));
 const clientRootDraft = ref("");
 const clientRootDirty = ref(false);
@@ -51,6 +54,10 @@ function displayTime(value) {
     hour12: false,
   }).format(date);
 }
+
+function labelModeName(value) {
+  return value === "source" ? "来源标识模式" : "易刷模式";
+}
 </script>
 
 <template>
@@ -71,12 +78,52 @@ function displayTime(value) {
         </div>
         <div>
           <span>符号说明</span>
-          <p><b>·</b> 表示国服价格（易刷或国服备用源）；<b>⁙</b> 表示非国服价格（poe.ninja 兜底）。</p>
+          <p>来源标识模式下，<b>·</b> 表示国服价格，<b>⁙</b> 表示 poe.ninja 非国服兜底价。</p>
         </div>
         <div>
           <span>显示规则</span>
           <p>超过 1 枚神圣石的 c 价会按同一来源汇率换算为 d；同名变体显示样本量最高的代表价。</p>
         </div>
+      </div>
+
+      <div class="mode-block">
+        <div class="mode-heading">
+          <b>标价格式</b>
+          <small>切换只保存设置，点击应用后才修改客户端。</small>
+        </div>
+        <div class="mode-options">
+          <label :class="{ on: labelMode === 'efarm' }">
+            <input
+              type="radio"
+              name="price-label-mode"
+              value="efarm"
+              :checked="labelMode === 'efarm'"
+              :disabled="busy || pending"
+              @change="$emit('mode', 'efarm')"
+            />
+            <span>
+              <b>易刷模式 <em>默认</em></b>
+              <small>物品名[1.2d]，兼容易刷快捷查价</small>
+            </span>
+          </label>
+          <label :class="{ on: labelMode === 'source' }">
+            <input
+              type="radio"
+              name="price-label-mode"
+              value="source"
+              :checked="labelMode === 'source'"
+              :disabled="busy || pending"
+              @change="$emit('mode', 'source')"
+            />
+            <span>
+              <b>来源标识模式</b>
+              <small>国服 · 1.2d / 非国服 ⁙ 1.2d</small>
+            </span>
+          </label>
+        </div>
+        <small v-if="labelModeDirty" class="mode-pending">
+          当前客户端仍为{{ labelModeName(patch.applied_label_mode) }}，点击“重新应用”后切换。
+        </small>
       </div>
 
       <div class="status-block">
@@ -137,9 +184,9 @@ function displayTime(value) {
           type="button"
           class="btn ok primary"
           :disabled="busy"
-          @click="$emit('apply')"
-        >
-          {{ busy ? "正在处理…" : "立即更新价格" }}
+        @click="$emit('apply')"
+      >
+          {{ busy ? "正在处理…" : labelModeDirty ? `重新应用${labelModeName(labelMode)}` : "立即更新价格" }}
         </button>
         <button
           type="button"
@@ -206,6 +253,40 @@ function displayTime(value) {
 .price-help span { color: var(--text); font-weight: 600; }
 .price-help p { margin: 0; line-height: 1.55; }
 .price-help b { color: var(--accent); font-size: 16px; }
+.mode-block {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--row);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.mode-heading { display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }
+.mode-heading > small { color: var(--muted); }
+.mode-options { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.mode-options > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.mode-options > label.on { border-color: var(--accent-border); background: var(--raised); }
+.mode-options input { margin-top: 3px; accent-color: var(--accent); }
+.mode-options span { display: grid; gap: 2px; }
+.mode-options small { color: var(--muted); }
+.mode-options em {
+  margin-left: 4px;
+  padding: 1px 5px;
+  color: #b7e4c7;
+  background: #203d31;
+  border-radius: 8px;
+  font-size: 10px;
+  font-style: normal;
+}
+.mode-pending { color: #e5b567; }
 .badge {
   flex: 0 0 auto;
   padding: 4px 10px;
@@ -259,6 +340,7 @@ function displayTime(value) {
 .auto-row small { color: var(--muted); }
 .auto-row input { width: 18px; height: 18px; accent-color: var(--accent); }
 @media (max-width: 680px) {
+  .mode-options { grid-template-columns: 1fr; }
   .client-path-row { grid-template-columns: 1fr 1fr; }
   .client-path-row .ctrl { grid-column: 1 / -1; }
 }

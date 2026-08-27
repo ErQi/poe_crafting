@@ -7,6 +7,7 @@ import {
   defaultPricePatchState,
   pricePatchStateFrom,
   pricePatchView,
+  type PriceLabelMode,
   type PricePatchPendingAction,
   type PricePatchState,
   type PricePatchView,
@@ -23,6 +24,10 @@ function time(value: string): number {
 
 function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function labelModeName(mode: PriceLabelMode): string {
+  return mode === "efarm" ? "易刷模式" : "来源标识模式";
 }
 
 export class PricePatchController {
@@ -58,7 +63,9 @@ export class PricePatchController {
       this.persist();
     } else if (this.state.applied && this.state.phase !== "error") {
       this.state.phase = "idle";
-      this.state.statusText = "已应用";
+      this.state.statusText = this.state.labelMode === this.state.appliedLabelMode
+        ? "已应用"
+        : `${labelModeName(this.state.labelMode)}已选择，点击重新应用后生效`;
     }
     if (!this.timer) this.timer = setInterval(() => void this.tick(), TICK_MS);
     setTimeout(() => void this.tick(), 1000);
@@ -128,6 +135,10 @@ export class PricePatchController {
   }
 
   private async runApply(action: "apply" | "update"): Promise<void> {
+    // 自动更新沿用客户端当前格式；只有用户点击应用才提交刚选择的新模式。
+    const appliedLabelMode = action === "update" && this.state.appliedLabelMode
+      ? this.state.appliedLabelMode
+      : this.state.labelMode;
     this.patch({
       pendingAction: action,
       phase: "applying",
@@ -139,15 +150,19 @@ export class PricePatchController {
       const checkedAt = new Date().toISOString();
       this.patch({ clientRoot, lastCheckedAt: checkedAt }, false);
       const prices = await this.source.fetch();
-      const result = await this.patcher.apply(clientRoot, this.state, prices);
+      const result = await this.patcher.apply(clientRoot, this.state, prices, appliedLabelMode);
       const completedAt = new Date().toISOString();
+      const labelModeDirty = this.state.labelMode !== appliedLabelMode;
       this.patch({
         clientRoot,
         baselineId: result.baselineId,
         applied: true,
         pendingAction: null,
         phase: "idle",
-        statusText: result.skipped ? "已应用，当前价格无需改写" : `已应用，已标价 ${result.matchedCount} 个物品`,
+        statusText: labelModeDirty
+          ? `价格已更新；${labelModeName(this.state.labelMode)}待重新应用`
+          : result.skipped ? "已应用，当前价格无需改写" : `已应用，已标价 ${result.matchedCount} 个物品`,
+        appliedLabelMode,
         lastUpdatedAt: completedAt,
         lastCheckedAt: completedAt,
         sourceUpdatedAt: prices.sourceUpdatedAt,
@@ -188,6 +203,7 @@ export class PricePatchController {
         clientRoot,
         baselineId: result.baselineId,
         applied: false,
+        appliedLabelMode: "",
         pendingAction: null,
         phase: "idle",
         statusText: result.restored ? "已取消补丁，客户端已恢复原版" : "未应用标价补丁",
@@ -251,9 +267,33 @@ export class PricePatchController {
       autoUpdate: enabled,
       pendingAction,
       phase: pendingAction ? "waiting" : this.state.phase === "waiting" ? "idle" : this.state.phase,
-      statusText: pendingAction ? this.state.statusText : this.state.applied ? "已应用" : "尚未应用",
+      statusText: pendingAction
+        ? this.state.statusText
+        : this.state.applied
+          ? this.state.labelMode === this.state.appliedLabelMode
+            ? "已应用"
+            : `${labelModeName(this.state.labelMode)}已选择，点击重新应用后生效`
+          : "尚未应用",
     });
     if (enabled) setTimeout(() => void this.tick(), 0);
+    return { ok: true, price_patch: this.view() };
+  }
+
+  setLabelMode(value: string): Record<string, unknown> {
+    if (this.operation) return { ok: false, error: "标价补丁正在处理中", price_patch: this.view() };
+    if (this.state.pendingAction) {
+      return { ok: false, error: "已有等待执行的标价操作，完成后再切换模式", price_patch: this.view() };
+    }
+    const labelMode: PriceLabelMode = value === "source" ? "source" : "efarm";
+    this.patch({
+      labelMode,
+      statusText: this.state.applied
+        ? labelMode === this.state.appliedLabelMode
+          ? "已应用"
+          : `${labelModeName(labelMode)}已选择，点击重新应用后生效`
+        : `已选择${labelModeName(labelMode)}，尚未应用`,
+      error: "",
+    });
     return { ok: true, price_patch: this.view() };
   }
 
@@ -273,6 +313,7 @@ export class PricePatchController {
       this.patch({
         clientRoot,
         baselineId: changed ? "" : this.state.baselineId,
+        appliedLabelMode: changed ? "" : this.state.appliedLabelMode,
         phase: "idle",
         statusText: clientRoot ? "客户端路径已保存，尚未应用" : "已改为自动检测客户端，尚未应用",
         lastUpdatedAt: changed ? "" : this.state.lastUpdatedAt,
