@@ -565,6 +565,7 @@ export function applyNumericSettings(target: AppSettings, data: Record<string, u
 
 export class AppSettings {
   windowTitleKeywords = ["Path of Exile", "流放之路"];
+  backgroundInput = true;
   hotkeyStop = "f8";
   hotkeyStart = "f7";
   maxAttempts = 200;
@@ -584,6 +585,7 @@ export class AppSettings {
   toDict() {
     return {
       window_title_keywords: this.windowTitleKeywords,
+      background_input: this.backgroundInput,
       hotkey_stop: this.hotkeyStop,
       hotkey_start: this.hotkeyStart,
       max_attempts: this.maxAttempts,
@@ -615,6 +617,10 @@ export class AppSettings {
     ];
     const bag = s as unknown as Record<string, unknown>;
     if (Array.isArray(data.window_title_keywords)) s.windowTitleKeywords = data.window_title_keywords.map(String);
+    if ("background_input" in data) {
+      const value = data.background_input;
+      s.backgroundInput = !(value === false || value === 0 || String(value).trim().toLowerCase() === "false");
+    }
     for (const [key, jsonKey] of strings) {
       if (jsonKey in data) bag[key] = String(data[jsonKey]);
     }

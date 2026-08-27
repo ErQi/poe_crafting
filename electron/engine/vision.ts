@@ -8,10 +8,12 @@ import {
   findGameWindow,
   getCursorHotspot,
   getCursorPosition,
+  isMinimizedWindow,
   type Hwnd,
   type WindowInfo,
   windowMetrics,
 } from "./win32";
+import { captureWindowWgcBgra } from "./wgcCapture";
 
 export type { Mat };
 
@@ -150,9 +152,18 @@ function scaleExcludes(
   return regions.map(([l, t, r, b]) => [l * sx, t * sy, r * sx, b * sy]);
 }
 
-export function bgraToBgr(bgra: Buffer, width: number, height: number): Mat {
+export function bgraToBgr(
+  bgra: Buffer,
+  width: number,
+  height: number,
+  sourceWidth = width,
+  sourceHeight = height,
+): Mat {
   if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1) {
     throw new VisionError("截图像素尺寸无效");
+  }
+  if (!Number.isInteger(sourceWidth) || !Number.isInteger(sourceHeight) || sourceWidth < 1 || sourceHeight < 1) {
+    throw new VisionError("截图源尺寸无效");
   }
   if (bgra.length < width * height * 4) throw new VisionError("截图像素缓冲大小不符");
   const api = requireCv();
@@ -162,7 +173,7 @@ export function bgraToBgr(bgra: Buffer, width: number, height: number): Mat {
     const bgr = new api.Mat();
     api.cvtColor(src, bgr, api.COLOR_BGRA2BGR);
     src.delete();
-    return attachSrcScale(bgr, fitted.scaleX, fitted.scaleY);
+    return attachSrcScale(bgr, fitted.scaleX * (width / sourceWidth), fitted.scaleY * (height / sourceHeight));
   } catch (e) {
     throw new VisionError(`图像转换失败: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -398,6 +409,7 @@ export class VisionService {
   private posCache = new Map<string, MatchHit>();
   private windowHeight = 0;
   private windowHwnd: Hwnd | null = null;
+  private lastCapture = { backend: "none", detail: "尚未捕获" };
 
   constructor(templatesDir: string, threshold = 0.82, searchScale = 0.75, scales?: number[]) {
     this.templatesDir = resolvePath(templatesDir);
@@ -488,17 +500,43 @@ export class VisionService {
     this.windowHwnd = window.hwnd;
   }
 
-  grabWindow(window: WindowInfo): Mat {
+  captureInfo(): { backend: string; detail: string } {
+    return { ...this.lastCapture };
+  }
+
+  async grabWindow(window: WindowInfo): Promise<Mat> {
     this.noteWindow(window);
+    if (isMinimizedWindow(window.hwnd)) {
+      this.lastCapture = { backend: "none", detail: "游戏窗口已最小化" };
+      throw new VisionError("游戏窗口已最小化；WGC 遮挡捕获不支持最小化窗口");
+    }
     try {
-      const frame = captureWindow(window);
+      const captured = await captureWindowWgcBgra(window);
+      const frame = bgraToBgr(
+        captured.bgra,
+        captured.width,
+        captured.height,
+        captured.sourceWidth,
+        captured.sourceHeight,
+      );
+      this.lastCapture = { backend: "wgc", detail: `${captured.width}x${captured.height} · ${captured.sourceId}` };
       const { x: sx, y: sy } = matScale(frame);
+      console.log("[vision] WGC frame", frame.cols, "x", frame.rows, "srcScale", sx.toFixed(3), sy.toFixed(3));
       if (sx < 0.999 || sy < 0.999) {
         console.log("[vision] wasm frame", frame.cols, "x", frame.rows, "srcScale", sx.toFixed(3));
       }
       return frame;
-    } catch (e) {
-      throw e instanceof VisionError ? e : new VisionError(`截屏失败: ${e instanceof Error ? e.message : String(e)}`);
+    } catch (wgcError) {
+      const wgcReason = visionErrText(wgcError);
+      console.warn(`[vision] WGC 捕获失败，回退 GDI: ${wgcReason}`);
+      try {
+        const frame = captureWindow(window);
+        this.lastCapture = { backend: "gdi", detail: `WGC 失败: ${wgcReason}` };
+        return frame;
+      } catch (gdiError) {
+        this.lastCapture = { backend: "none", detail: `WGC: ${wgcReason}; GDI: ${visionErrText(gdiError)}` };
+        throw new VisionError(`截屏失败（WGC: ${wgcReason}；GDI: ${visionErrText(gdiError)}）`);
+      }
     }
   }
 
@@ -563,16 +601,16 @@ export class VisionService {
     }
   }
 
-  findInWindow(
+  async findInWindow(
     window: WindowInfo,
     templateName: string,
     threshold?: number,
     frameBgr?: Mat,
     frameGray?: Mat,
     excludeRegions?: [number, number, number, number][],
-  ): MatchHit | null {
+  ): Promise<MatchHit | null> {
     const own = !frameBgr;
-    const frame = frameBgr ?? this.grabWindow(window);
+    const frame = frameBgr ?? (await this.grabWindow(window));
     try {
       return this.matchInFrame(window, frame, templateName, threshold, frameGray, undefined, true, excludeRegions);
     } finally {
@@ -588,20 +626,44 @@ export class VisionService {
     this.posCache.set(name, hit);
   }
 
-  testMatchReport(keywords: string[], names: string[], threshold?: number) {
+  async testMatchReport(keywords: string[], names: string[], threshold?: number) {
     const win = findGameWindow(keywords);
-    if (!win) return names.map((name) => ({ template: name, ok: false, error: "未找到流放之路窗口" }));
+    if (!win) {
+      return names.map((name) => ({
+        template: name,
+        ok: false,
+        error: "未找到流放之路窗口",
+        capture_backend: "none",
+        capture_detail: "未找到窗口",
+      }));
+    }
     let frame: Mat;
     try {
-      frame = this.grabWindow(win);
+      frame = await this.grabWindow(win);
     } catch (e) {
-      return names.map((name) => ({ template: name, ok: false, error: `截屏失败: ${e}` }));
+      const capture = this.captureInfo();
+      return names.map((name) => ({
+        template: name,
+        ok: false,
+        error: `截屏失败: ${visionErrText(e)}`,
+        capture_backend: capture.backend,
+        capture_detail: capture.detail,
+      }));
     }
+    const capture = this.captureInfo();
     const gray = toGray(frame);
     const thr = threshold ?? this.threshold;
     const results = names.map((name) => {
       const file = this.templatePath(name);
-      if (!fs.existsSync(file)) return { template: name, ok: false, error: `文件不存在: ${path.basename(file)}` };
+      if (!fs.existsSync(file)) {
+        return {
+          template: name,
+          ok: false,
+          error: `文件不存在: ${path.basename(file)}`,
+          capture_backend: capture.backend,
+          capture_detail: capture.detail,
+        };
+      }
       try {
         const hit = this.matchInFrame(win, frame, name, thr, gray, undefined, true);
         if (!hit) {
@@ -616,7 +678,14 @@ export class VisionService {
             this.getTemplateMask(name),
             this.searchScale,
           );
-          return { template: name, ok: false, score: raw ? round4(raw[0]) : 0, error: `低于阈值 ${thr}` };
+          return {
+            template: name,
+            ok: false,
+            score: raw ? round4(raw[0]) : 0,
+            error: `低于阈值 ${thr}`,
+            capture_backend: capture.backend,
+            capture_detail: capture.detail,
+          };
         }
         return {
           template: name,
@@ -624,9 +693,17 @@ export class VisionService {
           score: round4(hit.score),
           client_xy: [hit.clientX, hit.clientY],
           screen_xy: [hit.screenX, hit.screenY],
+          capture_backend: capture.backend,
+          capture_detail: capture.detail,
         };
       } catch (e) {
-        return { template: name, ok: false, error: String(e) };
+        return {
+          template: name,
+          ok: false,
+          error: visionErrText(e),
+          capture_backend: capture.backend,
+          capture_detail: capture.detail,
+        };
       }
     });
     gray.delete();

@@ -1,7 +1,7 @@
 {
   "name": "poe-crafting",
   "private": true,
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "POE Tools",
   "productName": "POE Tools",
   "author": "Faith",
@@ -15,6 +15,7 @@
     "dev": "npm run build:patcher && node scripts/dev.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "probe:wgc": "electron scripts/probe-wgc.cjs",
     "typecheck": "tsc --noEmit",
     "start": "npm run build:patcher && npm run build && electron .",
     "postinstall": "npm install --prefix web"

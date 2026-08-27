@@ -3,14 +3,18 @@ import { clearClipboard, getClipboard, normalizeClipboardText, waitClipboardChan
 import { currencyLabel, currencyStackCount } from "./currencies";
 import {
   clickScreen,
+  clickWindowClient,
   findGameWindow,
   focusGameWindow,
   focusWindow,
   getCursorHandle,
   getCursorPosition,
   hotkey,
+  isMinimizedWindow,
   moveScreen,
   peekWindow,
+  postWindowMouseMove,
+  sendWindowCopyWithThreadState,
   type WindowInfo,
   windowMetrics,
 } from "./input";
@@ -55,6 +59,7 @@ const COPY_TIMEOUT_MS = 280;
 const COPY_SLICE_MS = 40;
 const COPY_POLL_MS = 2;
 const CURSOR_MS = 4;
+const BACKGROUND_INPUT_SETTLE_MS = 50;
 const APPLY_CONFIRM_TRIES = 3;
 const PUT_BACK_TRIES = 3;
 const HOLD_CHECK_MS = 80;
@@ -169,6 +174,8 @@ export class CraftAutomation {
   private parseFailures = 0;
   private copyTimeoutMs = COPY_TIMEOUT_MS;
   private copyPollMs = COPY_POLL_MS;
+  private backgroundInput = true;
+  private inputWindow: WindowInfo | null = null;
 
   constructor(onLog?: (m: string) => void, onStatus?: (s: RunStatus) => void) {
     this.onLog = onLog ?? (() => undefined);
@@ -210,6 +217,8 @@ export class CraftAutomation {
     this.active = true;
     this.parseFailures = 0;
     this.currencyOnCursor = false;
+    this.backgroundInput = config.settings.backgroundInput;
+    this.inputWindow = null;
     this.update({ running: true, message: "启动中" });
     void this.runSafe(config);
   }
@@ -226,6 +235,7 @@ export class CraftAutomation {
       }
       this.disarmCurrency();
       this.resetPointerBaselines();
+      this.inputWindow = null;
       this.active = false;
     }
   }
@@ -240,6 +250,7 @@ export class CraftAutomation {
     console.log("[craft] run began", config.craftMode);
     await initVision();
     const s = config.settings;
+    this.backgroundInput = s.backgroundInput;
     this.applyClipboardTiming(s);
     const scales = config.craftMode === CraftMode.WORKFLOW ? [1, 0.9, 1.1, 0.8, 1.2] : [1];
     const vision = new VisionService(s.templatesDir, s.templateThreshold, 0.7, scales);
@@ -290,6 +301,7 @@ export class CraftAutomation {
   private syncGameWindow(win: WindowInfo): [WindowInfo | null, boolean, string] {
     const next = peekWindow(win.hwnd, win.title);
     if (!next) return [null, false, "游戏窗口丢失"];
+    this.inputWindow = next;
     const a = windowMetrics(win);
     const b = windowMetrics(next);
     const moved =
@@ -298,6 +310,18 @@ export class CraftAutomation {
       Math.abs(a.width - b.width) > WINDOW_MOVE_PX ||
       Math.abs(a.height - b.height) > WINDOW_MOVE_PX;
     return moved ? [next, true, ""] : [win, false, ""];
+  }
+
+  private async acquireGameWindow(keywords: string[], retries: number): Promise<[WindowInfo | null, boolean]> {
+    if (this.backgroundInput) {
+      const win = findGameWindow(keywords);
+      if (win && isMinimizedWindow(win.hwnd)) throw new VisionError("后台模式不支持最小化游戏窗口");
+      this.inputWindow = win;
+      return [win, false];
+    }
+    const result = await focusGameWindow(keywords, retries);
+    this.inputWindow = result[0];
+    return result;
   }
 
   private async relocateWorkflow(
@@ -312,7 +336,7 @@ export class CraftAutomation {
     this.lastHoverHit = null;
     this.disarmCurrency();
     this.resetPointerBaselines();
-    const failure = this.locateTemplates(vision, win, s, ["item_slot"]);
+    const failure = await this.locateTemplates(vision, win, s, ["item_slot"]);
     if (failure) return `窗口移动后目标装备重定位失败：${failure.message}`;
     const itemHit = vision.getCachedPosition("item_slot");
     if (itemHit) {
@@ -351,16 +375,22 @@ export class CraftAutomation {
       return;
     }
     const currencyNames = workflow.enabledSteps().map((st) => st.currencyTemplate).filter((n, i, a) => a.indexOf(n) === i);
-    const [found, focused] = await focusGameWindow(s.windowTitleKeywords, 4);
+    const [found, focused] = await this.acquireGameWindow(s.windowTitleKeywords, 4);
     if (!found) {
       this.finish(StopReason.WINDOW_NOT_FOUND, "未找到流放之路窗口");
       return;
     }
     const win = found;
-    this.log(focused ? `已切换到游戏: ${win.title} (${windowMetrics(win).width}x${windowMetrics(win).height})` : `已定位窗口: ${win.title}（未完全置前，继续运行）`);
+    this.log(
+      this.backgroundInput
+        ? `后台模式已锁定窗口: ${win.title} (${windowMetrics(win).width}x${windowMetrics(win).height})`
+        : focused
+          ? `已切换到游戏: ${win.title} (${windowMetrics(win).width}x${windowMetrics(win).height})`
+          : `已定位窗口: ${win.title}（未完全置前，继续运行）`,
+    );
     this.log(`开始多步骤流程「${workflow.name}」 | 启用步骤=${workflow.enabledSteps().length} | 最大动作数=${s.maxAttempts}`);
     this.log("首次定位目标装备…");
-    const located = this.locateTemplates(vision, win, s, ["item_slot"]);
+    const located = await this.locateTemplates(vision, win, s, ["item_slot"]);
     if (located) {
       this.finish(located.reason, located.message);
       return;
@@ -396,7 +426,15 @@ export class CraftAutomation {
       return;
     }
     this.update({ lastItem: initialItem });
-    this.log(this.captureItemPointerBaseline(vision) ? "已采集装备格普通指针基线" : "未能采集装备格指针基线，未确认通货前不会左键");
+    if (this.backgroundInput) {
+      this.log("后台输入已启用：点击只使用已匹配的客户区坐标，实体鼠标不参与");
+    } else {
+      this.log(
+        this.captureItemPointerBaseline(vision)
+          ? "已采集装备格普通指针基线"
+          : "未能采集装备格指针基线，未确认通货前不会左键",
+      );
+    }
     this.log(`启动读取成功：稀有度=${initialItem.rarity || "-"} | 显式词缀=${initialItem.craftAffixCount}`);
 
     const matching = workflow.enabledSteps().filter((st) => st.expectedRarity && st.expectedRarity.trim() === initialItem!.rarity.trim());
@@ -607,15 +645,21 @@ export class CraftAutomation {
       this.finish(StopReason.TEMPLATE_NOT_FOUND, `缺少模板文件: ${missing.join(", ")}`);
       return;
     }
-    const [found, focused] = await focusGameWindow(s.windowTitleKeywords, 4);
+    const [found, focused] = await this.acquireGameWindow(s.windowTitleKeywords, 4);
     if (!found) {
       this.finish(StopReason.WINDOW_NOT_FOUND, "未找到流放之路窗口");
       return;
     }
     let win = found;
-    this.log(focused ? `已切换到游戏: ${win.title}` : `已定位窗口: ${win.title}（未完全置前，继续运行）`);
+    this.log(
+      this.backgroundInput
+        ? `后台模式已锁定窗口: ${win.title}`
+        : focused
+          ? `已切换到游戏: ${win.title}`
+          : `已定位窗口: ${win.title}（未完全置前，继续运行）`,
+    );
     this.log("首次定位模板坐标…");
-    const located = this.locateTemplates(vision, win, s, HARVEST_TEMPLATES);
+    const located = await this.locateTemplates(vision, win, s, HARVEST_TEMPLATES);
     if (located) {
       this.finish(located.reason, located.message);
       return;
@@ -734,23 +778,23 @@ export class CraftAutomation {
     if (!moved) return [win, ""];
     this.log("连续读取失败且窗口已移动，重新匹配模板");
     vision.clearPositionCache();
-    const located = this.locateTemplates(vision, next, s, HARVEST_TEMPLATES);
+    const located = await this.locateTemplates(vision, next, s, HARVEST_TEMPLATES);
     if (located) return [next, `窗口移动后模板重定位失败：${located.message}`];
-    await focusWindow(next.hwnd, 1, 20);
+    if (!this.backgroundInput) await focusWindow(next.hwnd, 1, 20);
     return [next, ""];
   }
 
   /** 只负责定位并返回失败原因，绝不改 running/active：运行中途调用时不能让停止按钮失效。 */
-  private locateTemplates(
+  private async locateTemplates(
     vision: VisionService,
     win: WindowInfo,
     s: AppSettings,
     names: string[],
-  ): { reason: StopReasonValue; message: string } | null {
+  ): Promise<{ reason: StopReasonValue; message: string } | null> {
     console.log("[craft] grab begin", windowMetrics(win).width, "x", windowMetrics(win).height);
     let frame: Mat | null = null;
     try {
-      frame = vision.grabWindow(win);
+      frame = await vision.grabWindow(win);
       console.log("[craft] grab ok", frame.cols, "x", frame.rows);
       for (const name of names) {
         const hit = vision.matchInFrame(win, frame, name, s.templateThreshold);
@@ -933,13 +977,34 @@ export class CraftAutomation {
   }
 
   private async moveToHit(hit: MatchHit): Promise<void> {
-    await moveScreen(hit.screenX, hit.screenY, CURSOR_MS);
+    if (this.backgroundInput) {
+      const win = this.inputWindow;
+      if (win && isMinimizedWindow(win.hwnd)) throw new VisionError("游戏窗口已最小化，后台输入已停止");
+      if (!win || !postWindowMouseMove(win.hwnd, hit.clientX, hit.clientY)) {
+        throw new VisionError("后台鼠标移动消息投递失败");
+      }
+      await sleepMs(BACKGROUND_INPUT_SETTLE_MS, () => this.shouldStop());
+    } else {
+      await moveScreen(hit.screenX, hit.screenY, CURSOR_MS);
+    }
+    this.lastHoverHit = hit;
+  }
+
+  private async clickHit(hit: MatchHit, button: "left" | "right"): Promise<void> {
+    if (this.backgroundInput) {
+      const win = this.inputWindow;
+      if (win && isMinimizedWindow(win.hwnd)) throw new VisionError("游戏窗口已最小化，后台输入已停止");
+      if (!win || !(await clickWindowClient(win.hwnd, hit.clientX, hit.clientY, BACKGROUND_INPUT_SETTLE_MS, button))) {
+        throw new VisionError(`后台${button === "right" ? "右键" : "左键"}消息投递失败`);
+      }
+    } else {
+      await clickScreen(hit.screenX, hit.screenY, CURSOR_MS, button);
+    }
     this.lastHoverHit = hit;
   }
 
   private async clickItemSlotLeft(hit: MatchHit): Promise<void> {
-    await clickScreen(hit.screenX, hit.screenY, CURSOR_MS, "left");
-    this.lastHoverHit = hit;
+    await this.clickHit(hit, "left");
   }
 
   /** 放回装备的左键与使用通货的左键走同一套确认，绝不空手点装备格。 */
@@ -1175,11 +1240,11 @@ export class CraftAutomation {
     this.stackCounts.delete(name);
   }
 
-  private resolveItemHit(vision: VisionService, win: WindowInfo, s: AppSettings): MatchHit | null {
+  private async resolveItemHit(vision: VisionService, win: WindowInfo, s: AppSettings): Promise<MatchHit | null> {
     const cached = vision.getCachedPosition("item_slot");
     if (cached) return cached;
     try {
-      return vision.findInWindow(win, "item_slot", s.templateThreshold);
+      return await vision.findInWindow(win, "item_slot", s.templateThreshold);
     } catch (e) {
       this.log(`定位目标装备失败：${visionErrText(e)}`);
       return null;
@@ -1194,7 +1259,7 @@ export class CraftAutomation {
   }
 
   private async selectStepCurrency(vision: VisionService, win: WindowInfo, step: CraftStep, s: AppSettings): Promise<boolean> {
-    const itemHit = this.resolveItemHit(vision, win, s);
+    const itemHit = await this.resolveItemHit(vision, win, s);
     if (!itemHit) return false;
     const itemRegion = hitClientRegion(itemHit);
     const templateName = step.currencyTemplate;
@@ -1272,7 +1337,7 @@ export class CraftAutomation {
   ): Promise<[string, Item | null]> {
     if (!this.itemUseClicked) {
       if (!(await this.selectStepCurrency(vision, win, step, s))) return ["no_select", null];
-      const itemHit = this.resolveItemHit(vision, win, s);
+      const itemHit = await this.resolveItemHit(vision, win, s);
       if (!itemHit) return ["no_click", null];
       const clickKind = await this.leftClickItemUse(vision, itemHit);
       if (clickKind !== "ok") return [clickKind, null];
@@ -1285,6 +1350,7 @@ export class CraftAutomation {
 
   private captureItemPointerBaseline(vision: VisionService): boolean {
     const itemHit = vision.getCachedPosition("item_slot");
+    if (this.backgroundInput) return Boolean(itemHit);
     if (!itemHit || !cursorInHit(itemHit)) return false;
     const handle = getCursorHandle();
     const patch = vision.captureCursorPatch();
@@ -1297,6 +1363,7 @@ export class CraftAutomation {
 
   /** 光标句柄或图案与装备格普通指针基线不同 ⇒ 光标上确实挂着东西（通货或装备）。 */
   private cursorHoldsSomething(vision: VisionService): boolean {
+    if (this.backgroundInput) return this.currencyOnCursor;
     const handle = getCursorHandle();
     const patch = vision.captureCursorPatch();
     try {
@@ -1314,6 +1381,13 @@ export class CraftAutomation {
    * 返回 ok 之外的任何值都不许左键；时间只作上限，条件满足立即返回。
    */
   private async confirmCursorOnItem(vision: VisionService, itemHit: MatchHit, holdsProven = false): Promise<string> {
+    if (this.backgroundInput) {
+      if (this.conflictingCurrencyName(vision, itemHit, "")) return "hit_on_currency";
+      await this.moveToHit(itemHit);
+      if (!hitsClose(this.lastHoverHit, itemHit)) return "not_parked";
+      if (!holdsProven && !this.currencyUseArmed) return "like_pointer";
+      return "ok";
+    }
     let check = "ok";
     if (!holdsProven && !this.itemPointerPatch && this.itemPointerHandle == null) check = "no_baseline";
     else if (this.conflictingCurrencyName(vision, itemHit, "")) check = "hit_on_currency";
@@ -1355,18 +1429,19 @@ export class CraftAutomation {
 
   /** 动作之间不睡固定时长：等到光标恢复成普通指针即可继续，capMs 只作上限/节流。返回是否被用户停止。 */
   private async settleAfterAction(vision: VisionService, capMs: number): Promise<boolean> {
+    if (this.backgroundInput) return sleepMs(capMs, () => this.shouldStop());
     await waitUntil(() => !this.cursorHoldsSomething(vision), capMs, 20, () => this.shouldStop());
     return this.shouldStop();
   }
 
   private async rightClickCurrencyStack(stackHit: MatchHit): Promise<boolean> {
     await this.moveToHit(stackHit);
-    if (!cursorInHit(stackHit)) {
+    if (this.backgroundInput ? !hitsClose(this.lastHoverHit, stackHit) : !cursorInHit(stackHit)) {
       this.log("未能停在已核实通货堆叠上，本轮不右键");
       return false;
     }
     console.log("[craft] after first: click begin right currency");
-    await clickScreen(stackHit.screenX, stackHit.screenY, CURSOR_MS, "right");
+    await this.clickHit(stackHit, "right");
     console.log("[craft] after first: click ok right currency");
     this.lastHoverHit = stackHit;
     this.currencyOnCursor = true;
@@ -1394,7 +1469,7 @@ export class CraftAutomation {
     let hit = forceRematch ? undefined : vision.getCachedPosition(templateName);
     if (!hit) {
       try {
-        hit = vision.findInWindow(win, templateName, s.templateThreshold) ?? undefined;
+        hit = (await vision.findInWindow(win, templateName, s.templateThreshold)) ?? undefined;
       } catch (e) {
         this.log(`模板匹配错误 [${templateName}]: ${e}`);
         return false;
@@ -1406,7 +1481,8 @@ export class CraftAutomation {
       return false;
     }
     console.log("[craft] after first: click begin", templateName, button);
-    await clickScreen(hit.screenX, hit.screenY, CURSOR_MS, button);
+    this.inputWindow = win;
+    await this.clickHit(hit, button);
     console.log("[craft] after first: click ok", templateName);
     return true;
   }
@@ -1430,6 +1506,7 @@ export class CraftAutomation {
     let found: string | null = null;
     let logged = false;
     let sendFailed = false;
+    const lastBackgroundSendFailure: { current: { stage: string; errorCode?: number } | null } = { current: null };
     const deadline = Date.now() + Math.max(1, timeoutMs);
     const pred = async () => {
       if (sendFailed) return false;
@@ -1437,7 +1514,29 @@ export class CraftAutomation {
       if (remain <= 0) return false;
       try {
         if (!logged) console.log("[craft] copy: keydown");
-        if (!hotkey("ctrl", "c")) {
+        let shortcutSent = false;
+        if (this.backgroundInput) {
+          const win = this.inputWindow;
+          if (win) {
+            if (isMinimizedWindow(win.hwnd)) throw new VisionError("游戏窗口已最小化，后台复制已停止");
+            const result = sendWindowCopyWithThreadState(win.hwnd);
+            shortcutSent = result.ok;
+            if (!result.ok) {
+              lastBackgroundSendFailure.current = { stage: result.stage, errorCode: result.errorCode };
+              console.error(
+                `[craft] 后台复制失败: ${result.stage} Win32=${result.errorCode ?? 0} ` +
+                  `thread=${result.currentTid ?? "?"}->${result.targetTid ?? "?"}`,
+              );
+              // Ctrl 尚未被目标线程明确读回时，底层不会投递 C。这里在总超时内安全重试，
+              // 避免一次瞬时的共享键盘状态失败直接终止整次装备读取。
+              return false;
+            }
+            lastBackgroundSendFailure.current = null;
+          }
+        } else {
+          shortcutSent = hotkey("ctrl", "c");
+        }
+        if (!shortcutSent) {
           sendFailed = true;
           console.error("[craft] 复制失败");
           return false;
@@ -1480,6 +1579,12 @@ export class CraftAutomation {
     };
     if (await waitUntil(pred, timeoutMs, this.copyPollMs, () => this.shouldStop())) return found;
     if (sendFailed) throw new ItemParseError("复制失败");
+    if (lastBackgroundSendFailure.current) {
+      throw new ItemParseError(
+        `后台复制投递失败: ${lastBackgroundSendFailure.current.stage} ` +
+          `(Win32=${lastBackgroundSendFailure.current.errorCode ?? 0})`,
+      );
+    }
     return null;
   }
 
@@ -1494,7 +1599,7 @@ export class CraftAutomation {
     let hit = vision.getCachedPosition("item_slot");
     if (!hit) {
       alreadyOnItem = false;
-      hit = vision.findInWindow(win, "item_slot", s.templateThreshold) ?? undefined;
+      hit = (await vision.findInWindow(win, "item_slot", s.templateThreshold)) ?? undefined;
     }
     if (!hit) throw new VisionError("未找到 item_slot.png（工艺槽物品区域）");
     if (!hitInWindow(hit, win)) throw new VisionError("装备格坐标不在游戏窗口内");
@@ -1517,19 +1622,25 @@ export class CraftAutomation {
   }
 
   async readItemOnce(settings: AppSettings): Promise<Item> {
+    const previousBackgroundInput = this.backgroundInput;
+    const previousInputWindow = this.inputWindow;
     await initVision();
+    this.backgroundInput = settings.backgroundInput;
     this.applyClipboardTiming(settings);
     const vision = new VisionService(settings.templatesDir, settings.templateThreshold, 0.7, [1]);
     try {
       if (!fs.existsSync(vision.templatePath("item_slot"))) throw new VisionError("缺少模板 item_slot.png");
-      const win = findGameWindow(settings.windowTitleKeywords);
+      const [win] = await this.acquireGameWindow(settings.windowTitleKeywords, 3);
       if (!win) throw new VisionError("未找到流放之路窗口");
-      await focusWindow(win.hwnd, 3, 50);
-      const hit = vision.findInWindow(win, "item_slot", settings.templateThreshold);
+      const hit = await vision.findInWindow(win, "item_slot", settings.templateThreshold);
       if (!hit) throw new VisionError("未找到 item_slot.png");
-      return this.readItemFast(vision, win, settings);
+      // 必须等后台悬停与复制全部结束后再进入 finally；否则 inputWindow 会在
+      // moveToHit() 的等待期间被提前恢复成 null，随后无法向目标 HWND 投递 Ctrl+C。
+      return await this.readItemFast(vision, win, settings);
     } finally {
       vision.close();
+      this.backgroundInput = previousBackgroundInput;
+      this.inputWindow = previousInputWindow;
     }
   }
 }

@@ -3,6 +3,7 @@
     "Path of Exile",
     "流放之路"
   ],
+  "background_input": true,
   "hotkey_stop": "f8",
   "hotkey_start": "f7",
   "max_attempts": 200,

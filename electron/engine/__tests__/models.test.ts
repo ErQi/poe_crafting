@@ -99,6 +99,12 @@ describe("AppSettings 序列化", () => {
     expect(s.windowTitleKeywords).toEqual(["Path of Exile", "流放之路"]);
   });
 
+  it("后台输入默认启用并可显式关闭", () => {
+    expect(new AppSettings().backgroundInput).toBe(true);
+    expect(AppSettings.fromDict({ background_input: false }).backgroundInput).toBe(false);
+    expect(AppSettings.fromDict({ background_input: "false" }).backgroundInput).toBe(false);
+  });
+
   it("window_title_keywords 必须是数组才生效", () => {
     expect(AppSettings.fromDict({ window_title_keywords: "PoE" }).windowTitleKeywords).toEqual([
       "Path of Exile",

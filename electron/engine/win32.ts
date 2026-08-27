@@ -58,6 +58,8 @@ const GetWindowThreadProcessId = user32.func("uint32 __stdcall GetWindowThreadPr
 const EnumWindows = user32.func("int __stdcall EnumWindows(EnumWindowsProc *lpEnumFunc, intptr lParam)");
 const AttachThreadInput = user32.func("int __stdcall AttachThreadInput(uint32 idAttach, uint32 idAttachTo, int fAttach)");
 const GetCurrentThreadId = kernel32.func("uint32 __stdcall GetCurrentThreadId()");
+const GetLastError = kernel32.func("uint32 __stdcall GetLastError()");
+const SetLastError = kernel32.func("void __stdcall SetLastError(uint32 dwErrCode)");
 const GetClientRect = user32.func("int __stdcall GetClientRect(HWND hWnd, _Out_ RECT *lpRect)");
 const ClientToScreen = user32.func("int __stdcall ClientToScreen(HWND hWnd, _Inout_ POINT *lpPoint)");
 const GetCursorPos = user32.func("int __stdcall GetCursorPos(_Out_ POINT *lpPoint)");
@@ -102,6 +104,13 @@ const INPUT = koffi.struct("INPUT", {
 });
 const SendInput = user32.func("uint32 __stdcall SendInput(uint32 cInputs, INPUT *pInputs, int cbSize)");
 const keybd_event = user32.func("void __stdcall keybd_event(uint8 bVk, uint8 bScan, uint32 dwFlags, uintptr dwExtraInfo)");
+const PostMessageW = user32.func("int __stdcall PostMessageW(HWND hWnd, uint32 Msg, uintptr wParam, intptr lParam)");
+const SendMessageTimeoutW = user32.func(
+  "uintptr __stdcall SendMessageTimeoutW(HWND hWnd, uint32 Msg, uintptr wParam, intptr lParam, uint32 fuFlags, uint32 uTimeout, _Out_ uintptr *lpdwResult)",
+);
+const GetKeyboardState = user32.func("int __stdcall GetKeyboardState(_Out_ uint8 *lpKeyState)");
+const SetKeyboardState = user32.func("int __stdcall SetKeyboardState(const uint8 *lpKeyState)");
+const GetKeyState = user32.func("int16 __stdcall GetKeyState(int nVirtKey)");
 
 const GA_ROOT = 2;
 const SW_RESTORE = 9;
@@ -113,6 +122,15 @@ const KEYEVENTF_KEYUP = 0x0002;
 const KEYEVENTF_SCANCODE = 0x0008;
 const INPUT_MOUSE = 0;
 const INPUT_KEYBOARD = 1;
+const WM_KEYDOWN = 0x0100;
+const WM_KEYUP = 0x0101;
+const WM_CHAR = 0x0102;
+const WM_MOUSEMOVE = 0x0200;
+const WM_LBUTTONDOWN = 0x0201;
+const WM_LBUTTONUP = 0x0202;
+const WM_RBUTTONDOWN = 0x0204;
+const WM_RBUTTONUP = 0x0205;
+const WM_COPY = 0x0301;
 const MOUSEEVENTF_LEFTDOWN = 0x0002;
 const MOUSEEVENTF_LEFTUP = 0x0004;
 const MOUSEEVENTF_RIGHTDOWN = 0x0008;
@@ -123,6 +141,15 @@ const BMIH_SIZE = koffi.sizeof(BITMAPINFOHEADER);
 const CAPTURE_MAX_EDGE = 8192;
 const CAPTURE_MAX_PIXELS = 8192 * 4320;
 const ASFW_ANY = 0xffffffff;
+const VK_CONTROL = 0x11;
+const VK_C = 0x43;
+const VK_LCONTROL = 0xa2;
+const SMTO_BLOCK = 0x0001;
+const SMTO_ABORTIFHUNG = 0x0002;
+const SEND_MESSAGE_TIMEOUT_MS = 250;
+const ERROR_TIMEOUT = 1460;
+const MK_LBUTTON = 0x0001;
+const MK_RBUTTON = 0x0002;
 
 export type Hwnd = object | bigint | number;
 
@@ -257,6 +284,26 @@ export function isForegroundWindow(hwnd: Hwnd | null | undefined): boolean {
     if (!fg) return false;
     if (hwndEq(fg, h)) return true;
     return hwndEq(hwndPtr(GetAncestor(fg, GA_ROOT)), h);
+  } catch {
+    return false;
+  }
+}
+
+export function isWindowAvailable(hwnd: Hwnd | null | undefined): boolean {
+  const h = hwndPtr(hwnd);
+  if (!h) return false;
+  try {
+    return Boolean(IsWindow(h));
+  } catch {
+    return false;
+  }
+}
+
+export function isMinimizedWindow(hwnd: Hwnd | null | undefined): boolean {
+  const h = hwndPtr(hwnd);
+  if (!h) return false;
+  try {
+    return Boolean(IsWindow(h) && IsIconic(h));
   } catch {
     return false;
   }
@@ -472,6 +519,259 @@ const SCAN: Record<string, number> = {
   a: 0x1e,
   f8: 0x42,
 };
+
+function postMessage(h: bigint, message: number, wParam: number, lParam: number): boolean {
+  try {
+    return Boolean(PostMessageW(h, message, wParam, lParam));
+  } catch (e) {
+    console.error("[win32] PostMessageW:", e);
+    return false;
+  }
+}
+
+function mouseClientLParam(clientX: number, clientY: number): number | null {
+  if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return null;
+  const x = Math.round(clientX);
+  const y = Math.round(clientY);
+  if (x < -0x8000 || x > 0x7fff || y < -0x8000 || y > 0x7fff) return null;
+  return (((y & 0xffff) << 16) | (x & 0xffff)) | 0;
+}
+
+/** 只改变目标窗口消息队列里的逻辑鼠标位置，不移动系统实体光标。 */
+export function postWindowMouseMove(hwnd: Hwnd | null | undefined, clientX: number, clientY: number): boolean {
+  const h = hwndPtr(hwnd);
+  const lParam = mouseClientLParam(clientX, clientY);
+  if (!h || lParam == null) return false;
+  return postMessage(h, WM_MOUSEMOVE, 0, lParam);
+}
+
+/** 向目标窗口队列投递鼠标按下/抬起，不移动系统实体光标，也不切换前台。 */
+export function postWindowMouseButton(
+  hwnd: Hwnd | null | undefined,
+  clientX: number,
+  clientY: number,
+  button: "left" | "right",
+  down: boolean,
+): boolean {
+  const h = hwndPtr(hwnd);
+  const lParam = mouseClientLParam(clientX, clientY);
+  if (!h || lParam == null) return false;
+  const message =
+    button === "right"
+      ? down
+        ? WM_RBUTTONDOWN
+        : WM_RBUTTONUP
+      : down
+        ? WM_LBUTTONDOWN
+        : WM_LBUTTONUP;
+  const wParam = down ? (button === "right" ? MK_RBUTTON : MK_LBUTTON) : 0;
+  return postMessage(h, message, wParam, lParam);
+}
+
+/**
+ * 向指定窗口投递“复制”语义，不发送字母 C 的按下/抬起消息。
+ * PostMessage 不会改变真实 Ctrl 状态；伪造 Ctrl+C 会被游戏识别成单独的 C，进而关闭仓库。
+ */
+export function postWindowCopy(hwnd: Hwnd | null | undefined): boolean {
+  const h = hwndPtr(hwnd);
+  if (!h) return false;
+  try {
+    // WM_COPY 供标准控件使用；WM_CHAR(ETX) 是 Ctrl+C 对应的控制字符。
+    // 两者都不会产生可被游戏当作快捷键的 VK_C/扫描码消息。
+    const copied = postMessage(h, WM_COPY, 0, 0);
+    const controlChar = postMessage(h, WM_CHAR, 0x03, (1 | (SCAN.c << 16)) | 0);
+    return copied && controlChar;
+  } catch (e) {
+    console.error("[win32] postWindowCopy:", e);
+    return false;
+  }
+}
+
+interface SendMessageTimeoutResult {
+  ok: boolean;
+  errorCode: number;
+  durationMs: number;
+}
+
+function sendMessageTimeout(
+  h: bigint,
+  message: number,
+  wParam: number,
+  lParam: number,
+  flags = SMTO_BLOCK | SMTO_ABORTIFHUNG,
+  timeoutMs = SEND_MESSAGE_TIMEOUT_MS,
+): SendMessageTimeoutResult {
+  const startedAt = Date.now();
+  try {
+    const result = [0n];
+    SetLastError(0);
+    const ok = Boolean(
+      SendMessageTimeoutW(
+        h,
+        message,
+        wParam,
+        lParam,
+        flags,
+        timeoutMs,
+        result,
+      ),
+    );
+    return { ok, errorCode: ok ? 0 : Number(GetLastError()), durationMs: Date.now() - startedAt };
+  } catch (e) {
+    console.error("[win32] SendMessageTimeoutW:", e);
+    return { ok: false, errorCode: Number(GetLastError()), durationMs: Date.now() - startedAt };
+  }
+}
+
+/**
+ * 增强后台复制探针：把当前线程与目标窗口线程的输入队列短暂连接，在共享队列中确认
+ * Ctrl 为按下后同步发送一次 C。它不改变系统物理键盘状态，也不切换前台；状态必定恢复。
+ */
+export interface ThreadStateCopyResult {
+  ok: boolean;
+  stage: string;
+  errorCode?: number;
+  currentTid?: number;
+  targetTid?: number;
+  deliveryUncertain?: boolean;
+  cDownErrorCode?: number;
+  cUpErrorCode?: number;
+  controlReadback?: number;
+  leftControlReadback?: number;
+  controlKeyState?: number;
+}
+
+export function sendWindowCopyWithThreadState(hwnd: Hwnd | null | undefined): ThreadStateCopyResult {
+  const h = hwndPtr(hwnd);
+  if (!h) return { ok: false, stage: "invalid_window" };
+  const targetTid = Number(GetWindowThreadProcessId(h, null));
+  const currentTid = Number(GetCurrentThreadId());
+  const base = { currentTid, targetTid };
+  if (!targetTid || !currentTid) return { ok: false, stage: "resolve_threads", ...base };
+
+  const original = Buffer.alloc(256);
+  SetLastError(0);
+  if (!GetKeyboardState(original)) {
+    return { ok: false, stage: "read_keyboard_state", errorCode: Number(GetLastError()), ...base };
+  }
+  let attached = false;
+  let cDownAttempted = false;
+  let cUpAttempted = false;
+  try {
+    if (currentTid !== targetTid) {
+      SetLastError(0);
+      attached = Boolean(AttachThreadInput(currentTid, targetTid, 1));
+      if (!attached) {
+        return { ok: false, stage: "attach_thread_input", errorCode: Number(GetLastError()), ...base };
+      }
+    }
+
+    const state = Buffer.from(original);
+    state[VK_CONTROL] |= 0x80;
+    state[VK_LCONTROL] |= 0x80;
+    state[VK_C] |= 0x80;
+    let controlReadback = 0;
+    let leftControlReadback = 0;
+    let controlKeyState = 0;
+    let controlVerified = false;
+    for (let verifyTry = 0; verifyTry < 3; verifyTry++) {
+      SetLastError(0);
+      if (!SetKeyboardState(state)) {
+        if (verifyTry === 2) {
+          return { ok: false, stage: "set_control_state", errorCode: Number(GetLastError()), ...base };
+        }
+        continue;
+      }
+      const readback = Buffer.alloc(256);
+      if (GetKeyboardState(readback)) {
+        controlReadback = readback[VK_CONTROL];
+        leftControlReadback = readback[VK_LCONTROL];
+      }
+      controlKeyState = Number(GetKeyState(VK_CONTROL));
+      controlVerified =
+        Boolean(controlReadback & 0x80) ||
+        Boolean(controlKeyState & 0x8000);
+      if (controlVerified) break;
+    }
+    // 只有共享队列能明确读回 Ctrl=down 时才允许投递 C，避免再次退化成单独的 C 快捷键。
+    if (!controlVerified) {
+      return {
+        ok: false,
+        stage: "verify_control_state",
+        controlReadback,
+        leftControlReadback,
+        controlKeyState,
+        ...base,
+      };
+    }
+
+    const downParam = (1 | (SCAN.c << 16)) | 0;
+    cDownAttempted = true;
+    const cDown = sendMessageTimeout(h, WM_KEYDOWN, VK_C, downParam);
+    const cDownTimedOut = !cDown.ok && cDown.errorCode === ERROR_TIMEOUT;
+    if (!cDown.ok && !cDownTimedOut) {
+      return { ok: false, stage: "send_c_down", errorCode: cDown.errorCode, ...base };
+    }
+
+    state[VK_C] &= 0x7f;
+    SetLastError(0);
+    if (!SetKeyboardState(state)) {
+      return { ok: false, stage: "release_c_state", errorCode: Number(GetLastError()), ...base };
+    }
+    const upParam = (1 | (SCAN.c << 16) | 0xc0000000) | 0;
+    cUpAttempted = true;
+    const cUp = sendMessageTimeout(h, WM_KEYUP, VK_C, upParam);
+    const cUpTimedOut = !cUp.ok && cUp.errorCode === ERROR_TIMEOUT;
+    if (!cUp.ok && !cUpTimedOut) {
+      return { ok: false, stage: "send_c_up", errorCode: cUp.errorCode, ...base };
+    }
+    const deliveryUncertain = cDownTimedOut || cUpTimedOut;
+    return {
+      ok: true,
+      stage: deliveryUncertain ? "complete_after_timeout" : "complete",
+      deliveryUncertain,
+      cDownErrorCode: cDown.errorCode || undefined,
+      cUpErrorCode: cUp.errorCode || undefined,
+      controlReadback,
+      leftControlReadback,
+      controlKeyState,
+      ...base,
+    };
+  } catch (e) {
+    console.error("[win32] sendWindowCopyWithThreadState:", e);
+    return { ok: false, stage: "exception", ...base };
+  } finally {
+    // SendMessageTimeout 超时仍可能已经把 C-down 交给目标线程；只要尝试过 down，就必须保证
+    // 后续也尝试一次 up，避免目标客户端留下按键按住状态。
+    if (cDownAttempted) {
+      const released = Buffer.from(original);
+      released[VK_CONTROL] |= 0x80;
+      released[VK_LCONTROL] |= 0x80;
+      released[VK_C] &= 0x7f;
+      try {
+        SetKeyboardState(released);
+        const upParam = (1 | (SCAN.c << 16) | 0xc0000000) | 0;
+        if (!cUpAttempted) sendMessageTimeout(h, WM_KEYUP, VK_C, upParam);
+        // 同步发送超时仍可能处于未知状态；再排入一个无副作用的 key-up，确保目标最终释放 C。
+        postMessage(h, WM_KEYUP, VK_C, upParam);
+      } catch {
+        /* ignore */
+      }
+    }
+    try {
+      SetKeyboardState(original);
+    } catch {
+      /* ignore */
+    }
+    if (attached) {
+      try {
+        AttachThreadInput(currentTid, targetTid, 0);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
 
 export function hotkey(...keys: string[]): boolean {
   try {

@@ -3,7 +3,7 @@ import fs from "fs";
 import path from "path";
 import { clipboard, nativeImage, shell } from "electron";
 import { AutomationConfig, CraftAutomation } from "./automation";
-import { getClipboard } from "./clipboard";
+import { clearClipboard, getClipboard, waitClipboardChange } from "./clipboard";
 import {
   loadLibrary,
   loadRuleset,
@@ -16,8 +16,18 @@ import {
 } from "./configStore";
 import { CURRENCIES, CURRENCY_BY_TEMPLATE, currencyLabel } from "./currencies";
 import { hasCurrencyCell } from "./stashGrid";
-import { focusGameWindow } from "./input";
-import { formatItemPreview, ItemParseError, parseItemText } from "./itemParser";
+import {
+  findGameWindow,
+  focusGameWindow,
+  isForegroundWindow,
+  isMinimizedWindow,
+  isWindowAvailable,
+  postWindowCopy,
+  postWindowMouseMove,
+  sendWindowCopyWithThreadState,
+  type WindowInfo,
+} from "./input";
+import { formatItemPreview, isEquipmentClipboardText, ItemParseError, parseItemText } from "./itemParser";
 import { matchRuleset, normalizeOperator, parseThresholdText } from "./matcher";
 import {
   AppSettings,
@@ -153,6 +163,12 @@ export class AppHost {
   library;
   workflow: CraftWorkflow;
   private logs: string[] = [];
+  private backgroundRunActive = false;
+  private backgroundProbeTarget: {
+    hwnd: WindowInfo["hwnd"];
+    clientX: number;
+    clientY: number;
+  } | null = null;
   itemPreview = "（尚未读取）";
   private wasRunning = false;
   private lastItemTs = 0;
@@ -397,7 +413,11 @@ export class AppHost {
   }
 
   private onStatus(status: RunStatus): void {
-    if (status.running) {
+    if (this.backgroundRunActive) {
+      this.overlay?.hide();
+      this.wasRunning = status.running;
+      if (!status.running) this.backgroundRunActive = false;
+    } else if (status.running) {
       this.wasRunning = true;
       this.overlay?.pushStatus(status);
     } else {
@@ -458,6 +478,9 @@ export class AppHost {
       save_settings: () => this.saveSettingsNow(),
       save_rules: () => this.saveRulesNow(),
       refresh_item: () => this.refreshItem(),
+      prepare_background_probe: () => this.prepareBackgroundProbe(),
+      run_background_probe: () => this.runBackgroundProbe(),
+      run_background_probe_thread_state: () => this.runBackgroundThreadStateProbe(),
       parse_clipboard: () => this.parseClipboard(),
       paste_template: () => this.pasteTemplate(),
       get_pending_preview: () => ok({ pending_preview: this.pendingPreviewUrl }),
@@ -648,6 +671,10 @@ export class AppHost {
     const hotkeyChanged = "hotkey_start" in patch || "hotkey_stop" in patch;
     if ("hotkey_start" in patch) s.hotkeyStart = String(patch.hotkey_start || "f7").trim().toLowerCase();
     if ("hotkey_stop" in patch) s.hotkeyStop = String(patch.hotkey_stop || "f8").trim().toLowerCase();
+    if ("background_input" in patch) {
+      const value = patch.background_input;
+      s.backgroundInput = !(value === false || value === 0 || String(value).trim().toLowerCase() === "false");
+    }
     if ("craft_mode" in patch) {
       const mode = String(patch.craft_mode || CraftMode.GENERIC);
       if (mode === CraftMode.WORKFLOW) s.craftMode = mode;
@@ -749,7 +776,9 @@ export class AppHost {
         [],
         [
           "请确认：",
-          "1. 游戏为窗口/无边框模式，仓库打开「非绑定 / 通用」通货页",
+          s.backgroundInput
+            ? "1. 游戏为窗口/无边框模式且不要最小化；可以被其他窗口完全遮挡，仓库打开「非绑定 / 通用」通货页"
+            : "1. 游戏为窗口/无边框模式，仓库打开「非绑定 / 通用」通货页",
           "2. 目标装备在画面中，流程通货在仓库固定格子里",
           "3. item_slot.png 截取的是目标装备本身",
           `4. 流程使用通货: ${currencies}（按仓库格坐标悬停后 Ctrl+C 核名）`,
@@ -767,7 +796,9 @@ export class AppHost {
       [],
       [
         "请确认：",
-        "1. 游戏为窗口/无边框模式，园艺台已打开",
+        s.backgroundInput
+          ? "1. 游戏为窗口/无边框模式且不要最小化；可以被其他窗口完全遮挡，园艺台已打开"
+          : "1. 游戏为窗口/无边框模式，园艺台已打开",
         "2. 物品已放入工艺槽",
         "3. 已准备 craft_button.png 与 item_slot.png 模板",
         "4. 请先在游戏里选好花园工艺再开始（开始后只点执行按钮）",
@@ -788,11 +819,12 @@ export class AppHost {
         s.workflowFile = "config/workflows.json";
         saveLibrary(this.library, resolvePath(s.workflowFile));
       }
-      this.log("正在切换到游戏窗口…");
+      this.log(s.backgroundInput ? "正在定位游戏窗口（后台模式不会置前）…" : "正在切换到游戏窗口…");
       let win = null;
       let focused = false;
       try {
-        [win, focused] = await focusGameWindow(s.windowTitleKeywords, 8);
+        if (s.backgroundInput) win = findGameWindow(s.windowTitleKeywords);
+        else [win, focused] = await focusGameWindow(s.windowTitleKeywords, 8);
       } catch (e) {
         return err(startErrorText(e));
       }
@@ -801,7 +833,10 @@ export class AppHost {
         return err("未找到流放之路窗口");
       }
       let focusNote = "";
-      if (focused) this.log(`已切换到游戏: ${win.title}`);
+      if (s.backgroundInput) {
+        if (isMinimizedWindow(win.hwnd)) return err("后台模式不支持最小化游戏，请还原后再开始");
+        this.log(`已定位游戏: ${win.title}；WGC 与定向输入不会抢占前台`);
+      } else if (focused) this.log(`已切换到游戏: ${win.title}`);
       else {
         this.log(`已找到窗口但未能置前: ${win.title}，将继续启动并重试`);
         try {
@@ -823,6 +858,7 @@ export class AppHost {
         craftMode: s.craftMode,
         workflow,
       };
+      this.backgroundRunActive = s.backgroundInput;
       this.wasRunning = true;
       this.automation.start(cfg);
       const { x, y } = {
@@ -830,9 +866,12 @@ export class AppHost {
         y: win.top + Math.floor((win.bottom - win.top) / 2),
       };
       try {
-        this.overlay?.resetRun();
-        this.overlay?.show({ x, y });
-        this.overlay?.addLine("▶ 开始匹配…", false);
+        if (s.backgroundInput) this.overlay?.hide();
+        else {
+          this.overlay?.resetRun();
+          this.overlay?.show({ x, y });
+          this.overlay?.addLine("▶ 开始匹配…", false);
+        }
       } catch (e) {
         console.error("[overlay] 显示失败，继续工艺:", e);
       }
@@ -840,6 +879,7 @@ export class AppHost {
       return ok({ focus_warning: focusNote });
     } catch (e) {
       this.wasRunning = false;
+      this.backgroundRunActive = false;
       try {
         this.overlay?.hide();
       } catch {
@@ -860,6 +900,142 @@ export class AppHost {
       this.log(`读取失败: ${e}`);
       return err(`读取失败: ${e}`);
     }
+  }
+
+  /**
+   * 第一步只在游戏可见时定位目标装备并保存 HWND + 客户区坐标；不切前台、不发送输入。
+   * 第二步会在游戏被其他窗口遮挡、但没有最小化时验证安全复制消息。
+   */
+  async prepareBackgroundProbe() {
+    if (this.busy()) return err("工艺运行中不能检测，请先停止当前流程");
+    this.backgroundProbeTarget = null;
+    await initVision();
+    const vision = new VisionService(this.settings.templatesDir, this.settings.templateThreshold, 0.7, [1]);
+    try {
+      const win = findGameWindow(this.settings.windowTitleKeywords);
+      if (!win) return err("未找到流放之路窗口");
+      if (isMinimizedWindow(win.hwnd)) return err("请先还原游戏窗口，并让目标装备完整可见");
+      const hit = await vision.findInWindow(win, "item_slot", this.settings.templateThreshold);
+      if (!hit) return err("未找到 item_slot.png，请让目标装备完整可见后重试");
+      this.backgroundProbeTarget = {
+        hwnd: win.hwnd,
+        clientX: hit.clientX,
+        clientY: hit.clientY,
+      };
+      const message =
+        `标定完成：目标装备客户区坐标 (${hit.clientX}, ${hit.clientY})。` +
+        "现在切回本工具或用其他窗口遮住游戏，但不要最小化游戏，再执行第二步。";
+      this.log(message);
+      return ok({ probe_ready: true, message });
+    } catch (e) {
+      return err(`标定失败: ${e instanceof Error ? e.message : String(e)}`);
+    } finally {
+      vision.close();
+    }
+  }
+
+  /** 无鼠标点击探针：后台移动逻辑鼠标并投递安全复制语义，成功标准是剪贴板出现合法装备文本。 */
+  async runBackgroundProbe() {
+    if (this.busy()) return err("工艺运行中不能检测，请先停止当前流程");
+    const target = this.backgroundProbeTarget;
+    if (!target) return err("请先执行第一步标定目标装备");
+    if (!isWindowAvailable(target.hwnd)) {
+      this.backgroundProbeTarget = null;
+      return err("流放之路窗口已失效，请重新标定");
+    }
+    if (isMinimizedWindow(target.hwnd)) return err("最小化模式不受支持：请还原游戏，再用本工具或其他窗口遮挡游戏");
+    if (isForegroundWindow(target.hwnd)) return err("流放之路仍是前台窗口，请切回本工具或用其他窗口遮挡后重试");
+
+    clearClipboard();
+    const tries = 5;
+    for (let attempt = 1; attempt <= tries; attempt++) {
+      const moved = postWindowMouseMove(target.hwnd, target.clientX, target.clientY);
+      const keyed = postWindowCopy(target.hwnd);
+      if (!moved || !keyed) {
+        this.backgroundProbeTarget = null;
+        return err("目标窗口已失效或后台消息投递失败，请重新标定");
+      }
+      const copied = await waitClipboardChange("", 250, this.settings.clipboardPollMs, true);
+      if (copied && isEquipmentClipboardText(copied)) {
+        if (isForegroundWindow(target.hwnd)) {
+          return err("检测期间游戏意外成为前台，本次结果不能证明后台输入可用");
+        }
+        try {
+          const item = parseItemText(copied);
+          const label = [item.name, item.baseType].filter(Boolean).join(" ") || "目标装备";
+          const message =
+            `检测通过：游戏保持非前台且未最小化，后台复制成功读取「${label}」。` +
+            "可以继续实现遮挡状态下的完整后台点击链路。";
+          this.log(message);
+          return ok({ supported: true, message, item_preview: formatItem(item) });
+        } catch {
+          // 看起来像装备文本但解析不完整时继续重试，不能把一次偶然剪贴板变化当作通过。
+        }
+      }
+      clearClipboard();
+    }
+
+    const message =
+      "检测未通过：安全复制消息已经投递，但被遮挡且未最小化的游戏没有返回装备文本。" +
+      "该客户端忽略 WM_COPY/控制字符；可以继续执行第三步线程键盘状态检测。";
+    this.log(message);
+    return ok({ supported: false, can_try_thread_state: true, message });
+  }
+
+  /**
+   * 增强探针：只在共享输入队列已确认 Ctrl=down 后，向目标线程同步投递一次 C。
+   * 不移动系统光标、不切前台、不改变物理键盘状态；无论成功失败都会恢复线程键盘状态。
+   */
+  async runBackgroundThreadStateProbe() {
+    if (this.busy()) return err("工艺运行中不能检测，请先停止当前流程");
+    const target = this.backgroundProbeTarget;
+    if (!target) return err("请先执行第一步标定目标装备");
+    if (!isWindowAvailable(target.hwnd)) {
+      this.backgroundProbeTarget = null;
+      return err("流放之路窗口已失效，请重新标定");
+    }
+    if (isMinimizedWindow(target.hwnd)) return err("最小化模式不受支持：请还原游戏，再用本工具或其他窗口遮挡游戏");
+    if (isForegroundWindow(target.hwnd)) return err("流放之路仍是前台窗口，请切回本工具或用其他窗口遮挡后重试");
+
+    let lastItem: Item | null = null;
+    let successfulCopies = 0;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      clearClipboard();
+      const moved = postWindowMouseMove(target.hwnd, target.clientX, target.clientY);
+      if (!moved) return err("后台鼠标位置消息投递失败，请重新标定");
+      const copiedWithState = sendWindowCopyWithThreadState(target.hwnd);
+      if (!copiedWithState.ok) {
+        const code = copiedWithState.errorCode ? `，Win32=${copiedWithState.errorCode}` : "";
+        const detail = `${copiedWithState.stage}${code}，线程 ${copiedWithState.currentTid || "?"}→${copiedWithState.targetTid || "?"}`;
+        console.warn(`[background-probe] 增强复制准备失败: ${detail}`);
+        return err(`第 ${attempt}/3 次增强复制准备失败 [${detail}]；保护逻辑未发送 C`);
+      }
+      const copied = await waitClipboardChange("", 1000, this.settings.clipboardPollMs, true);
+      if (!copied || !isEquipmentClipboardText(copied)) break;
+      try {
+        lastItem = parseItemText(copied);
+      } catch {
+        break;
+      }
+      successfulCopies += 1;
+      if (isForegroundWindow(target.hwnd)) {
+        return err("检测期间游戏意外成为前台，本次结果不能证明后台输入可用");
+      }
+    }
+    if (lastItem && successfulCopies === 3) {
+      const label = [lastItem.name, lastItem.baseType].filter(Boolean).join(" ") || "目标装备";
+      const message =
+        `增强检测通过：连续 3 次在游戏非前台时读取「${label}」成功。` +
+        "这条路径没有移动实体鼠标或切换前台。";
+      this.log(message);
+      return ok({ supported: true, method: "thread_keyboard_state", message, item_preview: formatItem(lastItem) });
+    }
+
+    const message =
+      "增强检测未通过：目标线程队列中的 Ctrl 状态已经验证，但 POE 仍未复制装备文本。" +
+      "如果仓库再次关闭，说明客户端读取的是物理/异步键盘状态；同一桌面内无法做到完全隔离的后台 Ctrl+C。";
+    this.log(message);
+    return ok({ supported: false, method: "thread_keyboard_state", message });
   }
 
   parseClipboard() {
@@ -984,7 +1160,7 @@ export class AppHost {
       if (stem in CURRENCY_BY_TEMPLATE) continue;
       if (!names.includes(stem)) names.push(stem);
     }
-    this.templateTest = { status: "正在测试（请保持游戏窗口可见）…", color: "#f4a261", testing: true };
+    this.templateTest = { status: "正在测试（WGC 可遮挡，请勿最小化游戏）…", color: "#f4a261", testing: true };
     this.log("测试模板匹配…");
     this.push();
     const thr = this.settings.templateThreshold;
@@ -992,7 +1168,7 @@ export class AppHost {
     void (async () => {
       try {
         await initVision();
-        const results = vision.testMatchReport(keywords, names, thr);
+        const results = await vision.testMatchReport(keywords, names, thr);
         this.onTemplateTest(results, null, thr);
       } catch (e) {
         this.onTemplateTest([], String(e), thr);
@@ -1011,7 +1187,11 @@ export class AppHost {
       this.push();
       return;
     }
-    const lines = [`阈值: ${thr.toFixed(2)}`, ""];
+    const first = results[0];
+    const backend = String(first?.capture_backend || "none");
+    const captureDetail = String(first?.capture_detail || "");
+    const captureLabel = backend === "wgc" ? "WGC" : backend === "gdi" ? "GDI 回退" : "不可用";
+    const lines = [`捕获: ${captureLabel}${captureDetail ? `（${captureDetail}）` : ""}`, `阈值: ${thr.toFixed(2)}`, ""];
     let okN = 0;
     for (const row of results) {
       const name = String(row.template || "?");

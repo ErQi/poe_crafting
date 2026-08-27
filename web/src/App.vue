@@ -196,6 +196,17 @@ async function persistSettings(p, done) {
   done?.();
 }
 
+async function backgroundProbe(action, done) {
+  const names = {
+    prepare: "prepare_background_probe",
+    run: "run_background_probe",
+    thread: "run_background_probe_thread_state",
+  };
+  const name = names[action] || "run_background_probe";
+  const result = await applyCall(() => call(name));
+  done?.(result);
+}
+
 function craftKind() {
   if (tab.value === "garden") return "garden";
   if (tab.value === "normal") return "normal";
@@ -430,6 +441,7 @@ async function removeStep(id) {
         @persist="persistSettings"
         @save-settings="() => applyCall(() => call('save_settings'))"
         @open-data-dir="wrap(() => call('open_data_dir'))"
+        @background-probe="backgroundProbe"
       />
     </main>
     </template>
