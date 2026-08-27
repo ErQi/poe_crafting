@@ -5,6 +5,7 @@ import {
   matchRuleset,
   normalizeOperator,
   parseThresholdText,
+  splitPatternAlternatives,
   splitPatternKeywords,
 } from "../matcher";
 import { Affix, Item, MatchMode, MatchRule, RuleGroup, RuleSet } from "../models";
@@ -114,6 +115,23 @@ describe("词缀名称匹配", () => {
     expect(suffix.matched).toBe(true);
     expect(suffix.actualValue).toBe(52);
     expect(matchItem(flask, [rule("炼金的 感电")]).success).toBe(false);
+  });
+
+  it("竖线分隔的词缀名称按或者匹配", () => {
+    const matched = matchItem(flask, [rule("不存在的|炼金的|启蒙师的")]).hits[0];
+    expect(matched.matched).toBe(true);
+    expect(matched.matchedAffix).toContain("“炼金的”");
+
+    const missed = matchItem(flask, [rule("不存在的|启蒙师的")]).hits[0];
+    expect(missed.matched).toBe(false);
+    expect(missed.reason).toBe("未找到符合任一“|”分支的词缀");
+  });
+
+  it("每个或者分支内部仍按并且匹配，数值规则作用于命中的效果行", () => {
+    const hit = matchItem(flask, [rule("炼金的 感电|泥藓之 感电", ">=", 52)]).hits[0];
+    expect(hit.matched).toBe(true);
+    expect(hit.actualValue).toBe(52);
+    expect(hit.matchedAffix).toContain("“泥藓之”");
   });
 });
 
@@ -253,14 +271,28 @@ describe("splitPatternKeywords", () => {
     expect(splitPatternKeywords("攻击附加,冰霜伤害")).toEqual(["攻击附加", "冰霜伤害"]);
     expect(splitPatternKeywords("攻击附加，冰霜伤害")).toEqual(["攻击附加", "冰霜伤害"]);
     expect(splitPatternKeywords("攻击附加;冰霜伤害")).toEqual(["攻击附加", "冰霜伤害"]);
-    expect(splitPatternKeywords("攻击附加|冰霜伤害")).toEqual(["攻击附加", "冰霜伤害"]);
     expect(splitPatternKeywords("  最大生命  ")).toEqual(["最大生命"]);
+  });
+
+  it("竖线拆成或者分支，分支内部保留并且关键字", () => {
+    expect(splitPatternAlternatives("炼金的|业余者的|启蒙师的")).toEqual([
+      ["炼金的"],
+      ["业余者的"],
+      ["启蒙师的"],
+    ]);
+    expect(splitPatternAlternatives("炼金的 效果提高|泥藓之，感电")).toEqual([
+      ["炼金的", "效果提高"],
+      ["泥藓之", "感电"],
+    ]);
+    expect(splitPatternAlternatives("炼金的｜泥藓之")).toEqual([["炼金的"], ["泥藓之"]]);
+    expect(splitPatternKeywords("炼金的|泥藓之")).toEqual(["炼金的", "泥藓之"]);
   });
 
   it("空 pattern 与纯分隔符返回空数组", () => {
     expect(splitPatternKeywords("")).toEqual([]);
     expect(splitPatternKeywords("   ")).toEqual([]);
     expect(splitPatternKeywords(",,,")).toEqual([]);
+    expect(splitPatternAlternatives("||｜")).toEqual([]);
   });
 
   it("多关键字必须落在同一条词缀上", () => {

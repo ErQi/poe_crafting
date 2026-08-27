@@ -32,13 +32,25 @@ export function formatThresholdText(threshold: number | null, threshold2: number
   return `${threshold}-${threshold2}`;
 }
 
-export function splitPatternKeywords(pattern: string): string[] {
-  const raw = (pattern || "").trim();
-  if (!raw) return [];
-  const parts = raw.split(/[,，;；|]+/).map((p) => p.trim()).filter(Boolean);
+function splitAndKeywords(pattern: string): string[] {
+  const parts = pattern.split(/[,，;；]+/).map((p) => p.trim()).filter(Boolean);
   const keywords: string[] = [];
   for (const part of parts) keywords.push(...part.split(/\s+/).filter(Boolean));
   return keywords;
+}
+
+export function splitPatternAlternatives(pattern: string): string[][] {
+  const raw = (pattern || "").trim();
+  if (!raw) return [];
+  return raw
+    .split(/[|｜]+/)
+    .map((part) => splitAndKeywords(part.trim()))
+    .filter((keywords) => keywords.length > 0);
+}
+
+/** 保留扁平关键字接口；实际匹配使用 splitPatternAlternatives 保留“或”分支。 */
+export function splitPatternKeywords(pattern: string): string[] {
+  return splitPatternAlternatives(pattern).flat();
 }
 
 function affixHasKeywords(affix: Affix, keywords: string[]): boolean {
@@ -59,8 +71,8 @@ function compare(actual: number, op: string, threshold: number): boolean {
 
 export function matchRule(item: Item, rule: MatchRule): RuleHit {
   if (!rule.enabled) return new RuleHit({ rule, matched: true, reason: "disabled" });
-  const keywords = splitPatternKeywords((rule.pattern || "").trim());
-  if (!keywords.length) return new RuleHit({ rule, matched: false, reason: "空规则" });
+  const alternatives = splitPatternAlternatives((rule.pattern || "").trim());
+  if (!alternatives.length) return new RuleHit({ rule, matched: false, reason: "空规则" });
 
   let op = (rule.operator || "").trim();
   op = ({ "≥": ">=", "≤": "<=", "＝": "=", "＞": ">", "＜": "<" } as Record<string, string>)[op] || op;
@@ -68,7 +80,7 @@ export function matchRule(item: Item, rule: MatchRule): RuleHit {
   const candidates: RuleHit[] = [];
 
   for (const affix of item.affixes) {
-    if (!affixHasKeywords(affix, keywords)) continue;
+    if (!alternatives.some((keywords) => affixHasKeywords(affix, keywords))) continue;
     if (!needValue) {
       return new RuleHit({
         rule,
@@ -104,7 +116,9 @@ export function matchRule(item: Item, rule: MatchRule): RuleHit {
   }
 
   if (!candidates.length) {
-    return new RuleHit({ rule, matched: false, reason: "未找到同时包含这些关键字的词缀" });
+    const reason =
+      alternatives.length > 1 ? "未找到符合任一“|”分支的词缀" : "未找到同时包含这些关键字的词缀";
+    return new RuleHit({ rule, matched: false, reason });
   }
   const successes = candidates.filter((h) => h.matched);
   const pool = successes.length ? successes : candidates;

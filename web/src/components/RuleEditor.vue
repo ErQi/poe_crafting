@@ -184,7 +184,7 @@ syncThr();
     <div class="table-wrap scroll">
       <div class="table">
         <div class="th">启用</div>
-        <div class="th">词缀名称 / 文本</div>
+        <div class="th">词缀名称 / 文本（| 或者）</div>
         <div class="th">算子</div>
         <div class="th">阈值</div>
         <div class="th">备注</div>
@@ -223,7 +223,7 @@ syncThr();
       <button type="button" class="btn ok" :disabled="disabled" @click="addRule">+ 添加条件</button>
       <button type="button" class="btn danger" :disabled="disabled" @click="delRule">删除选中</button>
     </div>
-    <p v-if="!compact" class="tiny tip">可匹配词缀名称或效果文本；空格/逗号可写多个关键字。</p>
+    <p v-if="!compact" class="tiny tip">可匹配词缀名称或效果文本；空格/逗号表示“并且”，竖线 | 表示“或者”。</p>
   </div>
 </template>
 
