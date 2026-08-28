@@ -299,6 +299,25 @@ function sendBootStatus(status: { ok: boolean; error?: string }): void {
   mainWindow?.webContents.send("boot-status", status);
 }
 
+/** 洗地图校准：进入校准模式时临时把 F6 用作校准热键（捕获当前「起始格/结束格」模式对应的格位），退出即恢复正式开始/停止热键。 */
+function bindMapWashHotkeys(): void {
+  if (!host) return;
+  host.onMapWashCalibration((enabled) => {
+    // 先复位正式开始/停止热键（会 unregisterAll），再按需叠加校准热键
+    try {
+      registerHotkeys();
+    } catch (e) {
+      console.error("[hotkey] 复位失败:", e);
+    }
+    if (!enabled) return;
+    try {
+      globalShortcut.register("F6", () => host?.captureMapWashCalibrateActive());
+    } catch (e) {
+      console.error("[hotkey] 注册校准 F6 失败:", e);
+    }
+  });
+}
+
 function scheduleBoot(): void {
   setImmediate(() => {
     if (!host) return;
@@ -450,6 +469,7 @@ function bindHost(): void {
     }
   });
   registerHotkeys();
+  bindMapWashHotkeys();
   listenSplashReady();
 }
 

@@ -204,7 +204,7 @@ export function patchLocalizedBaseItems(
   englishInput: Buffer,
   localizedInput: Buffer,
   quotes: PriceQuote[],
-  labelMode: PriceLabelMode = "source",
+  labelMode: PriceLabelMode = "efarm",
 ): PatchedBaseItemTypes {
   const english = parseBaseItemTypes(englishInput);
   const localized = parseBaseItemTypes(localizedInput);

@@ -75,34 +75,33 @@ describe("客户端增强资源转换", () => {
     expect(otText(cleanCameraResource(Buffer.from(patched, "utf16le")))).not.toContain("CameraZoomNode");
   });
 
-  it("清理旧版全局揭雾写法，始终保留原版未探索可见度", () => {
+  it("可见度全开强制整图渲染，未探索区也有地形线", () => {
     const patched = patchMinimapVisibilityResource(Buffer.from(visibility), true).toString();
-    expect(patched).not.toContain("0.18f");
-    expect(patched).not.toContain("POE Tools minimap reveal");
-    expect(patched).toContain("float4(0.0f, 0.0f, 0.0f, 1.0f)");
+    expect(patched).toContain("POE Tools minimap reveal begin");
+    expect(patched).toContain("res_color.r = max(res_color.r, 0.5f);");
+
     const cleaned = cleanMinimapVisibilityResource(Buffer.from(patched)).toString();
     expect(cleaned).not.toContain("POE Tools minimap reveal");
     expect(cleaned).toContain("float4(0.0f, 0.0f, 0.0f, 1.0f)");
   });
 
-  it("默认色只提高地图轮廓透明度，不改真实探索可见度", () => {
+  it("混色全开由 floor 完成，不再叠加阴影/灰蒙层；自定义色仍注入迷雾色", () => {
     const plain = patchMinimapBlendingResource(Buffer.from(blending), true, "default").toString();
-    expect(plain).toContain("float poe_tools_outline_visibility = max(visibility, 0.36f)");
-    expect(plain).toContain("float4(1.0f, 1.0f, 1.0f, poe_tools_outline_visibility)");
-    expect(plain).toContain("float visibility = 0.5f;");
-    expect(plain).toContain("unexplored_edge = saturate(visibility * (1.0f - visibility)");
-    expect(plain).not.toContain("poe_tools_mist_color_rgb");
-    const cleaned = cleanMinimapBlendingResource(Buffer.from(plain)).toString();
-    expect(cleaned).not.toContain("poe_tools_outline_visibility");
-    expect(cleaned).toContain(originalGeometryBlend);
+    expect(plain).not.toContain("POE Tools minimap layout");
+    expect(plain).toContain(originalGeometryBlend);
+
+    const purple = patchMinimapBlendingResource(Buffer.from(blending), true, "purple").toString();
+    expect(purple).toContain("float3(0.55f, 0.00f, 0.55f)");
+    expect(purple).toContain("POE Tools minimap color");
+    expect(cleanMinimapBlendingResource(Buffer.from(purple)).toString()).not.toContain("POE Tools minimap color");
   });
 
-  it("自定义色重复应用时，轮廓与迷雾混色都只注入一次", () => {
+  it("自定义色重复应用时，迷雾混色不重复注入", () => {
     const purple = patchMinimapBlendingResource(Buffer.from(blending), true, "purple").toString();
     expect(purple).toContain("float3(0.55f, 0.00f, 0.55f)");
     const blue = patchMinimapBlendingResource(Buffer.from(purple), true, "blue").toString();
     expect(blue.match(/poe_tools_mist_color_rgb/g)).toHaveLength(2);
-    expect(blue.match(/poe_tools_outline_visibility/g)).toHaveLength(2);
+    expect(blue).not.toContain("POE Tools minimap layout");
     expect(cleanMinimapBlendingResource(Buffer.from(blue)).toString()).not.toContain("POE Tools minimap color");
   });
 

@@ -245,7 +245,7 @@ export function patchLocalizedUniqueWords(
   localizedInput: Buffer,
   uniqueLayoutInput: Buffer,
   quotes: PriceQuote[],
-  labelMode: PriceLabelMode = "source",
+  labelMode: PriceLabelMode = "efarm",
 ): PatchedUniqueWords {
   const localizedLayout = findLayout(localizedInput, MIN_WORD_RECORD_SIZE);
   const quoteByEnglish = new Map<string, PriceQuote>();

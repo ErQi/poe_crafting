@@ -1260,6 +1260,23 @@ export class ClientPricePatcher {
     }
   }
 
+  /**
+   * 强制以「当前客户端」为基准重建只读基线备份（重置基线）。
+   * 用于初始备份有问题、或想重新以现在状态为还原基准时。以当前磁盘上的标价资源原样
+   * 快照为新基线，不做“去价格后缀”的清理。旧的基线目录保留，不会被覆盖删除。
+   */
+  async resetBaseline(clientRoot: string): Promise<{ baselineId: string; baselineDir: string }> {
+    await this.assertClientSafe(clientRoot);
+    const current = await this.currentResources(clientRoot);
+    const created = await this.createBaseline(
+      clientRoot,
+      current,
+      { applied: false } as unknown as PricePatchState,
+      false,
+    );
+    return { baselineId: created.manifest.id, baselineDir: created.dir };
+  }
+
   async restore(clientRoot: string, state: PricePatchState): Promise<RestorePatchResult> {
     const prepared = await this.prepareBaseline(clientRoot, state);
     const uniqueResources = uniqueWordBaseline(prepared.manifest);

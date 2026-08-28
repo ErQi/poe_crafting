@@ -261,4 +261,54 @@ export class ClientEnhancementController {
     });
     return restoring ? this.restore() : this.apply();
   }
+
+  /** 重置增强基线备份：以当前客户端状态为新的还原基准 */
+  async resetBaseline(): Promise<Record<string, unknown>> {
+    if (this.operation) {
+      return { ok: false, error: "客户端增强正在处理中", client_enhancements: this.view() };
+    }
+    if (await this.gameRunning()) {
+      return { ok: false, error: "请先退出游戏再重置增强基线", client_enhancements: this.view() };
+    }
+    try {
+      await this.startOperation(() => this.runResetBaseline());
+      return { ok: true, client_enhancements: this.view() };
+    } catch (error) {
+      return { ok: false, error: errorText(error), client_enhancements: this.view() };
+    }
+  }
+
+  private async runResetBaseline(): Promise<void> {
+    this.patch({ phase: "idle", statusText: "正在重置增强基线备份…", error: "" });
+    try {
+      const clientRoot = await this.patcher.clientRoot(this.rootHint());
+      const result = await this.patcher.resetBaseline(clientRoot);
+      const anyEnabled =
+        this.state.viewDistanceEnabled || this.state.minimapEnabled || this.state.environmentDefogEnabled;
+      this.patch({
+        clientRoot,
+        baselineId: result.baselineId,
+        executableSha256: result.executableSha256,
+        appliedResourceSha256: {},
+        applied: false,
+        dirty: anyEnabled,
+        pending: false,
+        pendingRestore: false,
+        phase: "idle",
+        statusText: "已重置增强基线备份，以当前客户端为基准",
+        lastAppliedAt: new Date().toISOString(),
+        error: "",
+      });
+    } catch (error) {
+      if (error instanceof GameRunningError) return;
+      const message = errorText(error);
+      this.patch({
+        pendingRestore: false,
+        phase: "error",
+        statusText: `重置增强基线失败：${message}`,
+        error: message,
+      });
+      throw error;
+    }
+  }
 }

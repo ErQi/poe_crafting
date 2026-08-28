@@ -11,6 +11,12 @@ export function priceQuoteSourcePriority(source: PriceQuoteSource | undefined): 
   return 1;
 }
 
+/** 把价格以易刷可剥离的 `名称[价]` 形式追加到物品名后，兼容易刷按纯名查价；
+ *  半角方括号紧贴名字、无空格，复制出的物品名可直接被易刷解析成纯名再查价。 */
+export function priceSuffix(display: string): string {
+  return `[${display}]`;
+}
+
 /** 国服价格使用普通中点；poe.ninja 兜底价格使用 ⁙，便于在游戏内直接识别来源。 */
 export function priceQuoteSeparator(source: PriceQuoteSource | undefined): " · " | " ⁙ " {
   return source === "poe-ninja" ? " ⁙ " : " · ";
@@ -18,7 +24,7 @@ export function priceQuoteSeparator(source: PriceQuoteSource | undefined): " · 
 
 /** 易刷模式使用其原生可清理的 [价格] 后缀；来源模式保留国服/国际服符号。 */
 export function priceQuoteSuffix(quote: Pick<PriceQuote, "display" | "source">, mode: PriceLabelMode): string {
-  return mode === "efarm" ? `[${quote.display}]` : `${priceQuoteSeparator(quote.source)}${quote.display}`;
+  return mode === "efarm" ? priceSuffix(quote.display) : `${priceQuoteSeparator(quote.source)}${quote.display}`;
 }
 
 export interface PriceQuote {

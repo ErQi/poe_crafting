@@ -5,11 +5,16 @@ const EASY_FARM_VISIBILITY = /if\s*\(\s*visibility_reset\s*>\s*0\.5f\s*\)\s*\{\s
 const RESET_ASSIGNMENT = /if\s*\(\s*visibility_reset\s*>\s*0\.5f\s*\)\s*(?:\{\s*)?res_color\s*=\s*float4\(\s*0(?:\.0f)?f?\s*,\s*0(?:\.0f)?f?\s*,\s*0(?:\.0f)?f?\s*,\s*1(?:\.0f)?f?\s*\)\s*;\s*\}?/i;
 const POE_TOOLS_VISIBILITY = /\s*\/\/ POE Tools minimap reveal begin[\s\S]*?\/\/ POE Tools minimap reveal end\s*/gi;
 const POE_TOOLS_OUTLINE = /^([\t ]*)\/\/ POE Tools minimap outline begin\r?\n[\s\S]*?^[\t ]*\/\/ POE Tools minimap outline end/gim;
+const POE_TOOLS_LAYOUT = /^[\t ]*\/\/ POE Tools minimap layout begin\r?\n[\s\S]*?^[\t ]*\/\/ POE Tools minimap layout end\r?\n/gim;
 const POE_TOOLS_COLOR = /^[\t ]*\/\/ POE Tools minimap color begin\r?\n[\s\S]*?^[\t ]*\/\/ POE Tools minimap color end\r?\n/gim;
 const POE_TOOLS_ENVIRONMENT_DEFOG = /^([\t ]*)\/\/ POE Tools environment defog begin\r?\n[\t ]*return\s+iColour\s*;\r?\n[\t ]*\/\/ POE Tools environment defog end/gim;
 const GEOMETRY_BLEND = /res_color\s*=\s*Uberblend\(\s*res_color\s*,\s*geometry_sample\s*\*\s*float4\(\s*1\.0f\s*,\s*1\.0f\s*,\s*1\.0f\s*,\s*visibility\s*\)\s*\)\s*;/i;
 const ORIGINAL_GEOMETRY_BLEND = "res_color = Uberblend(res_color, geometry_sample * float4(1.0f, 1.0f, 1.0f, visibility));";
 const ORIGINAL_FOG_RETURN = "return oColour;";
+
+// 小地图全开：强开可见度下限，让客户端把全图地形(含未探索区)都光栅化出来。
+// floor 会把原生未探索阴影一起抹平，故本功能不再用阴影区分探索/未探索。
+const MINIMAP_REVEAL_FLOOR = "0.5f";
 
 interface TextBuffer {
   text: string;
@@ -129,14 +134,31 @@ export function cleanMinimapVisibilityResource(buffer: Buffer): Buffer {
 
 export function patchMinimapVisibilityResource(buffer: Buffer, enabled: boolean): Buffer {
   const decoded = decodeUtf8(buffer);
-  // 全开只应改地图轮廓的混色，不能提高可见度纹理的初始值。
-  // 保留参数是为了稳定现有调用接口；无论开关状态都清理旧版揭雾写法。
-  void enabled;
-  return decoded.encode(cleanVisibilityText(decoded.text));
+  let text = cleanVisibilityText(decoded.text);
+  if (!enabled) return decoded.encode(text);
+  const newline = newlineOf(text);
+  const { open, close } = functionBlockRange(text, "RenderVisibility");
+  const body = text.slice(open + 1, close);
+  const ret = /(^|\r?\n)([\t ]*)return\s+res_color\s*;/im.exec(body);
+  if (!ret || ret.index === undefined) {
+    throw new Error("小地图可见度着色器缺少最终返回点，已拒绝盲目修改");
+  }
+  const indent = ret[2] || "\t";
+  const at = open + 1 + ret.index + (ret[1] ? ret[1].length : 0);
+  // floor 使全图按已探索光栅化地形线；原生阴影随之抹平(目标=未探索阴影透明)。
+  const injection = [
+    `${indent}// POE Tools minimap reveal begin`,
+    `${indent}res_color.r = max(res_color.r, ${MINIMAP_REVEAL_FLOOR});`,
+    `${indent}// POE Tools minimap reveal end`,
+    "",
+  ].join(newline);
+  text = `${text.slice(0, at)}${injection}${text.slice(at)}`;
+  return decoded.encode(text);
 }
 
 function cleanBlendingText(input: string): string {
-  let text = input.replace(POE_TOOLS_OUTLINE, (_match, indent: string) => `${indent}${ORIGINAL_GEOMETRY_BLEND}`);
+  let text = input.replace(POE_TOOLS_LAYOUT, "");
+  text = text.replace(POE_TOOLS_OUTLINE, (_match, indent: string) => `${indent}${ORIGINAL_GEOMETRY_BLEND}`);
   text = text.replace(POE_TOOLS_COLOR, "");
   text = text.replace(
     /\s*float3\s+desired_mist_color_rgb\s*=\s*float3\([^;]+\)\s*;\s*res_color\.rgb\s*=\s*lerp\(\s*res_color\.rgb\s*,\s*desired_mist_color_rgb\s*,\s*1\.0f\s*-\s*visibility\s*\)\s*;\s*/gi,
@@ -173,29 +195,24 @@ export function patchMinimapBlendingResource(buffer: Buffer, enabled: boolean, c
   let text = cleanBlendingText(decoded.text);
   if (!enabled) return decoded.encode(text);
   const newline = newlineOf(text);
-  const outline = [
-    "// POE Tools minimap outline begin",
-    "float poe_tools_outline_visibility = max(visibility, 0.36f);",
-    "res_color = Uberblend(res_color, geometry_sample * float4(1.0f, 1.0f, 1.0f, poe_tools_outline_visibility));",
-    "// POE Tools minimap outline end",
-  ].join(newline);
-  text = text.replace(GEOMETRY_BLEND, outline);
+  // 全开只由可见度 floor 完成(未探索区同样渲染地形线)；这里不再叠加任何阴影/灰蒙层，
+  // 未探索阴影保持透明(目标2)，也不再区分探索与未探索。
   if (color === "default") return decoded.encode(text);
   const rgb = COLOR_RGB[color];
-  const { open, close } = functionBlockRange(text, "BlendMinimap");
-  const body = text.slice(open + 1, close);
-  const anchor = /(^|\r?\n)([\t ]*)res_color\.a\s*\*=\s*saturate\(\s*1\.0f\s*-\s*walkability_sample\.b\s*\*\s*2\.0f\s*\)\s*;/i.exec(body);
+  const colorRange = functionBlockRange(text, "BlendMinimap");
+  const colorBody = text.slice(colorRange.open + 1, colorRange.close);
+  const anchor = /(^|\r?\n)([\t ]*)res_color\.a\s*\*=\s*saturate\(\s*1\.0f\s*-\s*walkability_sample\.b\s*\*\s*2\.0f\s*\)\s*;/i.exec(colorBody);
   if (!anchor || anchor.index === undefined) throw new Error("小地图混色着色器缺少颜色插入点");
-  const indent = anchor[2] || "\t\t";
-  const at = open + 1 + anchor.index + (anchor[1] ? anchor[1].length : 0);
+  const colorIndent = anchor[2] || "\t\t";
+  const atColor = colorRange.open + 1 + anchor.index + (anchor[1] ? anchor[1].length : 0);
   const injection = [
-    `${indent}// POE Tools minimap color begin`,
-    `${indent}float3 poe_tools_mist_color_rgb = float3(${float(rgb[0])}, ${float(rgb[1])}, ${float(rgb[2])});`,
-    `${indent}res_color.rgb = lerp(res_color.rgb, poe_tools_mist_color_rgb, 1.0f - visibility);`,
-    `${indent}// POE Tools minimap color end`,
+    `${colorIndent}// POE Tools minimap color begin`,
+    `${colorIndent}float3 poe_tools_mist_color_rgb = float3(${float(rgb[0])}, ${float(rgb[1])}, ${float(rgb[2])});`,
+    `${colorIndent}res_color.rgb = lerp(res_color.rgb, poe_tools_mist_color_rgb, 1.0f - visibility);`,
+    `${colorIndent}// POE Tools minimap color end`,
     "",
   ].join(newline);
-  text = `${text.slice(0, at)}${injection}${text.slice(at)}`;
+  text = `${text.slice(0, atColor)}${injection}${text.slice(atColor)}`;
   return decoded.encode(text);
 }
 

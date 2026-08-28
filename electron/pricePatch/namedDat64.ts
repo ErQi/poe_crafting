@@ -215,7 +215,7 @@ export function patchLocalizedNamedDat(
   localizedInput: Buffer,
   quotes: PriceQuote[],
   options: NamedDatOptions,
-  labelMode: PriceLabelMode = "source",
+  labelMode: PriceLabelMode = "efarm",
 ): PatchedNamedDat {
   const english = findLayout(englishInput, options.namePointerOffset + 8);
   const localized = findLayout(localizedInput, options.namePointerOffset + 8);

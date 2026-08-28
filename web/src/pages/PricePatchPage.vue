@@ -5,7 +5,15 @@ const props = defineProps({
   state: { type: Object, required: true },
   runtime: { type: Object, required: true },
 });
-const emit = defineEmits(["apply", "restore", "auto", "mode", "client-root", "choose-client-root"]);
+const emit = defineEmits([
+  "apply",
+  "restore",
+  "reset-baseline",
+  "auto",
+  "mode",
+  "client-root",
+  "choose-client-root",
+]);
 
 const patch = computed(() => props.runtime.price_patch || props.state.price_patch || {});
 const applied = computed(() => Boolean(patch.value.applied));
@@ -39,6 +47,17 @@ function saveClientRoot() {
 function chooseClientRoot() {
   if (clientRootLocked.value) return;
   emit("choose-client-root", clientRootDraft.value, completeClientRoot);
+}
+
+function resetBaseline() {
+  if (
+    !window.confirm(
+      "重置基线备份：将以当前客户端的标价资源作为新的还原基准。\n\n旧基线不会被删除，但仍建议先确认无误再重置。确定继续？",
+    )
+  ) {
+    return;
+  }
+  emit("reset-baseline");
 }
 
 function displayTime(value) {
@@ -77,8 +96,11 @@ function labelModeName(value) {
           <p>优先使用易刷国服行情；缺价时依次使用国服备用源、poe.ninja 国际服行情。</p>
         </div>
         <div>
-          <span>符号说明</span>
-          <p>来源标识模式下，<b>·</b> 表示国服价格，<b>⁙</b> 表示 poe.ninja 非国服兜底价。</p>
+          <span>格式说明</span>
+          <p>
+            易刷模式以可剥离的形式缀在物品名后（如 <b>[1.2c]</b>），复制查价仍可识别纯名；
+            来源标识模式下，<b>·</b> 表示国服价格，<b>⁙</b> 表示 poe.ninja 非国服兜底价。
+          </p>
         </div>
         <div>
           <span>显示规则</span>
@@ -184,8 +206,8 @@ function labelModeName(value) {
           type="button"
           class="btn ok primary"
           :disabled="busy"
-        @click="$emit('apply')"
-      >
+          @click="$emit('apply')"
+        >
           {{ busy ? "正在处理…" : labelModeDirty ? `重新应用${labelModeName(labelMode)}` : "立即更新价格" }}
         </button>
         <button
@@ -196,6 +218,18 @@ function labelModeName(value) {
         >
           {{ busy ? "正在处理…" : "取消补丁 / 恢复原版" }}
         </button>
+      </div>
+
+      <div class="reset-row">
+        <button
+          type="button"
+          class="btn ghost"
+          :disabled="busy || pending"
+          @click="resetBaseline"
+        >
+          重置基线备份
+        </button>
+        <small>以当前客户端状态作为新的还原基准（初始备份有问题时使用；旧备份保留）。</small>
       </div>
 
       <label class="auto-row">
@@ -328,6 +362,8 @@ function labelModeName(value) {
 .client-path-row .ctrl[readonly] { opacity: 0.6; cursor: default; }
 .primary { width: 100%; height: 40px; font-size: 14px; font-weight: 700; }
 .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.reset-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.reset-row small { color: var(--muted); }
 .auto-row {
   display: flex;
   align-items: center;

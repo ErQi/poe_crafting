@@ -5,13 +5,14 @@ import {
   pricePatchView,
   priceQuoteSeparator,
   priceQuoteSuffix,
+  priceSuffix,
 } from "../types";
 
 describe("标价补丁界面状态", () => {
-  it("只为 poe.ninja 兜底价使用非国服来源分隔符", () => {
-    expect(priceQuoteSeparator("efarm")).toBe(" · ");
-    expect(priceQuoteSeparator("poecurrency")).toBe(" · ");
-    expect(priceQuoteSeparator("poe-ninja")).toBe(" ⁙ ");
+  it("价格后缀以易刷可剥离的 [价] 形式紧贴名字", () => {
+    expect(priceSuffix("1c")).toBe("[1c]");
+    expect(priceSuffix("1.18d")).toBe("[1.18d]");
+    expect(priceSuffix("0.9d")).toBe("[0.9d]");
   });
 
   it("默认使用易刷模式，并生成易刷查价可清理的方括号后缀", () => {
@@ -19,6 +20,9 @@ describe("标价补丁界面状态", () => {
     expect(state.labelMode).toBe("efarm");
     expect(priceQuoteSuffix({ display: "1.2d", source: "efarm" }, "efarm")).toBe("[1.2d]");
     expect(priceQuoteSuffix({ display: "390c", source: "poe-ninja" }, "efarm")).toBe("[390c]");
+    expect(priceQuoteSeparator("efarm")).toBe(" · ");
+    expect(priceQuoteSeparator("poecurrency")).toBe(" · ");
+    expect(priceQuoteSeparator("poe-ninja")).toBe(" ⁙ ");
     expect(priceQuoteSuffix({ display: "390c", source: "poe-ninja" }, "source")).toBe(" ⁙ 390c");
   });
 

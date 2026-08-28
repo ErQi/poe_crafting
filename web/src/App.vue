@@ -17,6 +17,7 @@ import Modal from "./components/Modal.vue";
 import HelpPage from "./pages/HelpPage.vue";
 import CraftPage from "./pages/CraftPage.vue";
 import WorkflowPage from "./pages/WorkflowPage.vue";
+import MapWashPage from "./pages/MapWashPage.vue";
 import TemplatesPage from "./pages/TemplatesPage.vue";
 import PricePatchPage from "./pages/PricePatchPage.vue";
 import ClientEnhancementsPage from "./pages/ClientEnhancementsPage.vue";
@@ -311,6 +312,7 @@ async function removeStep(id) {
         <button type="button" :class="{ on: tab === 'help' }" @click="setTab('help')">使用说明</button>
         <button type="button" :class="{ on: tab === 'garden' }" @click="setTab('garden')">花园工艺</button>
         <button type="button" :class="{ on: tab === 'normal' }" @click="setTab('normal')">普通工艺</button>
+        <button type="button" class="sub" :class="{ on: tab === 'mapwash' }" @click="setTab('mapwash')">洗地图</button>
         <button type="button" class="sub" :class="{ on: tab === 'templates' }" @click="setTab('templates')">模板</button>
         <button type="button" class="sub" :class="{ on: tab === 'price_patch' }" @click="setTab('price_patch')">标价补丁</button>
         <button type="button" class="sub" :class="{ on: tab === 'client_enhancements' }" @click="setTab('client_enhancements')">游戏增强</button>
@@ -401,6 +403,7 @@ async function removeStep(id) {
         @rules="(rs, id, timing) => wrap(() => call('update_rules', rs, id, timing))"
         @prompt="onPrompt"
       />
+      <MapWashPage v-show="tab === 'mapwash'" :state="state" :runtime="runtime" :disabled="running" />
       <TemplatesPage
         v-show="tab === 'templates'"
         :state="state"
@@ -419,6 +422,7 @@ async function removeStep(id) {
         :runtime="runtime"
         @apply="applyCall(() => call('price_patch_apply'))"
         @restore="applyCall(() => call('price_patch_restore'))"
+        @reset-baseline="applyCall(() => call('price_patch_reset_baseline'))"
         @auto="(enabled) => applyCall(() => call('price_patch_set_auto', enabled))"
         @mode="(value) => applyCall(() => call('price_patch_set_mode', value))"
         @client-root="setPricePatchClientRoot"
@@ -431,6 +435,7 @@ async function removeStep(id) {
         @update="(values) => applyCall(() => call('client_enhancements_update', values))"
         @apply="applyCall(() => call('client_enhancements_apply'))"
         @restore="applyCall(() => call('client_enhancements_restore'))"
+        @reset-baseline="applyCall(() => call('client_enhancements_reset_baseline'))"
         @retry="applyCall(() => call('client_enhancements_retry'))"
       />
       <SettingsPage
